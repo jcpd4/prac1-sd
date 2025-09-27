@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# SQLite DB
+*.db
+*.sqlite3
+
+# VSCode settings
+.vscode/
+
+# Entornos virtuales (si los usas)
+env/
+venv/
+
+# Logs y otros
+*.log
+*.tmp
