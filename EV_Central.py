@@ -4,8 +4,7 @@ import threading
 import sys
 import time
 import os
-# Asegúrate de tener instalado: pip install kafka-python
-from kafka import KafkaConsumer, KafkaProducer
+from kafka import KafkaConsumer
 import json
 import database # Módulo de base de datos (se asume implementado)
 
@@ -83,6 +82,81 @@ def display_panel(central_messages, driver_requests):
         time.sleep(2) # El panel se refresca cada 2 segundos
 
 # --- Funciones de Kafka ---
+def start_driver_json_consumer(central_messages):
+    """
+    Lanza un consumidor Kafka que escucha peticiones de conductores
+    en formato JSON desde el topic 'peticiones_ev'.
+    """
+    try:
+        #1. Crear el consumidor Kafka que escucha el topic 'peticiones_ev'
+        consumer = KafkaConsumer(
+            'peticiones_ev',
+            bootstrap_servers=['127.0.0.1:9092'],
+            auto_offset_reset='latest',
+            group_id='central_ev_json',
+            enable_auto_commit=True,
+            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        )
+        #2. Notifica en el panel que la conexión ha sido exitosa
+        central_messages.append("[Kafka] Consumidor JSON conectado a 'peticiones_ev'")
+    
+    
+    except Exception as e:
+        #3. En caso de error al crear el consumidor, se muestra el error y se termina la función
+        central_messages.append(f"[Kafka] ERROR al conectar consumidor JSON: {e}")
+        return
+
+    #4. Bucle principal de escucha de mensajes Kafka
+    for message in consumer:
+        #5. Extrae el valor del mensaje (ya es un diccionario JSON)
+        try:
+            payload = message.value
+            #6. Muestra el contenido del mensaje en consola (debug) y en el panel central
+            print(f"[Kafka] JSON recibido: {payload}")
+            central_messages.append(f"Kafka -> {payload}")
+            #7. Procesa solo si es del tipo esperado ("PETICION")
+            if payload.get("type") == "PETICION":
+                process_driver_json_request(payload, central_messages)
+            else:
+                #8. Ignora mensajes que no sean del tipo esperado
+                central_messages.append(f"Ignorado: tipo de mensaje no esperado: {payload.get('type')}")
+        except Exception as e:
+            #9. Si ocurre un error procesando un mensaje, se notifica pero no se detiene el bucle
+            central_messages.append(f"[Kafka] ERROR al procesar mensaje: {e}")
+
+def process_driver_json_request(payload, central_messages):
+    """
+    Procesa mensajes JSON de tipo 'PETICION' con acciones como INICIAR o FINALIZAR.
+    """
+    #1. Validación básica de campos requeridos
+    action = payload.get('action', '').upper()
+    cp_id = payload.get('cp_id', '').upper()
+    driver_id = payload.get('user_id', '')
+
+    #2. Comprobación de campos obligatorios
+    if not action or not cp_id or not driver_id:
+        central_messages.append("ERROR: Mensaje JSON incompleto.")
+        return
+
+    #. Verificar si el CP está conectado (socket activo)
+    if cp_id not in active_cp_sockets:
+        central_messages.append(f"ERROR: El CP {cp_id} no está conectado. Petición ignorada.")
+        return
+
+    #4. Procesar acciones reconocidas
+    if action == 'INICIAR':
+        central_messages.append(f"Petición de INICIO para {cp_id} ({driver_id}).")
+        send_cp_command(cp_id, f"INICIAR#{driver_id}", central_messages)
+
+    elif action == 'FINALIZAR':
+        central_messages.append(f"Petición de FIN para {cp_id} ({driver_id}).")
+        send_cp_command(cp_id, f"FINALIZAR#{driver_id}", central_messages)
+
+    else:
+        central_messages.append(f"Comando Kafka desconocido: {action}")
+
+
+
 def process_kafka_requests(kafka_broker, central_messages, driver_requests):
     """
     Consumidor Kafka: Recibe peticiones de suministro de los Drivers 
@@ -401,8 +475,12 @@ if __name__ == "__main__":
         input_thread.daemon = True
         input_thread.start()
 
-        # 5. Iniciar el panel de monitorización en el hilo principal
+        #5. Lanzamos el consumidor del kafka
+        threading.Thread(target=start_driver_json_consumer, args=(central_messages,), daemon=True).start()
+
+        #6. Iniciar el panel de monitorización en el hilo principal
         display_panel(central_messages, driver_requests)
+
 
     except ValueError:
         print("Error: El puerto debe ser un número entero.")

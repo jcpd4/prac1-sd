@@ -72,6 +72,59 @@ def handle_monitor_connection(monitor_socket, monitor_address):
             elif data.startswith("REANUDAR"):
                 ENGINE_STATUS['health'] = 'OK'  # Simulamos que está listo para volver a cargar
                 monitor_socket.sendall(b"ACK#REANUDAR")   # Confirmamos acción
+            
+            
+            elif data.startswith("INICIAR#"):
+                # Comando INICIAR recibido desde la Central (vía Monitor).
+                # Formato esperado: "INICIAR#DRIVER123"
+                driver_id = data.split('#')[1] if '#' in data else None
+                
+                # Solo iniciamos si todo está en condiciones correctas.
+                if ENGINE_STATUS['health'] == 'OK' and not ENGINE_STATUS['is_charging'] and driver_id:
+                    # Activamos el modo de carga
+                    ENGINE_STATUS['is_charging'] = True
+                    ENGINE_STATUS['driver_id'] = driver_id
+                    
+                    # Iniciamos la simulación de carga en un hilo aparte
+                    threading.Thread(target=simulate_charging, args=(CP_ID,), daemon=True).start()
+                    # Respondemos con ACK para confirmar que se ha iniciado la carga
+                    monitor_socket.sendall(b"ACK#INICIAR")
+                    print(f"[Engine] Carga iniciada por orden remota para {driver_id}")
+                else:
+                    # Si no cumple condiciones, rechazamos con NACK
+                    monitor_socket.sendall(b"NACK#INICIAR")
+
+            
+            elif data.startswith("FINALIZAR#"):
+                # Comando FINALIZAR recibido para terminar la carga actual
+                if ENGINE_STATUS['is_charging']:
+                    # Guardamos el ID del conductor antes de limpiar el estado
+                    user_id_finished = ENGINE_STATUS['driver_id']
+                    
+                    # Paramos la carga y limpiamos el estado del Engine
+                    ENGINE_STATUS['is_charging'] = False
+                    ENGINE_STATUS['driver_id'] = None
+
+                    # Creamos mensaje de fin de carga para enviar a la Central (Kafka)
+                    finish_message = {
+                        "cp_id": CP_ID,
+                        "type": "SUPPLY_END",
+                        "user_id": user_id_finished
+                    }
+
+                    try:
+                        # Enviamos mensaje a Kafka
+                        KAFKA_PRODUCER.send('cp_telemetry', value=finish_message)
+                    except Exception as e:
+                        print(f"[Engine] ERROR al enviar fin de suministro a Kafka: {e}")
+
+                    # Respondemos al Monitor con confirmación ACK
+                    monitor_socket.sendall(b"ACK#FINALIZAR")
+                    print("[Engine] Carga finalizada por orden remota.")
+                else:
+                    # Si no estaba cargando, respondemos con NACK
+                    monitor_socket.sendall(b"NACK#FINALIZAR")
+            
             # --- COMANDO DESCONOCIDO ---
             else:
                 monitor_socket.sendall(b"ERROR") # Comando no reconocido
