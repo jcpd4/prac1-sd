@@ -82,100 +82,40 @@ def display_panel(central_messages, driver_requests):
         time.sleep(2) # El panel se refresca cada 2 segundos
 
 # --- Funciones de Kafka ---
-def start_driver_json_consumer(central_messages):
+def process_kafka_requests(kafka_broker: str, central_messages: List[str], driver_requests: List[Dict[str, Any]]):
     """
-    Lanza un consumidor Kafka que escucha peticiones de conductores
-    en formato JSON desde el topic 'peticiones_ev'.
+    Consumidor Kafka: Recibe peticiones de suministro de los Drivers y mensajes de estado de los CPs.
     """
-    try:
-        #1. Crear el consumidor Kafka que escucha el topic 'peticiones_ev'
-        consumer = KafkaConsumer(
-            'peticiones_ev',
-            bootstrap_servers=['127.0.0.1:9092'],
-            auto_offset_reset='latest',
-            group_id='central_ev_json',
-            enable_auto_commit=True,
-            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-        #2. Notifica en el panel que la conexión ha sido exitosa
-        central_messages.append("[Kafka] Consumidor JSON conectado a 'peticiones_ev'")
+    global KAFKA_PRODUCER # <--- La función process_kafka_requests necesita acceder a KAFKA_PRODUCER para enviar los mensajes AUTH_OK, AUTH_DENIED, y el TICKET.
+    consumer = None
+    max_attempts = 10
+    attempt = 0
     
-    
-    except Exception as e:
-        #3. En caso de error al crear el consumidor, se muestra el error y se termina la función
-        central_messages.append(f"[Kafka] ERROR al conectar consumidor JSON: {e}")
-        return
-
-    #4. Bucle principal de escucha de mensajes Kafka
-    for message in consumer:
-        #5. Extrae el valor del mensaje (ya es un diccionario JSON)
+    # Bucle de reintento para la conexión inicial (Resiliencia)
+    while consumer is None and attempt < max_attempts:
+        attempt += 1
+        central_messages.append(f"INFO: Conectando a Kafka (Intento {attempt}/{max_attempts})...")
         try:
-            payload = message.value
-            #6. Muestra el contenido del mensaje en consola (debug) y en el panel central
-            print(f"[Kafka] JSON recibido: {payload}")
-            central_messages.append(f"Kafka -> {payload}")
-            #7. Procesa solo si es del tipo esperado ("PETICION")
-            if payload.get("type") == "PETICION":
-                process_driver_json_request(payload, central_messages)
-            else:
-                #8. Ignora mensajes que no sean del tipo esperado
-                central_messages.append(f"Ignorado: tipo de mensaje no esperado: {payload.get('type')}")
+            # Crea el consumidor de Kafka
+            consumer = KafkaConsumer(
+                KAFKA_TOPIC_REQUESTS,
+                KAFKA_TOPIC_STATUS,
+                bootstrap_servers=[kafka_broker],
+                auto_offset_reset='latest',
+                group_id='central-processor',
+                value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+            )
+            central_messages.append(f"Kafka Consumer: CONEXIÓN ESTABLECIDA con {kafka_broker}")
+            break
         except Exception as e:
-            #9. Si ocurre un error procesando un mensaje, se notifica pero no se detiene el bucle
-            central_messages.append(f"[Kafka] ERROR al procesar mensaje: {e}")
+            central_messages.append(f"ERROR: Falló la conexión a Kafka: {e}. Esperando 5s para reintentar.")
+            time.sleep(5)  # Espera antes de reintentar
 
-def process_driver_json_request(payload, central_messages):
-    """
-    Procesa mensajes JSON de tipo 'PETICION' con acciones como INICIAR o FINALIZAR.
-    """
-    #1. Validación básica de campos requeridos
-    action = payload.get('action', '').upper()
-    cp_id = payload.get('cp_id', '').upper()
-    driver_id = payload.get('user_id', '')
+    if consumer is None:
+        central_messages.append("ERROR FATAL: El sistema no pudo establecer conexión con Kafka después de todos los reintentos.")
+        return # Termina el hilo si falla permanentemente
 
-    #2. Comprobación de campos obligatorios
-    if not action or not cp_id or not driver_id:
-        central_messages.append("ERROR: Mensaje JSON incompleto.")
-        return
-
-    #. Verificar si el CP está conectado (socket activo)
-    if cp_id not in active_cp_sockets:
-        central_messages.append(f"ERROR: El CP {cp_id} no está conectado. Petición ignorada.")
-        return
-
-    #4. Procesar acciones reconocidas
-    if action == 'INICIAR':
-        central_messages.append(f"Petición de INICIO para {cp_id} ({driver_id}).")
-        send_cp_command(cp_id, f"INICIAR#{driver_id}", central_messages)
-
-    elif action == 'FINALIZAR':
-        central_messages.append(f"Petición de FIN para {cp_id} ({driver_id}).")
-        send_cp_command(cp_id, f"FINALIZAR#{driver_id}", central_messages)
-
-    else:
-        central_messages.append(f"Comando Kafka desconocido: {action}")
-
-
-
-def process_kafka_requests(kafka_broker, central_messages, driver_requests):
-    """
-    Consumidor Kafka: Recibe peticiones de suministro de los Drivers 
-    y mensajes de estado de los CPs.
-    """
-    try:
-        consumer = KafkaConsumer(
-            KAFKA_TOPIC_REQUESTS,
-            KAFKA_TOPIC_STATUS,
-            bootstrap_servers=[kafka_broker],
-            auto_offset_reset='latest', # Solo lee mensajes nuevos
-            group_id='central-processor',
-            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-        central_messages.append(f"Kafka Consumer: Conectado al broker {kafka_broker}")
-    except Exception as e:
-        central_messages.append(f"ERROR: No se pudo conectar a Kafka ({kafka_broker}): {e}")
-        return
-
+    # Bucle principal de consumo
     for message in consumer:
         try:
             payload = message.value
@@ -186,52 +126,72 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests):
                 driver_requests.append({'cp_id': payload['cp_id'], 'user_id': payload['user_id'], 'timestamp': time.strftime('%H:%M:%S')})
                 
                 # --- Lógica de Gobierno ---
-                # 1. Comprobar disponibilidad del CP
-                cp_status = database.get_cp_status(payload['cp_id'])
+                cp_id = payload['cp_id']
+                user_id = payload['user_id']
+                cp_status = database.get_cp_status(cp_id)
                 
                 if cp_status == 'ACTIVADO':
-                    # 2. Si está disponible, solicitar autorización al CP (via socket, ya que es bidireccional y síncrono)
-                    # Aquí se usaría active_cp_sockets para enviar la solicitud de autorización
-                    # Por simplicidad, solo notificamos
-                    central_messages.append(f"Petición OK. Autorizando a Driver {payload['user_id']} en CP {payload['cp_id']}.")
+                    central_messages.append(f"Petición OK. Autorizando a Driver {user_id} en CP {cp_id}.")
+                    
+                    # === IMPLEMENTACIÓN 1: Notificar Autorización (AUTH_OK) ===
+                    response_message = {"type": "AUTH_OK", "cp_id": cp_id, "user_id": user_id}
+                    if KAFKA_PRODUCER:
+                        KAFKA_PRODUCER.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=response_message)
+                        
                     # TO-DO: Implementar la lógica de sockets para la autorización al Engine
-                    # TO-DO: Usar KafkaProducer para notificar al conductor (KAFKA_TOPIC_DRIVER_NOTIFY)
+                    
                 else:
-                    central_messages.append(f"Petición RECHAZADA. CP {payload['cp_id']} no disponible ({cp_status}).")
-                    # TO-DO: Usar KafkaProducer para notificar la denegación al conductor
+                    central_messages.append(f"Petición RECHAZADA. CP {cp_id} no disponible ({cp_status}).")
+                    
+                    # === IMPLEMENTACIÓN 2: Notificar Denegación (AUTH_DENIED) ===
+                    response_message = {"type": "AUTH_DENIED", "cp_id": cp_id, "user_id": user_id, "reason": cp_status}
+                    if KAFKA_PRODUCER:
+                        KAFKA_PRODUCER.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=response_message)
                 
-                # Limpiamos la petición después de procesar (en un sistema real se procesaría de forma más robusta)
-                if driver_requests and driver_requests[0]['cp_id'] == payload['cp_id']:
+                # Limpiamos la petición después de procesar
+                if driver_requests and driver_requests[0]['cp_id'] == cp_id:
                     driver_requests.pop(0)
 
             elif topic == KAFKA_TOPIC_STATUS:
-                # Telemetría o estado del CP (por ejemplo, CONSUMO)
+                # Telemetría o estado del CP
+                cp_id = payload['cp_id']
                 
-                # Lógica existente para CONSUMO
+                # Lógica de SUMINISTRANDO
                 if payload.get('type') == 'CONSUMO':
-                    # 1. ACTUALIZAR CONSUMO (como ya lo tenías)
-                    database.update_cp_consumption(payload['cp_id'], payload['kwh'], payload['importe'], payload['user_id'])
-                    
-                    # 2. AÑADIR CAMBIO DE ESTADO A SUMINISTRANDO AQUÍ
-                    #    La Central debe actualizar la BD a SUMINISTRANDO.
-                    if database.get_cp_status(payload['cp_id']) != 'SUMINISTRANDO':
-                        database.update_cp_status(payload['cp_id'], 'SUMINISTRANDO')
-                        central_messages.append(f"INFO: CP {payload['cp_id']} ha comenzado el suministro (Driver {payload['user_id']}).")
-                # NUEVA LÓGICA: FIN DE SUMINISTRO
+                    database.update_cp_consumption(cp_id, payload['kwh'], payload['importe'], payload['user_id'])
+                    if database.get_cp_status(cp_id) != 'SUMINISTRANDO':
+                        database.update_cp_status(cp_id, 'SUMINISTRANDO')
+                        central_messages.append(f"INFO: CP {cp_id} ha comenzado el suministro (Driver {payload['user_id']}).")
+                
+                # LÓGICA DE FIN DE SUMINISTRO
                 if payload.get('type') == 'SUPPLY_END': 
-                    # El CP ha notificado el fin de la recarga
-                    database.update_cp_status(payload['cp_id'], 'ACTIVADO') # <--- CAMBIA A VERDE
-                    central_messages.append(f"INFO: Suministro finalizado en CP {payload['cp_id']} por Driver {payload['user_id']}.")
-                    # TO-DO: Enviar "ticket" final al conductor.
+                    
+                    # === IMPLEMENTACIÓN 3: Enviar Ticket Final (TICKET) ===
+                    # Recuperar el consumo final de la BD (asumimos que la BD guarda el último estado)
+                    cp_data = database.get_cp_data(cp_id) 
+                    final_kwh = cp_data.get('kwh', 0)
+                    final_cost = cp_data.get('importe', 0)
+                    
+                    ticket_message = {
+                        "type": "TICKET",
+                        "cp_id": cp_id,
+                        "user_id": payload['user_id'],
+                        "kwh": final_kwh,
+                        "importe": final_cost
+                    }
+                    if KAFKA_PRODUCER:
+                        KAFKA_PRODUCER.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=ticket_message)
+                        central_messages.append(f"INFO: Ticket final ({final_cost}€) enviado a Driver {payload['user_id']}.")
 
-                # Lógica existente para AVERIADO
+                    # Después de enviar el ticket, actualizar a ACTIVADO
+                    database.update_cp_status(cp_id, 'ACTIVADO') 
+
+                # Lógica de AVERIADO
                 if payload.get('type') == 'AVERIADO' or payload.get('type') == 'CONEXION_PERDIDA':
-                    database.update_cp_status(payload['cp_id'], 'AVERIADO')
-                    # REGISTRA EL CP SI NO EXISTE ANTES DE ACTUALIZAR ESTADO
-                    if database.get_cp_status(payload['cp_id']) == 'NO_EXISTE':
-                        database.register_cp(payload['cp_id'], 'Ubicación desconocida')
-                    database.update_cp_status(payload['cp_id'], 'AVERIADO')
-                    central_messages.append(f"ALARMA: CP {payload['cp_id']} ha reportado una AVERÍA crítica.")
+                    if database.get_cp_status(cp_id) == 'NO_EXISTE':
+                        database.register_cp(cp_id, 'Ubicación desconocida')
+                    database.update_cp_status(cp_id, 'AVERIADO')
+                    central_messages.append(f"ALARMA: CP {cp_id} ha reportado una AVERÍA crítica.")
 
         except Exception as e:
             central_messages.append(f"Error al procesar mensaje de Kafka: {e}")
@@ -445,7 +405,7 @@ def process_user_input(central_messages):
 # --- Punto de Entrada Principal ---
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("Uso: python ev_central.py <puerto_socket> <kafka_broker_ip:port>")
+        print("Uso: python EV_Central.py <puerto_socket> <kafka_broker_ip:port>")
         sys.exit(1)
 
     try:
@@ -453,39 +413,43 @@ if __name__ == "__main__":
         KAFKA_BROKER = sys.argv[2]
         HOST = '0.0.0.0'
         
-        # Usaremos listas compartidas para que los hilos se comuniquen con el panel
         central_messages = ["CENTRAL system status OK"]
         driver_requests = []
 
         # 1. Configurar la base de datos
         database.setup_database()
+        
+        # 2. Inicializar el Productor de Kafka (CRÍTICO)
+        KAFKA_PRODUCER = KafkaProducer(
+            bootstrap_servers=[KAFKA_BROKER],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+        central_messages.append(f"Kafka Producer inicializado.")
 
-        # 2. Iniciar el servidor de Sockets para CPs (registro y control síncrono)
-        server_thread = threading.Thread(target=start_socket_server, args=(HOST, SOCKET_PORT, central_messages))
-        server_thread.daemon = True
+        # 3. Iniciar el servidor de Sockets (Registro y Control Síncrono)
+        server_thread = threading.Thread(target=start_socket_server, args=(HOST, SOCKET_PORT, central_messages), daemon=True)
         server_thread.start()
         
-        # 3. Iniciar el consumidor Kafka (peticiones de driver y telemetría asíncrona)
-        kafka_thread = threading.Thread(target=process_kafka_requests, args=(KAFKA_BROKER, central_messages, driver_requests))
-        kafka_thread.daemon = True
+        # 4. Iniciar el Consumidor Kafka (Peticiones y Telemetría)
+        kafka_thread = threading.Thread(target=process_kafka_requests, args=(KAFKA_BROKER, central_messages, driver_requests), daemon=True)
         kafka_thread.start()
         
-        # 4. Iniciar el hilo de entrada de comandos del usuario
-        input_thread = threading.Thread(target=process_user_input, args=(central_messages,))
-        input_thread.daemon = True
+        # 5. Iniciar la entrada de comandos del usuario
+        input_thread = threading.Thread(target=process_user_input, args=(central_messages,), daemon=True)
         input_thread.start()
 
-        #5. Lanzamos el consumidor del kafka
-        threading.Thread(target=start_driver_json_consumer, args=(central_messages,), daemon=True).start()
-
-        #6. Iniciar el panel de monitorización en el hilo principal
+        # 6. Iniciar el panel de monitorización en el hilo principal
         display_panel(central_messages, driver_requests)
 
 
     except ValueError:
         print("Error: El puerto debe ser un número entero.")
         sys.exit(1)
+    except Exception as e:
+        # Esto captura errores al inicializar KafkaProducer si el broker no está
+        print(f"Error fatal al iniciar la Central: {e}")
+        sys.exit(1)
     except KeyboardInterrupt:
         print("\nServidor detenido por el usuario. Cerrando hilos...")
-        # Nota: La terminación del programa principal terminará los hilos daemon.
         sys.exit(0)
+
