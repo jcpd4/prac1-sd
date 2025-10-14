@@ -7,6 +7,9 @@ import os
 from kafka import KafkaConsumer
 import json
 import database # Módulo de base de datos (se asume implementado)
+from typing import List, Dict, Any, Optional
+from kafka import KafkaConsumer
+from kafka import KafkaConsumer, KafkaProducer  
 
 # --- Configuración global (ajusta los topics) ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
