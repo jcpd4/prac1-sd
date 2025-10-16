@@ -6,34 +6,104 @@ import os
 import json
 import database
 from kafka import KafkaProducer # Usado para enviar telemetría a Central (asíncrono)
+from kafka.errors import NoBrokersAvailable
+
 
 # --- Variables de Estado del Engine ---
-# Se usan para simular el estado interno de salud (OK/KO)
-# El Monitor preguntará por este estado
 ENGINE_STATUS = {"health": "OK", "is_charging": False, "driver_id": None}
 KAFKA_PRODUCER = None
 CP_ID = ""
-
+BROKER = None 
 # Creamos un Lock global para proteger el acceso concurrente a ENGINE_STATUS.
 # Un Lock (cerrojo) garantiza que solo un hilo a la vez puede modificar el estado compartido.
-# Así evitamos condiciones de carrera si llegan comandos simultáneos (p. ej., PARAR y REANUDAR al mismo tiempo).
+# Así evitamos condiciones de carrera si llegan comandos simultáneos (p. e.j, PARAR y REANUDAR al mismo tiempo).
 status_lock = threading.Lock()
 
+# Topic que espera la CENTRAL
+KAFKA_TOPIC_TELEMETRY = "cp_telemetry"
+
+
+# --- Kafka helper ---
+def init_kafka_producer(broker):
+    global KAFKA_PRODUCER
+    if KAFKA_PRODUCER is None:
+        try:
+            KAFKA_PRODUCER = KafkaProducer(
+                bootstrap_servers=[broker],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+            print(f"[ENGINE] Kafka producer conectado a {broker}")
+        except NoBrokersAvailable:
+            print(f"[ENGINE] WARNING: broker {broker} no disponible. Los mensajes se descartarán hasta reconexión.")
+            # lanzar hilo de reintento si se desea (opcional)
+            def _reconnect_loop(broker, interval=5):
+                global KAFKA_PRODUCER
+                while KAFKA_PRODUCER is None:
+                    try:
+                        tmp = KafkaProducer(
+                            bootstrap_servers=[broker],
+                            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+                        )
+                        KAFKA_PRODUCER = tmp
+                        print(f"[ENGINE] Reconectado a Kafka broker {broker}")
+                        break
+                    except Exception as e:
+                        print(f"[ENGINE] Reconexión fallida a {broker}: {e} - reintentando en {interval}s")
+                        time.sleep(interval)
+            threading.Thread(target=_reconnect_loop, args=(broker,), daemon=True).start()
+        except Exception as e:
+            print(f"[ENGINE] ERROR inicializando Kafka producer: {e}")
+            # intentar reconectar en background igual que arriba
+            threading.Thread(target=lambda: time.sleep(1) or init_kafka_producer(broker), daemon=True).start()
+
+def send_telemetry_message(payload):
+    """Envía payload JSON al topic cp_telemetry. No lanza si producer no existe."""
+    global KAFKA_PRODUCER
+    # log local para depuración
+    print(f"[ENGINE] Enviando telemetry -> {payload}")
+    if KAFKA_PRODUCER is None:
+        # Notar: descartamos el mensaje y seguimos; reconector puede restablecer el producer
+        print(f"[ENGINE] AVISO: Kafka producer no inicializado. Mensaje descartado.")
+        return
+    try:
+        KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=payload)
+        KAFKA_PRODUCER.flush()
+    except Exception as e:
+        print(f"[ENGINE] Error enviando telemetry: {e}")
 
 # --- Funciones de Utilidad ---
 def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
+def display_status_loop():
+    """Loop que mantiene el display actualizado cada segundo (para hilo)."""
+    while True:
+        with status_lock:
+            health = ENGINE_STATUS.get('health', 'N/A')
+            cp = CP_ID
+        clear_screen()
+        print(f"--- EV CHARGING POINT ENGINE: {cp} ---")
+        print("="*50)
+        print(f"  ESTADO DE SALUD: {health}")
+        print("  Información de suministro: disponible en la CENTRAL (topic cp_telemetry)")
+        print("="*50)
+        print("Comandos: [F]AIL | [R]ECOVER | [I]NIT | [E]ND")
+        print("-" * 50)
+        try:
+            print("\n> ", end="", flush=True)
+        except Exception:
+            pass
+        time.sleep(1)
+
+
 def display_status():
-    """Muestra el estado actual del Engine en pantalla."""
+    """Muestra el estado actual del Engine en pantalla (única vez)."""
     clear_screen()
     print(f"--- EV CHARGING POINT ENGINE: {CP_ID} ---")
     print("="*50)
     print(f"  ESTADO DE SALUD: {ENGINE_STATUS['health']}")
-    print(f"  ESTADO DE RECARGA: {'Suministrando' if ENGINE_STATUS['is_charging'] else 'Reposo'}")
-    if ENGINE_STATUS['is_charging']:
-        print(f"  CONDUCTOR ASIGNADO: {ENGINE_STATUS['driver_id']}")
+    print("  Información de suministro: disponible en la CENTRAL (topic cp_telemetry)")
     print("="*50)
     print("Comandos: [F]AIL para simular AVERÍA | [R]ECOVER para recuperar")
     print("          [I]NIT para simular ENCHUFAR vehículo (Iniciar Suministro)")
@@ -125,45 +195,113 @@ def start_health_server(host, port):
             
 # --- Funciones de Simulación de Lógica de Negocio (Suministro) ---
 
-def simulate_charging(cp_id):
-    """Simula el envío de telemetría constante a la Central vía Kafka."""
-    global ENGINE_STATUS, KAFKA_PRODUCER
-    
-    kwh_supplied = 0.0
-    price_per_kwh = 0.50 # Ejemplo de precio fijo
-    
-    #Bucle activo mientras el CP esté cargando y Se ejecuta una vez por segundo
-    while ENGINE_STATUS['is_charging']:
-        time.sleep(1) # Cada segundo enviamos un mensaje
-        
-        # 1. Simular consumo
-        kwh_supplied += 0.1 #Cada segundo simula que el CP suministra 0.1 kWh
-        current_cost = kwh_supplied * price_per_kwh #Calcula el coste acumulado
-        
-        # 2. Si hay avería, el suministro debe terminar inmediatamente
-        if ENGINE_STATUS['health'] != 'OK':
-            print("\n[Engine] Suministro terminado súbitamente por avería!")
-            break
+# --- Simulación de Suministro / Producción Kafka ---
+def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1):
+    """
+    Simula el suministro:
+    - Inicializa producer si es necesario.
+    - Envía mensajes CONSUMO cada segundo con campos: type, cp_id, user_id, kwh, importe
+    - Al terminar (usuario), envía SUPPLY_END con totales.
+    - price_per_kwh se usa para calcular importe (opcional; la CENTRAL leerá su precio desde BD).
+    """
+    init_kafka_producer(broker)
+    total_kwh = 0.0
+    total_importe = 0.0
+    aborted_due_to_fault = False
 
-        # 3. Enviar telemetría a Kafka (Topic: cp_telemetry)
-        telemetry_message = {
-            "cp_id": cp_id,
-            "type": "CONSUMO",
-            "kwh": round(kwh_supplied, 2),
-            "importe": round(current_cost, 2),
-            "user_id": ENGINE_STATUS['driver_id']
-        }
-        
-        try:
-            KAFKA_PRODUCER.send('cp_telemetry', value=telemetry_message)
-            # print(f"[Engine] Enviado CONSUMO: {kwh_supplied:.2f} kWh")
-        except Exception as e:
-            print(f"[Engine] ERROR: No se pudo enviar mensaje a Kafka: {e}")
-            
-    # Al finalizar el bucle, nos aseguramos de que el estado se actualice
-    ENGINE_STATUS['is_charging'] = False
-    ENGINE_STATUS['driver_id'] = None
-    display_status()
+    with status_lock:
+        ENGINE_STATUS['is_charging'] = True
+        ENGINE_STATUS['driver_id'] = driver_id
+
+    print(f"[ENGINE] Inicio suministro CP={cp_id} driver={driver_id}")
+    try:
+        while True:
+            with status_lock:
+                if not ENGINE_STATUS['is_charging']:
+                    break
+                if ENGINE_STATUS['health'] != "OK":
+                    # En caso de avería, notificar y salir
+                    payload_fault = {
+                        "type": "AVERIADO",
+                        "cp_id": cp_id,
+                        "user_id": driver_id,
+                        "kwh": round(total_kwh, 3),
+                        "importe": round(total_importe, 2)
+                    }
+                    send_telemetry_message(payload_fault)
+                    aborted_due_to_fault = True
+                    return
+
+            # Incremento de ejemplo por segundo
+            total_kwh += step_kwh
+            total_importe = total_kwh * price_per_kwh
+
+            payload = {
+                "type": "CONSUMO",
+                "cp_id": cp_id,
+                "user_id": driver_id,
+                "kwh": round(total_kwh, 3),
+                "importe": round(total_importe, 2)
+            }
+            send_telemetry_message(payload)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+       # En caso de aborto por avería no enviamos SUPPLY_END; en caso normal sí.
+        if not aborted_due_to_fault:
+            payload_end = {
+                "type": "SUPPLY_END",
+                "cp_id": cp_id,
+                "user_id": driver_id,
+                "kwh": round(total_kwh, 3),
+                "importe": round(total_importe, 2)
+            }
+            send_telemetry_message(payload_end)
+
+        with status_lock:
+            ENGINE_STATUS['is_charging'] = False
+            ENGINE_STATUS['driver_id'] = None
+
+        if aborted_due_to_fault:
+            print(f"[ENGINE] SUMINISTRO abortado por AVERÍA CP={cp_id} driver={driver_id} kwh={total_kwh} importe={total_importe}")
+        else:
+            print(f"[ENGINE] FIN suministro CP={cp_id} driver={driver_id} kwh={total_kwh} importe={total_importe}")
+
+# --- Funciones de control para simular fallos y finalizar ---
+def stop_charging():
+    with status_lock:
+        ENGINE_STATUS['is_charging'] = False
+
+def simulate_fault(cp_id, broker, driver_id):
+    """Forzar avería: set health 'KO' y enviar mensaje AVERIADO / CONEXION_PERDIDA."""
+    init_kafka_producer(broker)
+    with status_lock:
+        ENGINE_STATUS['health'] = "KO"
+    payload = {
+        "type": "AVERIADO",
+        "cp_id": cp_id,
+        "user_id": driver_id,
+        "kwh": 0.0,
+        "importe": 0.0
+    }
+    send_telemetry_message(payload)
+    print(f"[ENGINE] Simulado AVERIA CP={cp_id}")
+
+def simulate_connection_lost(cp_id, broker, driver_id):
+    init_kafka_producer(broker)
+    payload = {
+        "type": "CONEXION_PERDIDA",
+        "cp_id": cp_id,
+        "user_id": driver_id,
+        "kwh": 0.0,
+        "importe": 0.0
+    }
+    send_telemetry_message(payload)
+    print(f"[ENGINE] Simulado CONEXION_PERDIDA CP={cp_id}")
+
+
+
 
 # --- Funciones de Entrada de Usuario (Simulación de Teclas) ---
 def process_user_input():
@@ -180,51 +318,41 @@ def process_user_input():
                 # Simular Avería (KO)
                 if ENGINE_STATUS['health'] == 'OK':
                     #Cambiamos el estado de salud a "KO".
-                    ENGINE_STATUS['health'] = 'KO'
-                    #El Monitor lo detectará en 1 segundo y avisará a la Central.
+                    with status_lock:
+                        ENGINE_STATUS['health'] = 'KO'
                     print("\n[Engine] *** ESTADO INTERNO: AVERÍA (KO) ***. El Monitor notificará a Central.")
-                display_status()
+                display_status()  # snapshot
                 
             elif command == 'R' or command == 'RECOVER':
                 # Simular Recuperación
                 if ENGINE_STATUS['health'] == 'KO':
                     #Restablecemos el estado de salud a "OK"
-                    ENGINE_STATUS['health'] = 'OK'
+                    with status_lock:
+                        ENGINE_STATUS['health'] = 'OK'
                     print("\n[Engine] *** ESTADO INTERNO: RECUPERADO (OK) ***. El Monitor notificará a Central.")
-                display_status()
+                display_status()  # snapshot
                 
             elif command == 'I' or command == 'INIT':
-                # Simular INICIO de Suministro (Enganchar vehículo)
-                if not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK':
-                    # TO-DO: El driver_id debe venir de la Central tras la autorización,
-                    # aquí lo forzamos para la simulación.
-                    ENGINE_STATUS['is_charging'] = True
-                    ENGINE_STATUS['driver_id'] = f"DRIVER-{time.time_ns() % 100}" 
+                with status_lock:
+                    can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
+                if can_start:
+                    with status_lock:
+                        ENGINE_STATUS['is_charging'] = True
+                        ENGINE_STATUS['driver_id'] = f"DRIVER-{time.time_ns() % 100}" 
                     print(f"\n[Engine] *** SUMINISTRO INICIADO *** para {ENGINE_STATUS['driver_id']}.")
-                    #Lanzamos simulate_charging en un nuevo hilo, para que pueda seguir escuchando comandos.
-                    threading.Thread(target=simulate_charging, args=(CP_ID,)).start()
-                display_status()
+                    threading.Thread(
+                        target=simulate_charging,
+                        args=(CP_ID, BROKER, ENGINE_STATUS['driver_id']), 
+                        daemon=True
+                    ).start()
+                display_status()  # snapshot
                 
             elif command == 'E' or command == 'END':
-                 # Simular FIN de Suministro (Desenganchar vehículo)
-                if ENGINE_STATUS['is_charging']:
-                    user_id_finished = ENGINE_STATUS['driver_id']
-                    
-                    ENGINE_STATUS['is_charging'] = False # Detiene el bucle simulate_charging
-                    print("\n[Engine] *** SUMINISTRO FINALIZADO ***. Notificando a Central...")
-                    
-                    # 1. Enviar mensaje de finalización a Central (Kafka)
-                    finish_message = {
-                        "cp_id": CP_ID,
-                        "type": "SUPPLY_END",  # <-- Envía un mensaje "SUPPLY_END" a Kafka para que la Central sepa que ha terminado.
-                        "user_id": user_id_finished
-                    }
-                    try:
-                        KAFKA_PRODUCER.send('cp_telemetry', value=finish_message)
-                    except Exception as e:
-                        print(f"[Engine] ERROR al enviar fin de suministro a Kafka: {e}")
-
-                display_status()
+                with status_lock:
+                    if ENGINE_STATUS['is_charging']:
+                        ENGINE_STATUS['is_charging'] = False
+                        print("\n[Engine] *** SUMINISTRO FINALIZADO ***. Notificando a Central (por hilo de simulación)...")
+                display_status()  # snapshot
               #End Of File (fin de entrada) 
               #Este error ocurre cuando input() intenta leer del teclado, pero no hay más entrada disponible 
         except EOFError:
@@ -246,25 +374,21 @@ if __name__ == "__main__":
         CP_ID = sys.argv[3]
         ENGINE_HOST = '0.0.0.0' #significa que el servidor acepta conexiones desde cualquier IP local
         
+
+        # Guardamos broker global para que otros hilos lo usen al arrancar simulate_charging
+        BROKER = KAFKA_BROKER
         # Inicializar el Productor Kafka (una sola vez)
-        KAFKA_PRODUCER = KafkaProducer(
-            #Este parámetro le dice al productor a qué broker Kafka conectarse.
-            bootstrap_servers=[KAFKA_BROKER], #Ej localhost:9092"
-            
-            #Kafka solo transmite bytes, no objetos de Python. Por eso:
-            #1.Convierte el diccionario en JSON con json.dumps(v)
-            #2.Luego convierte el JSON en bytes con .encode('utf-8')
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
+        init_kafka_producer(KAFKA_BROKER)
         print(f"[Engine] Productor Kafka inicializado para {KAFKA_BROKER}")
 
+        
         # 1. Iniciar el servidor TCP de sockets para el Monitor (hilo de salud)
         threading.Thread(target=start_health_server, args=(ENGINE_HOST, ENGINE_PORT), daemon=True).start()
 
         # 2. Muestra el estado actual del Engine continuamente en pantalla.
         # ¡IMPORTANTE! display_status se ejecuta en un hilo separado para no bloquear la entrada del usuario input() en process_user_input()
         #sino nos quedariamos esperando el input y no podriamos actualizar el display cada segundo 
-        threading.Thread(target=display_status, daemon=True).start()
+        threading.Thread(target=display_status_loop, daemon=True).start()
 
         # 3. El hilo principal ejecuta la entrada de comandos del usuario
         #    process_user_input contiene el 'input()' que bloquea el prompt,

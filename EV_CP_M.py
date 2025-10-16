@@ -130,10 +130,15 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
             print("¡Conectado al servidor central! Enviando registro.")
             
             #2 Enviamos mensaje de registro al servidor Central.
-            register_message = f"REGISTER#{cp_id}#{location}" #Ej "REGISTER#CP01#C/ Serrano 10"
+            price = database.get_cp_price(cp_id) if hasattr(database, 'get_cp_price') else None
+            if price is not None:
+                register_message = f"REGISTER#{cp_id}#{location}#{price}"
+            else:
+                register_message = f"REGISTER#{cp_id}#{location}"
             central_socket.sendall(register_message.encode('utf-8'))
+            print(f"[Monitor] Enviado REGISTER (with price={price}): {register_message}")
             # Aseguramos modo blocking normal (sin timeout de conexión)
-            central_socket.settimeout(None)
+            central_socket.settimeout(5) # Timeout para recv (espera max 5s por datos)
 
 
             # 3. Iniciar el hilo de Monitorizacion Local si aun no esta activo

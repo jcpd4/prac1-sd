@@ -16,8 +16,17 @@ KAFKA_TOPIC_CENTRAL_ACTIONS = 'central_actions' # Central -> CP (Parar/Reanudar)
 KAFKA_TOPIC_DRIVER_NOTIFY = 'driver_notifications' # Central -> Drivers
 
 # Diccionario para almacenar la referencia a los sockets de los CPs activos
-# Esto es para que la Central pueda enviar comandos síncronos si es necesario.
 active_cp_sockets = {} 
+
+# Lock para proteger active_cp_sockets y lista de mensajes compartidos
+active_cp_lock = threading.Lock()
+
+def push_message(msg_list, msg, maxlen=200):
+    """Añade msg a msg_list y mantiene solo los últimos maxlen elementos."""
+    msg_list.append(msg)
+    if len(msg_list) > maxlen:
+        # eliminar los más antiguos
+        del msg_list[0:len(msg_list)-maxlen]
 
 # --- Funciones del Panel de Monitorización ---
 def clear_screen():
@@ -45,7 +54,7 @@ def display_panel(central_messages, driver_requests):
         clear_screen()
         #Imprime la cabecera del panel.
         print("--- PANEL DE MONITORIZACIÓN DE EV CHARGING ---")
-        print("="*50)
+        print("="*80)
         
         #1. --- Sección de Puntos de Recarga (CPs) ---
         #Recupera todos los CPs registrados en la base de datos.
@@ -53,13 +62,22 @@ def display_panel(central_messages, driver_requests):
         if not all_cps:
             print("No hay Puntos de Recarga registrados.")
         else:
-            print(f"{'ID':<10} | {'UBICACIÓN':<25} | {'ESTADO':<20}")
-            print("-"*50)
-            for cp in all_cps:   #para imprimir el estado con color ANSI
+            # Añadimos columna de precio
+            print(f"{'ID':<10} | {'UBICACIÓN':<25} | {'PRECIO':<12} | {'ESTADO':<20}")
+            print("-"*80)
+            for cp in all_cps:
+                price = database.get_cp_price(cp['id'])
+                price_str = f"{price:.2f} €/kWh" if price is not None else "N/A"
                 colored_status = get_status_color(cp['status'])
-                print(f"{cp['id']:<10} | {cp['location']:<25} | {colored_status}")
+                print(f"{cp['id']:<10} | {cp['location']:<25} | {price_str:<12} | {colored_status}")
 
-        print("="*50)
+                # Si está suministrando, mostramos datos de consumo acumulado
+                if cp.get('status') == 'SUMINISTRANDO':
+                    kwh = cp.get('kwh', 0.0)
+                    importe = cp.get('importe', 0.0)
+                    driver = cp.get('driver_id', 'N/A')
+                    print(f"    -> SUMINISTRANDO: {kwh:.3f} kWh  |  {importe:.2f} €  |  driver: {driver}")
+        print("="*80)
 
         #2. --- Sección Peticiones de Conductores (Kafka) ---
         print("\n*** PETICIONES DE CONDUCTORES EN CURSO (Kafka) ***")
@@ -93,71 +111,111 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests):
             KAFKA_TOPIC_REQUESTS,
             KAFKA_TOPIC_STATUS,
             bootstrap_servers=[kafka_broker],
-            auto_offset_reset='latest', # Solo lee mensajes nuevos
+            auto_offset_reset='latest',
             group_id='central-processor',
             value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        )
+
+        # Productor para enviar notificaciones a drivers (autorización / ticket)
+        producer = KafkaProducer(
+            bootstrap_servers=[kafka_broker],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
         central_messages.append(f"Kafka Consumer: Conectado al broker {kafka_broker}")
     except Exception as e:
         central_messages.append(f"ERROR: No se pudo conectar a Kafka ({kafka_broker}): {e}")
         return
 
+
+
     for message in consumer:
         try:
             payload = message.value
             topic = message.topic
-            
+
+            # ---- Peticiones de drivers (driver_requests) ----
             if topic == KAFKA_TOPIC_REQUESTS:
-                # Un conductor solicita servicio
-                driver_requests.append({'cp_id': payload['cp_id'], 'user_id': payload['user_id'], 'timestamp': time.strftime('%H:%M:%S')})
-                
-                # --- Lógica de Gobierno ---
-                # 1. Comprobar disponibilidad del CP
-                cp_status = database.get_cp_status(payload['cp_id'])
-                
+                cp_id = payload.get('cp_id')
+                user_id = payload.get('user_id')
+                # Usar 'timestamp' para compatibilizar con display_panel
+                ts = time.strftime('%H:%M:%S')
+                driver_requests.append({'cp_id': cp_id, 'user_id': user_id, 'timestamp': ts})
+                # Log inmediato en consola para trazabilidad
+                print(f"[CENTRAL][KAFKA] Recibida petición de Driver {user_id} para CP {cp_id} a las {ts}")
+
+                # Autorizar solo si CP está ACTIVADO
+                cp_status = database.get_cp_status(cp_id)
                 if cp_status == 'ACTIVADO':
-                    # 2. Si está disponible, solicitar autorización al CP (via socket, ya que es bidireccional y síncrono)
-                    # Aquí se usaría active_cp_sockets para enviar la solicitud de autorización
-                    # Por simplicidad, solo notificamos
-                    central_messages.append(f"Petición OK. Autorizando a Driver {payload['user_id']} en CP {payload['cp_id']}.")
-                    # TO-DO: Implementar la lógica de sockets para la autorización al Engine
-                    # TO-DO: Usar KafkaProducer para notificar al conductor (KAFKA_TOPIC_DRIVER_NOTIFY)
+                    notify = {"type": "AUTH_OK", "cp_id": cp_id, "user_id": user_id, "message": "Autorizado"}
+                    producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=notify)
+                    producer.flush()
+                    central_messages.append(f"AUTORIZADO: Driver {user_id} -> CP {cp_id}")
+                    print(f"[CENTRAL] AUTORIZACIÓN enviada a Driver {user_id} para CP {cp_id}")
                 else:
-                    central_messages.append(f"Petición RECHAZADA. CP {payload['cp_id']} no disponible ({cp_status}).")
-                    # TO-DO: Usar KafkaProducer para notificar la denegación al conductor
-                
-                # Limpiamos la petición después de procesar (en un sistema real se procesaría de forma más robusta)
-                if driver_requests and driver_requests[0]['cp_id'] == payload['cp_id']:
-                    driver_requests.pop(0)
+                    notify = {"type": "AUTH_DENIED", "cp_id": cp_id, "user_id": user_id, "reason": cp_status}
+                    producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=notify)
+                    producer.flush()
+                    central_messages.append(f"DENEGADO: Driver {user_id} -> CP {cp_id} (estado={cp_status})")
+                    print(f"[CENTRAL] DENEGACIÓN enviada a Driver {user_id} para CP {cp_id} (estado={cp_status})")
+
+                # opcional: eliminar petición procesada de la lista (primera coincidencia)
+                for i, req in enumerate(driver_requests):
+                    if req.get('cp_id') == cp_id and req.get('user_id') == user_id:
+                        del driver_requests[i]
+                        break
 
             elif topic == KAFKA_TOPIC_STATUS:
-                # Telemetría o estado del CP (por ejemplo, CONSUMO)
-                
-                # Lógica existente para CONSUMO
-                if payload.get('type') == 'CONSUMO':
-                    # 1. ACTUALIZAR CONSUMO (como ya lo tenías)
-                    database.update_cp_consumption(payload['cp_id'], payload['kwh'], payload['importe'], payload['user_id'])
-                    
-                    # 2. AÑADIR CAMBIO DE ESTADO A SUMINISTRANDO AQUÍ
-                    #    La Central debe actualizar la BD a SUMINISTRANDO.
-                    if database.get_cp_status(payload['cp_id']) != 'SUMINISTRANDO':
-                        database.update_cp_status(payload['cp_id'], 'SUMINISTRANDO')
-                        central_messages.append(f"INFO: CP {payload['cp_id']} ha comenzado el suministro (Driver {payload['user_id']}).")
-                # NUEVA LÓGICA: FIN DE SUMINISTRO
-                if payload.get('type') == 'SUPPLY_END': 
-                    # El CP ha notificado el fin de la recarga
-                    database.update_cp_status(payload['cp_id'], 'ACTIVADO') # <--- CAMBIA A VERDE
-                    central_messages.append(f"INFO: Suministro finalizado en CP {payload['cp_id']} por Driver {payload['user_id']}.")
-                    # TO-DO: Enviar "ticket" final al conductor.
+                msg_type = payload.get('type', '').upper()
+                cp_id = payload.get('cp_id')
 
-                # Lógica existente para AVERIADO
-                if payload.get('type') == 'AVERIADO' or payload.get('type') == 'CONEXION_PERDIDA':
-                    database.update_cp_status(payload['cp_id'], 'AVERIADO')
-                    # REGISTRA EL CP SI NO EXISTE ANTES DE ACTUALIZAR ESTADO
-                    if database.get_cp_status(payload['cp_id']) == 'NO_EXISTE':
-                        database.register_cp(payload['cp_id'], 'Ubicación desconocida')
-                    database.update_cp_status(payload['cp_id'], 'AVERIADO')
-                    central_messages.append(f"ALARMA: CP {payload['cp_id']} ha reportado una AVERÍA crítica.")
+                # Consumo periódico (ENGINE envía cada segundo)
+                if msg_type == 'CONSUMO':
+                    kwh = float(payload.get('kwh', 0))
+                    importe = float(payload.get('importe', 0))
+                    driver_id = payload.get('user_id') or payload.get('driver_id')
+
+                    # Si el CP no está registrado, lo creamos automáticamente
+                    current_status = database.get_cp_status(cp_id)
+                    if current_status == 'NO_EXISTE' or current_status is None:
+                        database.register_cp(cp_id, "Desconocida")
+                        database.update_cp_status(cp_id, 'ACTIVADO')
+                        push_message(central_messages, f"AUTOREGISTRO: CP {cp_id} registrado automáticamente (ubicación desconocida).")
+
+                    # Actualiza BD (esto marcará SUMINISTRANDO)
+                    database.update_cp_consumption(cp_id, kwh, importe, driver_id)
+
+                    # Recuperar precio real desde la BD (no calcularlo)
+                    price = database.get_cp_price(cp_id)
+                    price_str = f"{price:.2f} €/kWh" if price is not None else "N/A"
+
+                    push_message(central_messages,
+                        f"TELEMETRÍA: CP {cp_id} - {kwh:.3f} kWh - {importe:.2f} € - driver {driver_id} - precio {price_str}"
+                    )
+
+                # Fin de suministro: generar ticket final y limpiar consumo
+                elif msg_type == 'SUPPLY_END':
+                    kwh = float(payload.get('kwh', 0))
+                    importe = float(payload.get('importe', 0))
+                    driver_id = payload.get('user_id') or payload.get('driver_id')
+
+                    # Limpiar campos de consumo y dejar CP disponible (clear_cp_consumption hace ACTIVADO)
+                    database.clear_cp_consumption(cp_id)
+
+                    central_messages.append(
+                        f"TICKET FINAL: CP {cp_id} - driver {driver_id} - {kwh:.3f} kWh - {importe:.2f} €"
+                    )
+
+                    # Notificar ticket al driver si corresponde
+                    try:
+                        ticket_msg = {"type": "TICKET", "cp_id": cp_id, "user_id": driver_id, "kwh": kwh, "importe": importe}
+                        producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=ticket_msg)
+                        producer.flush()
+                    except Exception as e:
+                        central_messages.append(f"ERROR: no se pudo notificar ticket a driver {driver_id}: {e}")
+               # Eventos de avería / pérdida de conexión
+                elif msg_type in ('AVERIADO', 'CONEXION_PERDIDA', 'FAULT'):
+                    database.update_cp_status(cp_id, 'AVERIADO')
+                    central_messages.append(f"ALERTA: CP {cp_id} reporta AVERÍA/CONEXIÓN. Estado -> AVERIADO")
 
         except Exception as e:
             central_messages.append(f"Error al procesar mensaje de Kafka: {e}")
@@ -173,12 +231,12 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages):
         - ACK#PARAR o ACK#REANUDAR → confirmaciones de comandos.
         - Otros mensajes informativos.
     """
-    message = data.decode('utf-8').strip().upper()  # Normalizamos
-    print(f"[DEBUG CENTRAL] Recibido: {message}")
-    central_messages.append(f"CP {cp_id} -> CENTRAL: {message}")
-
-    parts = message.split('#')
-    command = parts[0] if parts else ""
+    raw = data.decode('utf-8').strip()
+    # Normalizamos comando (solo la parte del comando), pero mantenemos el resto
+    parts = raw.split('#')
+    command = parts[0].upper() if parts else ""
+    print(f"[DEBUG CENTRAL] Recibido raw: {raw} -> command: {command}")
+    push_message(central_messages, f"CP {cp_id} -> CENTRAL: {raw}")
 
     # --- Reporte de avería desde el Monitor ---
     if command == 'FAULT':
@@ -211,11 +269,11 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages):
                 )
 
     elif command == 'NACK':
-        central_messages.append(f"CP {cp_id} rechazó el comando: {message}")
+        central_messages.append(f"CP {cp_id} rechazó el comando: {raw}")
 
     # --- Otros mensajes no reconocidos ---
     else:
-        central_messages.append(f"INFO: Mensaje no reconocido de {cp_id}: {message}")
+        central_messages.append(f"INFO: Mensaje no reconocido de {cp_id}: {raw}")
 
 
 
@@ -228,17 +286,25 @@ def handle_client(client_socket, address, central_messages):
         message = client_socket.recv(1024).decode('utf-8')
         parts = message.strip().split('#')
 
-        if len(parts) == 3 and parts[0] == 'REGISTER':
+        if len(parts) >= 3 and parts[0] == 'REGISTER':
             cp_id = parts[1]
             location = parts[2]
-            
+            # Si se envía precio opcional: REGISTER#CP_ID#LOCATION#PRICE
+            price = None
+            if len(parts) >= 4:
+                try:
+                    price = float(parts[3])
+                except Exception:
+                    price = None
+
             # Registrar en la BD y actualizar estado a ACTIVADO
-            database.register_cp(cp_id, location)
+            database.register_cp(cp_id, location, price_per_kwh=price)
             database.update_cp_status(cp_id, 'ACTIVADO')
-            central_messages.append(f"CP '{cp_id}' registrado/actualizado desde {address}. Estado: ACTIVADO")
-            
+            push_message(central_messages, f"CP '{cp_id}' registrado/actualizado desde {address}. Estado: ACTIVADO (price={price})")
+
             # Guardamos la referencia del socket para envíos síncronos (autorización/órdenes)
-            active_cp_sockets[cp_id] = client_socket 
+            with active_cp_lock:
+                active_cp_sockets[cp_id] = client_socket 
             
             # 2. Empieza a escuchar continuamente mensajes del CP
             while True:
@@ -258,19 +324,17 @@ def handle_client(client_socket, address, central_messages):
     finally:
         # 3. Desconexión
         if cp_id:
-            central_messages.append(f"Conexión con CP '{cp_id}' perdida.")
-
+            push_message(central_messages, f"Conexión con CP '{cp_id}' perdida.")
             # Solo marcar DESCONECTADO si NO estaba ya AVERIADO
             current_status = database.get_cp_status(cp_id)
             if current_status not in ['AVERIADO', 'FUERA_DE_SERVICIO']:
                 database.update_cp_status(cp_id, 'DESCONECTADO')
             else:
-                central_messages.append(f"INFO: CP {cp_id} cerró conexión estando en estado '{current_status}'.")
+                push_message(central_messages, f"INFO: CP {cp_id} cerró conexión estando en estado '{current_status}'.")
 
-
-            if cp_id in active_cp_sockets:
-                del active_cp_sockets[cp_id]  # Eliminamos la referencia
-
+            with active_cp_lock:
+                if cp_id in active_cp_sockets:
+                    del active_cp_sockets[cp_id]
         client_socket.close()
 
 def start_socket_server(host, port, central_messages):

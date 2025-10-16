@@ -5,6 +5,7 @@ import json
 from kafka import KafkaConsumer, KafkaProducer
 import threading
 import os
+from collections import deque
 
 # --- Configuración (Debe coincidir con ev_central.py) ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests'
@@ -41,13 +42,13 @@ def process_central_notifications(kafka_broker, client_id, messages):
             # if payload.get('user_id') == client_id:
             
             if payload.get('type') == 'AUTH_OK':
-                messages.append(f"🟢 [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
+                messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
                 
             elif payload.get('type') == 'AUTH_DENIED':
-                messages.append(f"🔴 [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
+                messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
                 
             elif payload.get('type') == 'TICKET':
-                messages.append(f"🧾 [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
+                messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
             
             else:
                 messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
@@ -64,8 +65,9 @@ def display_driver_panel(messages):
         print("ESTADO: Listo para solicitar recarga.")
         print("COMANDOS: SOLICITAR <CP_ID> | [Q]UIT")
         print("="*50)
-        print("\n*** LOG DE COMUNICACIONES ***")
-        for msg in messages:
+        print("\n*** LOG DE COMUNICACIONES (últimas) ***")
+        # Si messages es deque o lista, iterar sobre él:
+        for msg in list(messages):
             print(msg)
         time.sleep(1)
 
@@ -77,36 +79,77 @@ def start_driver_interactive_logic(producer, messages):
     
     while True:
         try:
-            # El input() se ejecuta en el hilo principal
-            command_line = input("DRIVER> ").strip().upper()
-            
-            if command_line == 'QUIT' or command_line == 'Q':
-                # Esto detiene la ejecución del hilo principal y, por tanto, del programa.
+            # Solo una lectura de input()
+            command_line = input("DRIVER> ").strip()
+            if not command_line:
+                continue
+            if command_line.upper() in ('QUIT', 'Q'):
                 raise KeyboardInterrupt 
-            
+
             parts = command_line.split()
-            command = parts[0]
-            
-            if command == 'SOLICITAR' and len(parts) == 2:
+            command = parts[0].upper() if parts else ""
+
+            if command == 'SOLICITAR':
+                if len(parts) != 2:
+                    messages.append("Uso: SOLICITAR <CP_ID>")
+                    continue
                 cp_id = parts[1]
-                
-                # 1. Construir el mensaje de solicitud
+
                 request_message = {
                     "user_id": CLIENT_ID,
                     "cp_id": cp_id,
                     "timestamp": time.time()
                 }
-                
-                # 2. Enviar a Kafka (Topic: driver_requests)
-                producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
-                producer.flush()
-                messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
-                
+
+                try:
+                    fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
+                    fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER] enviado -> {rm} (ack={rec})"))
+                    fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER] fallo al enviar -> {rm} : {exc}"))
+                    messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
+                except Exception as e:
+                    messages.append(f"[ERROR KAFKA] No se pudo enviar la petición: {e}")
+                    print(f"[DRIVER] fallo al enviar -> {request_message} : {e}")
+
+            # Envío por lotes desde un archivo: cada línea contiene un ID de CP
+            elif command == 'BATCH' and len(parts) == 2:
+                file_path = parts[1]
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as fh:
+                        lines = [l.strip() for l in fh.readlines()]
+                except Exception as e:
+                    messages.append(f"[ERROR] No se pudo leer el archivo de batch: {e}")
+                    continue
+
+                messages.append(f"Iniciando envíos en lote desde {file_path} ({len(lines)} entradas)")
+                print(f"[DRIVER][BATCH] Iniciando envíos desde {file_path} ({len(lines)} entradas)")
+                for line in lines:
+                    if not line:
+                        continue
+                    cp_id = line
+                    request_message = {
+                        "user_id": CLIENT_ID,
+                        "cp_id": cp_id,
+                        "timestamp": time.time()
+                    }
+                    try:
+                        fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
+                        fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER][BATCH] enviado -> {rm} (ack={rec})"))
+                        fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER][BATCH] fallo -> {rm} : {exc}"))
+                        messages.append(f"-> (BATCH) Petición enviada a Central para CP {cp_id}")
+                    except Exception as e:
+                        messages.append(f"[ERROR KAFKA] No se pudo enviar la petición (CP {cp_id}): {e}")
+                        print(f"[DRIVER] fallo al enviar (BATCH) -> {request_message} : {e}")
+                    # pequeño retardo para no saturar
+                    time.sleep(0.3)
+
             else:
-                messages.append("Comando inválido. Uso: SOLICITAR <CP_ID>")
-                
+                messages.append("Comando inválido. Uso: SOLICITAR <CP_ID> o BATCH <FILE>")
+
         except EOFError:
-            time.sleep(0.1) 
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            # Propagar para que main capture y cierre limpio
+            raise
         except Exception as e:
             messages.append(f"Error en el procesamiento de comandos del Driver: {e}")
 
@@ -122,14 +165,25 @@ if __name__ == "__main__":
     CLIENT_ID = sys.argv[2]
     
     # Lista compartida para los logs y notificaciones
-    driver_messages = [f"Driver {CLIENT_ID} iniciado.", f"Broker: {KAFKA_BROKER}"]
+    driver_messages = deque(maxlen=200)
+    driver_messages.append(f"Driver {CLIENT_ID} iniciado.")
+    driver_messages.append(f"Broker: {KAFKA_BROKER}")
 
     try:
         # 1. Inicializar el Productor Kafka
-        kafka_producer = KafkaProducer(
-            bootstrap_servers=[KAFKA_BROKER],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
+        try:
+            # Configure producer for lower latency: acks=1, small linger_ms, limited retries
+            kafka_producer = KafkaProducer(
+                bootstrap_servers=[KAFKA_BROKER],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                acks=1,
+                linger_ms=5,
+                retries=2
+            )
+            driver_messages.append(f"[KAFKA] Producer inicializado en {KAFKA_BROKER}")
+        except Exception as e:
+            driver_messages.append(f"[KAFKA-ERROR] No se pudo inicializar producer: {e}")
+            raise
         
         # 2. Iniciar el Consumidor de Notificaciones en un hilo
         notify_thread = threading.Thread(
