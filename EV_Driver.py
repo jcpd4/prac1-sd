@@ -12,6 +12,12 @@ KAFKA_TOPIC_REQUESTS = 'driver_requests'
 KAFKA_TOPIC_NOTIFY = 'driver_notifications'
 CLIENT_ID = "" # Se asigna desde los argumentos
 
+# === INICIO CAMBIO 1: Almacenamiento del estado de la recarga ===
+# Usaremos un diccionario para guardar la información de la recarga activa
+active_charge_info = {}
+charge_lock = threading.Lock()
+# === FIN CAMBIO 1 ===
+
 def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -36,23 +42,33 @@ def process_central_notifications(kafka_broker, client_id, messages):
     for message in consumer:
         try:
             payload = message.value
-            
-            # NOTA: Aunque la Central no envía actualmente el user_id, 
-            # esta lógica de filtrado sería necesaria en una implementación final
-            # if payload.get('user_id') == client_id:
-            
-            if payload.get('type') == 'AUTH_OK':
-                messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
+
+            # === INICIO CAMBIO 2: Manejar nuevos tipos de mensajes ===
+            with charge_lock:
+                if payload.get('type') == 'AUTH_OK':
+                    messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
+                    # Preparamos el diccionario para recibir datos de consumo
+                    active_charge_info[payload['cp_id']] = {'kwh': 0.0, 'importe': 0.0}
+                    
+                elif payload.get('type') == 'AUTH_DENIED':
+                    messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
                 
-            elif payload.get('type') == 'AUTH_DENIED':
-                messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
+                elif payload.get('type') == 'CONSUMO_UPDATE':
+                    # ¡NUEVO! Actualizamos los datos de la recarga activa
+                    cp_id = payload['cp_id']
+                    if cp_id in active_charge_info:
+                        active_charge_info[cp_id]['kwh'] = payload['kwh']
+                        active_charge_info[cp_id]['importe'] = payload['importe']
+
+                elif payload.get('type') == 'TICKET':
+                    messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
+                    # Limpiamos la información de la recarga activa
+                    if payload['cp_id'] in active_charge_info:
+                        del active_charge_info[payload['cp_id']]
                 
-            elif payload.get('type') == 'TICKET':
-                messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
-            
-            else:
-                messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
-        
+                else:
+                    messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
+            # === FIN CAMBIO 2 ===        
         except Exception as e:
             messages.append(f"[ERROR] Procesando notificación: {e}")
 
@@ -62,7 +78,17 @@ def display_driver_panel(messages):
         clear_screen()
         print(f"--- EV DRIVER APP: CLIENTE {CLIENT_ID} ---")
         print("="*50)
-        print("ESTADO: Listo para solicitar recarga.")
+        # === INICIO CAMBIO 3: Mostrar datos de consumo si hay recarga activa ===
+        with charge_lock:
+            if not active_charge_info:
+                print("ESTADO: Listo para solicitar recarga.")
+            else:
+                # Mostramos la información de la primera (y única) recarga activa
+                for cp_id, data in active_charge_info.items():
+                    print(f"ESTADO: 🔋 Suministrando en {cp_id}...")
+                    print(f"   Consumo: {data['kwh']:.3f} kWh")
+                    print(f"   Coste actual: {data['importe']:.2f} €")
+        # === FIN CAMBIO 3 ===
         print("COMANDOS: SOLICITAR <CP_ID> | [Q]UIT")
         print("="*50)
         print("\n*** LOG DE COMUNICACIONES (últimas) ***")

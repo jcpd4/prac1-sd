@@ -184,6 +184,15 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests):
                     # Actualiza BD (esto marcará SUMINISTRANDO)
                     database.update_cp_consumption(cp_id, kwh, importe, driver_id)
 
+                    # === AÑADIDO ===
+                    # Reenviar una notificación de consumo al driver a través de su topic
+                    try:
+                        consumo_msg = {"type": "CONSUMO_UPDATE", "cp_id": cp_id, "user_id": driver_id, "kwh": kwh, "importe": importe}
+                        producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=consumo_msg)
+                    except Exception as e:
+                        push_message(central_messages, f"ERROR: no se pudo notificar consumo a driver {driver_id}: {e}")
+                    # === FIN AÑADIDO ===
+
                     # Recuperar precio real desde la BD (no calcularlo)
                     price = database.get_cp_price(cp_id)
                     price_str = f"{price:.2f} €/kWh" if price is not None else "N/A"
