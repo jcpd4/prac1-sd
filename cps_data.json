@@ -8,7 +8,6 @@
     "MAD-01": {
         "id": "MAD-01",
         "location": "C/ Serrano 10",
-        "status": "DESCONECTADO",
-        "driver_id": null
+        "status": "ACTIVADO"
     }
 }

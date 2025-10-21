@@ -14,6 +14,7 @@ KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
 KAFKA_TOPIC_STATUS = 'cp_telemetry'      # CP -> Central (Telemetría/Averías/Consumo)
 KAFKA_TOPIC_CENTRAL_ACTIONS = 'central_actions' # Central -> CP (Parar/Reanudar)
 KAFKA_TOPIC_DRIVER_NOTIFY = 'driver_notifications' # Central -> Drivers
+KAFKA_TOPIC_NETWORK_STATUS = 'network_status' # anunciar el estado de la red (11)
 
 # Diccionario para almacenar la referencia a los sockets de los CPs activos
 active_cp_sockets = {} 
@@ -100,8 +101,30 @@ def display_panel(central_messages, driver_requests):
         print(f"Última actualización: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         time.sleep(2) # El panel se refresca cada 2 segundos
 
+
+# === Añade esta NUEVA FUNCIÓN después de display_panel(11) ===
+def broadcast_network_status(kafka_broker, producer):
+    """
+    Envía periódicamente el estado de todos los CPs a un topic público.
+    """
+    while True:
+        try:
+            all_cps = database.get_all_cps()
+            # Creamos una lista simplificada solo con lo que el driver necesita
+            status_list = [{'id': cp['id'], 'status': cp['status'], 'location': cp['location']} for cp in all_cps]
+            
+            message = {'type': 'NETWORK_STATUS_UPDATE', 'cps': status_list}
+            producer.send(KAFKA_TOPIC_NETWORK_STATUS, value=message)
+            # No es necesario hacer flush aquí para no impactar el rendimiento
+        except Exception as e:
+            # En un sistema real, aquí iría un log más robusto
+            print(f"[ERROR Broadcast] No se pudo enviar el estado de la red: {e}")
+        
+        time.sleep(5) # Envía la actualización cada 5 segundos
+
 # --- Funciones de Kafka ---
-def process_kafka_requests(kafka_broker, central_messages, driver_requests):
+# Añadí el 4 argumento en process_kafka_requests producer y eliminé su creación porque como ya la estoy pasando
+def process_kafka_requests(kafka_broker, central_messages, driver_requests,producer):
     """
     Consumidor Kafka: Recibe peticiones de suministro de los Drivers 
     y mensajes de estado de los CPs.
@@ -114,12 +137,6 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests):
             auto_offset_reset='latest',
             group_id='central-processor',
             value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-
-        # Productor para enviar notificaciones a drivers (autorización / ticket)
-        producer = KafkaProducer(
-            bootstrap_servers=[kafka_broker],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
         )
         central_messages.append(f"Kafka Consumer: Conectado al broker {kafka_broker}")
     except Exception as e:
@@ -455,6 +472,24 @@ if __name__ == "__main__":
         # Usaremos listas compartidas para que los hilos se comuniquen con el panel
         central_messages = ["CENTRAL system status OK"]
         driver_requests = []
+
+        # === INICIO DE LA MODIFICACIÓN en __main__(11) ===
+        # Crear un productor Kafka compartido para que lo usen varios hilos
+        shared_producer = KafkaProducer(
+            bootstrap_servers=[KAFKA_BROKER],
+            value_serializer=lambda v: json.dumps(v).encode('utf-8')
+        )
+
+        # Reemplazar el consumidor de Kafka para que use el productor compartido
+        kafka_thread = threading.Thread(target=process_kafka_requests, args=(KAFKA_BROKER, central_messages, driver_requests, shared_producer))
+        kafka_thread.daemon = True
+        kafka_thread.start()
+
+        # Iniciar el nuevo hilo para anunciar el estado de la red
+        network_broadcast_thread = threading.Thread(target=broadcast_network_status, args=(KAFKA_BROKER, shared_producer))
+        network_broadcast_thread.daemon = True
+        network_broadcast_thread.start()
+        # === FIN DE LA MODIFICACIÓN en __main__ ===
 
         # 1. Configurar la base de datos
         database.setup_database()

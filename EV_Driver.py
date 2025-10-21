@@ -12,6 +12,12 @@ KAFKA_TOPIC_REQUESTS = 'driver_requests'
 KAFKA_TOPIC_NOTIFY = 'driver_notifications'
 CLIENT_ID = "" # Se asigna desde los argumentos
 
+# <<<--- CORRECCIÓN AQUÍ: Faltaban estas líneas ---<<<(11)
+KAFKA_TOPIC_NETWORK_STATUS = 'network_status'
+network_status = {}
+network_status_lock = threading.Lock()
+# >>>----------------------------------------------->>>
+
 # === INICIO CAMBIO 1: Almacenamiento del estado de la recarga ===
 # Usaremos un diccionario para guardar la información de la recarga activa
 active_charge_info = {}
@@ -42,6 +48,21 @@ def process_central_notifications(kafka_broker, client_id, messages):
     for message in consumer:
         try:
             payload = message.value
+            msg_type = payload.get('type')
+            # === ESTE ES EL FILTRO INTELIGENTE Y CORRECTO ===(11)
+            # Los mensajes de autorización/denegación DEBEN ser para nuestro user_id.
+            if msg_type in ['AUTH_OK', 'AUTH_DENIED']:
+                if payload.get('user_id') != client_id:
+                    continue # Ignorar si la autorización no es para mí.
+
+            # Los mensajes de consumo/ticket DEBEN ser de un CP en el que estemos cargando activamente.
+            elif msg_type in ['CONSUMO_UPDATE', 'TICKET']:
+                cp_id_del_mensaje = payload.get('cp_id')
+                with charge_lock:
+                    # Si el CP del mensaje no está en nuestra lista de recargas activas, lo ignoramos.
+                    if cp_id_del_mensaje not in active_charge_info:
+                        continue
+            # === FIN DEL FILTRO INTELIGENTE ===
 
             # === INICIO CAMBIO 2: Manejar nuevos tipos de mensajes ===
             with charge_lock:
@@ -72,30 +93,67 @@ def process_central_notifications(kafka_broker, client_id, messages):
         except Exception as e:
             messages.append(f"[ERROR] Procesando notificación: {e}")
 
+# === AÑADIDO: Nueva función para procesar el estado de la red === (11)
+def process_network_updates(kafka_broker):
+    """Consumidor que escucha el estado general de la red de CPs."""
+    try:
+        consumer = KafkaConsumer(
+            KAFKA_TOPIC_NETWORK_STATUS,
+            bootstrap_servers=[kafka_broker],
+            auto_offset_reset='latest',
+            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+        )
+    except Exception:
+        # No mostramos error para no ensuciar la consola del driver
+        return
+
+    for message in consumer:
+        payload = message.value
+        if payload.get('type') == 'NETWORK_STATUS_UPDATE':
+            with network_status_lock:
+                network_status.clear()
+                for cp in payload.get('cps', []):
+                    network_status[cp['id']] = {'status': cp['status'], 'location': cp['location']}
+# ============================================================= 
+
+
+
+# === MODIFICADO: El panel ahora incluye la lista de CPs disponibles ===(11)
 def display_driver_panel(messages):
     """Muestra el panel de mensajes del conductor de forma continua."""
     while True:
         clear_screen()
         print(f"--- EV DRIVER APP: CLIENTE {CLIENT_ID} ---")
         print("="*50)
-        # === INICIO CAMBIO 3: Mostrar datos de consumo si hay recarga activa ===
+        
+        # Estado de la recarga personal (esto ya lo tenías bien)
         with charge_lock:
             if not active_charge_info:
                 print("ESTADO: Listo para solicitar recarga.")
             else:
-                # Mostramos la información de la primera (y única) recarga activa
                 for cp_id, data in active_charge_info.items():
                     print(f"ESTADO: 🔋 Suministrando en {cp_id}...")
                     print(f"   Consumo: {data['kwh']:.3f} kWh")
                     print(f"   Coste actual: {data['importe']:.2f} €")
-        # === FIN CAMBIO 3 ===
-        print("COMANDOS: SOLICITAR <CP_ID> | [Q]UIT")
+        
+        # --- PUNTOS DE RECARGA DISPONIBLES ---
+        print("\n--- PUNTOS DE RECARGA DISPONIBLES ---")
+        with network_status_lock:
+            # Filtramos para mostrar solo los que están 'ACTIVADO'
+            available_cps = {cp_id: data for cp_id, data in network_status.items() if data['status'] == 'ACTIVADO'}
+            if not available_cps:
+                print("Buscando puntos de recarga en la red...")
+            else:
+                for cp_id, data in available_cps.items():
+                    print(f"  -> {cp_id:<10} ({data['location']})")
+
         print("="*50)
+        print("COMANDOS: SOLICITAR <CP_ID> | [Q]UIT")
         print("\n*** LOG DE COMUNICACIONES (últimas) ***")
-        # Si messages es deque o lista, iterar sobre él:
         for msg in list(messages):
             print(msg)
         time.sleep(1)
+# ===================================================================
 
 def start_driver_interactive_logic(producer, messages):
     """
@@ -218,6 +276,15 @@ if __name__ == "__main__":
             daemon=True
         )
         notify_thread.start()
+
+        # --- AÑADIDO: Iniciar el nuevo hilo para el estado de la red ---(11)
+        network_thread = threading.Thread(
+            target=process_network_updates,
+            args=(KAFKA_BROKER,),
+            daemon=True
+        )
+        network_thread.start()
+        # -----------------------------------------------------------
 
         # 3. Iniciar el Panel de Visualización en un hilo
         panel_thread = threading.Thread(
