@@ -106,6 +106,56 @@ def send_command_to_engine(engine_host, engine_port, command, central_socket):
         print(f"[Monitor] Error al contactar con Engine ({command}): {e}")
         central_socket.sendall(f"NACK#{command}".encode('utf-8'))
 
+def handle_engine_communication(engine_host, engine_port, cp_id, central_ip, central_port):
+    """Maneja la comunicación con el Engine para verificar asignación de driver."""
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server_socket.bind(('127.0.0.1', engine_port + 1000))  # Puerto diferente para evitar conflictos
+        server_socket.listen(1)
+        print(f"[Monitor] Servidor de comunicación con Engine escuchando en puerto {engine_port + 1000}")
+        
+        while True:
+            try:
+                client_socket, address = server_socket.accept()
+                data = client_socket.recv(1024).decode('utf-8').strip()
+                
+                if data.startswith("CHECK_DRIVER_ASSIGNMENT"):
+                    # Verificar asignación de driver consultando a la Central
+                    try:
+                        central_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        central_socket.connect((central_ip, central_port))
+                        central_socket.sendall(f"CHECK_DRIVER#{cp_id}".encode('utf-8'))
+                        response = central_socket.recv(1024).decode('utf-8').strip()
+                        central_socket.close()
+                        client_socket.sendall(response.encode('utf-8'))
+                    except Exception as e:
+                        print(f"[Monitor] Error verificando asignación de driver: {e}")
+                        client_socket.sendall(b"NO_DRIVER")
+                elif data.startswith("CHECK_SESSION"):
+                    # Verificar sesión activa autorizada consultando a la Central
+                    try:
+                        central_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        central_socket.connect((central_ip, central_port))
+                        central_socket.sendall(f"CHECK_SESSION#{cp_id}".encode('utf-8'))
+                        response = central_socket.recv(1024).decode('utf-8').strip()
+                        central_socket.close()
+                        client_socket.sendall(response.encode('utf-8'))
+                    except Exception as e:
+                        print(f"[Monitor] Error verificando sesión activa: {e}")
+                        client_socket.sendall(b"NO_SESSION")
+                else:
+                    client_socket.sendall(b"UNKNOWN_COMMAND")
+                    
+                client_socket.close()
+            except Exception as e:
+                print(f"[Monitor] Error en comunicación con Engine: {e}")
+                
+    except Exception as e:
+        print(f"[Monitor] Error iniciando servidor de comunicación: {e}")
+    finally:
+        server_socket.close()
+
+
 
 # --- Funciones de Conexion y Reporte a la Central ---
 def start_central_connection(central_host, central_port, cp_id, location, engine_host, engine_port):
@@ -130,21 +180,33 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
             print("¡Conectado al servidor central! Enviando registro.")
             
             #2 Enviamos mensaje de registro al servidor Central.
-            price = database.get_cp_price(cp_id) if hasattr(database, 'get_cp_price') else None
-            if price is not None:
-                register_message = f"REGISTER#{cp_id}#{location}#{price}"
-            else:
-                register_message = f"REGISTER#{cp_id}#{location}"
+            # Usar precio por defecto para nuevos CPs
+            default_price = 0.25  # €/kWh por defecto
+            register_message = f"REGISTER#{cp_id}#{location}#{default_price}"
             central_socket.sendall(register_message.encode('utf-8'))
-            print(f"[Monitor] Enviado REGISTER (with price={price}): {register_message}")
+            print(f"[Monitor] Enviado REGISTER (with price={default_price}): {register_message}")
             # Aseguramos modo blocking normal (sin timeout de conexión)
             central_socket.settimeout(5) # Timeout para recv (espera max 5s por datos)
+            
+            # Esperar un momento para que CENTRAL procese el registro antes de iniciar monitoreo
+            time.sleep(3)
 
 
             # 3. Iniciar el hilo de Monitorizacion Local si aun no esta activo
             #Si no existe ya un hilo llamado EngineMonitor, lo creamos.
                                                           #devuelve una lista de todos los hilos activos en este momento  
             if not any(t.name == "EngineMonitor" for t in threading.enumerate()):
+                # Verificar que el Engine esté listo antes de iniciar monitoreo
+                try:
+                    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    test_socket.settimeout(2)
+                    test_socket.connect((engine_host, engine_port))
+                    test_socket.close()
+                    print("[Monitor] Engine verificado como listo. Iniciando monitoreo.")
+                except Exception as e:
+                    print(f"[Monitor] Engine no está listo aún: {e}. Esperando...")
+                    time.sleep(5)  # Esperar más tiempo si el Engine no está listo
+                
                 #Creamos un nuevo hilo que corre monitor_engine_health(...).
                 monitor_thread = threading.Thread(
                     target=monitor_engine_health, 
@@ -155,6 +217,17 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                 monitor_thread.daemon = True
                 monitor_thread.start()
                 print("[Monitor] Hilo de monitorización del Engine iniciado.")
+                
+                # Iniciar servidor de comunicación con Engine
+                comm_thread = threading.Thread(
+                    target=handle_engine_communication,
+                    args=(engine_host, engine_port, cp_id, central_host, central_port),
+                    name="EngineCommunication"
+                )
+                comm_thread.daemon = True
+                comm_thread.start()
+                print("[Monitor] Servidor de comunicación con Engine iniciado.")
+                
 
             # 4. Bucle de escucha de comandos de la Central (Parar/Reanudar)
             while True:
@@ -203,6 +276,12 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                     send_command_to_engine(engine_host, engine_port, "REANUDAR", central_socket)
                     parado[0] = False
                     print("[Monitor] CP reanudado. Reanudando operaciones.")
+
+                elif command == 'AUTORIZAR_SUMINISTRO':
+                    print(f"[Monitor] COMANDO CENTRAL: 'AUTORIZAR_SUMINISTRO' recibido → enviando a Engine...")
+                    # Nos conectamos al Engine para ejecutar el comando
+                    send_command_to_engine(engine_host, engine_port, data, central_socket)
+                    print("[Monitor] Comando de autorización de suministro enviado al Engine.")
 
                 else:
                     print(f"Comando desconocido recibido: {command}")

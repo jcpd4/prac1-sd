@@ -31,7 +31,6 @@ def clear_screen():
 def process_central_notifications(kafka_broker, client_id, messages):
     """Consumidor Kafka: Recibe notificaciones de la Central (autorización/ticket)."""
     try:
-        # El consumidor debe escuchar el topic de notificaciones
         consumer = KafkaConsumer(
             KAFKA_TOPIC_NOTIFY,
             bootstrap_servers=[kafka_broker],
@@ -49,47 +48,49 @@ def process_central_notifications(kafka_broker, client_id, messages):
         try:
             payload = message.value
             msg_type = payload.get('type')
-            # === ESTE ES EL FILTRO INTELIGENTE Y CORRECTO ===(11)
-            # Los mensajes de autorización/denegación DEBEN ser para nuestro user_id.
+            
+            # 1. Mantenemos TU FILTRO INTELIGENTE, que es más robusto.
             if msg_type in ['AUTH_OK', 'AUTH_DENIED']:
                 if payload.get('user_id') != client_id:
-                    continue # Ignorar si la autorización no es para mí.
-
-            # Los mensajes de consumo/ticket DEBEN ser de un CP en el que estemos cargando activamente.
-            elif msg_type in ['CONSUMO_UPDATE', 'TICKET']:
+                    continue
+            elif msg_type in ['CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR']: # <-- Añadimos el nuevo tipo de mensaje aquí
                 cp_id_del_mensaje = payload.get('cp_id')
                 with charge_lock:
-                    # Si el CP del mensaje no está en nuestra lista de recargas activas, lo ignoramos.
                     if cp_id_del_mensaje not in active_charge_info:
                         continue
-            # === FIN DEL FILTRO INTELIGENTE ===
-
-            # === INICIO CAMBIO 2: Manejar nuevos tipos de mensajes ===
+            
+            # 2. Mantenemos TU LÓGICA DE PROCESAMIENTO y le añadimos la mejora de tu compañero.
             with charge_lock:
-                if payload.get('type') == 'AUTH_OK':
+                if msg_type == 'AUTH_OK':
                     messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
-                    # Preparamos el diccionario para recibir datos de consumo
                     active_charge_info[payload['cp_id']] = {'kwh': 0.0, 'importe': 0.0}
                     
-                elif payload.get('type') == 'AUTH_DENIED':
+                elif msg_type == 'AUTH_DENIED':
                     messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
                 
-                elif payload.get('type') == 'CONSUMO_UPDATE':
-                    # ¡NUEVO! Actualizamos los datos de la recarga activa
+                elif msg_type == 'CONSUMO_UPDATE':
                     cp_id = payload['cp_id']
                     if cp_id in active_charge_info:
                         active_charge_info[cp_id]['kwh'] = payload['kwh']
                         active_charge_info[cp_id]['importe'] = payload['importe']
 
-                elif payload.get('type') == 'TICKET':
+                elif msg_type == 'TICKET':
                     messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
-                    # Limpiamos la información de la recarga activa
                     if payload['cp_id'] in active_charge_info:
                         del active_charge_info[payload['cp_id']]
                 
-                else:
-                    messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
-            # === FIN CAMBIO 2 ===        
+                # 3. AÑADIMOS EL MANEJO DE SUPPLY_ERROR DE TU COMPAÑERO
+                elif msg_type == 'SUPPLY_ERROR':
+                    reason = payload.get('reason', 'Carga interrumpida')
+                    kwh_p = payload.get('kwh_partial', 0)
+                    imp_p = payload.get('importe_partial', 0)
+                    messages.append(f" [ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {payload['cp_id']}")
+                    # También limpiamos la recarga activa, ya que se ha interrumpido
+                    if payload['cp_id'] in active_charge_info:
+                        del active_charge_info[payload['cp_id']]
+
+                elif msg_type and msg_type not in ['AUTH_OK', 'AUTH_DENIED', 'CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR']:
+                     messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
         except Exception as e:
             messages.append(f"[ERROR] Procesando notificación: {e}")
 
@@ -179,13 +180,16 @@ def start_driver_interactive_logic(producer, messages):
                     continue
                 cp_id = parts[1]
 
+                print(f"[DRIVER] Solicitando carga en CP {cp_id}...")
                 request_message = {
+                    "type": "REQUEST_CHARGE",
                     "user_id": CLIENT_ID,
                     "cp_id": cp_id,
                     "timestamp": time.time()
                 }
 
                 try:
+                    print(f"[DRIVER] Esperando respuesta de CENTRAL...")
                     fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER] enviado -> {rm} (ack={rec})"))
                     fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER] fallo al enviar -> {rm} : {exc}"))
@@ -211,6 +215,7 @@ def start_driver_interactive_logic(producer, messages):
                         continue
                     cp_id = line
                     request_message = {
+                        "type": "REQUEST_CHARGE",
                         "user_id": CLIENT_ID,
                         "cp_id": cp_id,
                         "timestamp": time.time()
