@@ -59,6 +59,19 @@ def init_kafka_producer(broker):
 def send_telemetry_message(payload):
     """Envía payload JSON al topic cp_telemetry. No lanza si producer no existe."""
     global KAFKA_PRODUCER
+    
+    # Para mensajes de avería/conexión/finalización, permitir envío sin validación de carga activa
+    msg_type = payload.get('type', '').upper()
+    if msg_type in ['AVERIADO', 'CONEXION_PERDIDA', 'FAULT', 'SESSION_STARTED', 'SUPPLY_END']:
+        # Estos mensajes pueden enviarse sin estar cargando
+        pass
+    else:
+        # Para mensajes de consumo, validar que hay driver activo
+        with status_lock:
+            if not ENGINE_STATUS.get('is_charging') or not ENGINE_STATUS.get('driver_id'):
+                print(f"[ENGINE] AVISO: Telemetría de consumo bloqueada - no hay conductor activo autorizado.")
+                return
+    
     # log local para depuración
     print(f"[ENGINE] Enviando telemetry -> {payload}")
     if KAFKA_PRODUCER is None:
@@ -142,6 +155,23 @@ def handle_monitor_connection(monitor_socket, monitor_address):
             elif data.startswith("REANUDAR"):
                 ENGINE_STATUS['health'] = 'OK'  # Simulamos que está listo para volver a cargar
                 monitor_socket.sendall(b"ACK#REANUDAR")   # Confirmamos acción
+            
+            # --- AUTORIZAR SUMINISTRO ---
+            elif data.startswith("AUTORIZAR_SUMINISTRO"):
+                parts = data.split('#')
+                if len(parts) >= 2:
+                    driver_id = parts[1]
+                    print(f"[ENGINE] Solicitud de carga recibida por CP {CP_ID}. Driver asignado: {driver_id}")
+                    # No iniciar aún; solo registrar autorización. El inicio real ocurre con 'INIT' tras consultar a CENTRAL
+                    with status_lock:
+                        ENGINE_STATUS['driver_id'] = driver_id
+                    print(f"[ENGINE] ACK enviado a CENTRAL")
+                    print(f"[ENGINE] Esperando que el usuario inicie el suministro...")
+                    monitor_socket.sendall(b"ACK#AUTORIZAR_SUMINISTRO")
+                else:
+                    print(f"[ENGINE] ERROR: Formato de autorización inválido")
+                    monitor_socket.sendall(b"NACK#AUTORIZAR_SUMINISTRO")
+            
             # --- COMANDO DESCONOCIDO ---
             else:
                 monitor_socket.sendall(b"ERROR") # Comando no reconocido
@@ -333,25 +363,54 @@ def process_user_input():
                 display_status()  # snapshot
                 
             elif command == 'I' or command == 'INIT':
-                with status_lock:
-                    can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
-                if can_start:
+                print(f"\n[Engine] *** COMANDO INIT RECIBIDO ***")
+                # Consultar a CENTRAL directamente si hay sesión activa autorizada
+                try:
+                    helper_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    helper_socket.connect(('127.0.0.1', ENGINE_PORT + 1000))
+                    helper_socket.sendall(f"CHECK_SESSION#{CP_ID}".encode('utf-8'))
+                    resp = helper_socket.recv(1024).decode('utf-8').strip()
+                    helper_socket.close()
+                except Exception as e:
+                    print(f"[Engine] Error consultando sesión activa: {e}")
+                    resp = "NO_SESSION"
+
+                if resp == "NO_SESSION":
+                    print("[ENGINE] ERROR: No hay conductor autorizado para iniciar el suministro.")
+                else:
+                    driver_id = resp
+                    print(f"[ENGINE] Sesión validada para driver {driver_id}")
                     with status_lock:
-                        ENGINE_STATUS['is_charging'] = True
-                        ENGINE_STATUS['driver_id'] = f"DRIVER-{time.time_ns() % 100}" 
-                    print(f"\n[Engine] *** SUMINISTRO INICIADO *** para {ENGINE_STATUS['driver_id']}.")
-                    threading.Thread(
-                        target=simulate_charging,
-                        args=(CP_ID, BROKER, ENGINE_STATUS['driver_id']), 
-                        daemon=True
-                    ).start()
+                        can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
+                    if not can_start:
+                        print("[ENGINE] No se puede iniciar: ya está cargando o estado KO.")
+                    else:
+                        print(f"[ENGINE] Iniciando suministro para driver {driver_id}...")
+                        with status_lock:
+                            ENGINE_STATUS['is_charging'] = True
+                            ENGINE_STATUS['driver_id'] = driver_id
+                        # Avisar a CENTRAL que la sesión comienza
+                        send_telemetry_message({
+                            "type": "SESSION_STARTED",
+                            "cp_id": CP_ID,
+                            "user_id": driver_id
+                        })
+                        threading.Thread(
+                            target=simulate_charging,
+                            args=(CP_ID, BROKER, driver_id),
+                            daemon=True
+                        ).start()
+                        print(f"[ENGINE] Carga iniciada tras validar sesión para driver {driver_id}.")
                 display_status()  # snapshot
                 
             elif command == 'E' or command == 'END':
                 with status_lock:
                     if ENGINE_STATUS['is_charging']:
+                        print(f"[ENGINE] Finalizando suministro...")
                         ENGINE_STATUS['is_charging'] = False
-                        print("\n[Engine] *** SUMINISTRO FINALIZADO ***. Notificando a Central (por hilo de simulación)...")
+                        print(f"[ENGINE] *** SUMINISTRO FINALIZADO ***. Notificando a Central...")
+                    else:
+                        print(f"[ENGINE] No hay suministro activo para finalizar.")
                 display_status()  # snapshot
               #End Of File (fin de entrada) 
               #Este error ocurre cuando input() intenta leer del teclado, pero no hay más entrada disponible 

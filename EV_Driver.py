@@ -36,19 +36,34 @@ def process_central_notifications(kafka_broker, client_id, messages):
     for message in consumer:
         try:
             payload = message.value
+            print(f"[DRIVER] DEBUG: Recibido mensaje: {payload}")
             
-            # NOTA: Aunque la Central no envía actualmente el user_id, 
-            # esta lógica de filtrado sería necesaria en una implementación final
-            # if payload.get('user_id') == client_id:
+            # Filtrar notificaciones solo para este driver
+            target_driver = payload.get('target_driver')
+            if target_driver and target_driver != client_id:
+                print(f"[DRIVER] DEBUG: Mensaje no es para este driver (target: {target_driver}, client: {client_id})")
+                continue  # Esta notificación no es para este driver
             
             if payload.get('type') == 'AUTH_OK':
+                print(f"[DRIVER] Respuesta de CENTRAL: AUTORIZADO")
                 messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
                 
             elif payload.get('type') == 'AUTH_DENIED':
+                print(f"[DRIVER] Respuesta de CENTRAL: DENEGADO - {payload.get('reason', 'CP no disponible')}")
                 messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
                 
             elif payload.get('type') == 'TICKET':
+                print(f"[DRIVER] Ticket final recibido: {payload['kwh']} kWh, {payload['importe']} €")
                 messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
+            
+            elif payload.get('type') == 'SUPPLY_ERROR':
+                # Mensaje claro cuando la carga se interrumpe por FUERA_DE_SERVICIO o AVERÍA
+                reason = payload.get('reason', 'Carga interrumpida')
+                kwh_p = payload.get('kwh_partial', 0)
+                imp_p = payload.get('importe_partial', 0)
+                messages.append(
+                    f" [ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {payload['cp_id']}"
+                )
             
             else:
                 messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
@@ -95,13 +110,16 @@ def start_driver_interactive_logic(producer, messages):
                     continue
                 cp_id = parts[1]
 
+                print(f"[DRIVER] Solicitando carga en CP {cp_id}...")
                 request_message = {
+                    "type": "REQUEST_CHARGE",
                     "user_id": CLIENT_ID,
                     "cp_id": cp_id,
                     "timestamp": time.time()
                 }
 
                 try:
+                    print(f"[DRIVER] Esperando respuesta de CENTRAL...")
                     fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER] enviado -> {rm} (ack={rec})"))
                     fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER] fallo al enviar -> {rm} : {exc}"))
@@ -127,6 +145,7 @@ def start_driver_interactive_logic(producer, messages):
                         continue
                     cp_id = line
                     request_message = {
+                        "type": "REQUEST_CHARGE",
                         "user_id": CLIENT_ID,
                         "cp_id": cp_id,
                         "timestamp": time.time()
