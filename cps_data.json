@@ -1,0 +1,14 @@
+{
+    "VAL-03": {
+        "id": "VAL-03",
+        "location": "Plaza del Ayuntamiento 1",
+        "status": "DESCONECTADO",
+        "driver_id": null
+    },
+    "MAD-01": {
+        "id": "MAD-01",
+        "location": "C/ Serrano 10",
+        "status": "DESCONECTADO",
+        "driver_id": null
+    }
+}

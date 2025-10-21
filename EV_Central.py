@@ -450,6 +450,16 @@ if __name__ == "__main__":
         # 1. Configurar la base de datos
         database.setup_database()
 
+        # === INICIO DE LA MODIFICACIÓN ===
+        # 1.1. Forzar todos los CPs a estado DESCONECTADO al arrancar
+        # Esto cumple el requisito: "hasta que un punto de recarga no conecte... lo mostrará con el estado DESCONECTADO"
+        all_cps_on_startup = database.get_all_cps()
+        if all_cps_on_startup:
+            print("[CENTRAL] Restableciendo estado de CPs cargados a DESCONECTADO.")
+            for cp in all_cps_on_startup:
+                database.update_cp_status(cp['id'], 'DESCONECTADO')
+        # === FIN DE LA MODIFICACIÓN ===
+
         # 2. Iniciar el servidor de Sockets para CPs (registro y control síncrono)
         server_thread = threading.Thread(target=start_socket_server, args=(HOST, SOCKET_PORT, central_messages))
         server_thread.daemon = True
