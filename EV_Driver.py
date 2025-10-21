@@ -62,7 +62,7 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     # Si el CP del mensaje no está en nuestra lista de recargas activas, lo ignoramos.
                     if cp_id_del_mensaje not in active_charge_info:
                         continue
-            # === FIN DEL FILTRO INTELIGENTEl11 ===
+            # === FIN DEL FILTRO INTELIGENTEl ===
 
             # === INICIO CAMBIO 2: Manejar nuevos tipos de mensajes ===
             with charge_lock:
