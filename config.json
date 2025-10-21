@@ -1,0 +1,76 @@
+{
+  "central": {
+    "host": "0.0.0.0",
+    "port": 8000,
+    "max_connections": 10,
+    "timeout": 30,
+    "panel_refresh_interval": 2
+  },
+  "kafka": {
+    "bootstrap_servers": ["localhost:9092"],
+    "topics": {
+      "driver_requests": "driver_requests",
+      "cp_telemetry": "cp_telemetry",
+      "central_actions": "central_actions",
+      "driver_notifications": "driver_notifications"
+    },
+    "producer": {
+      "acks": "all",
+      "retries": 3,
+      "linger_ms": 5,
+      "batch_size": 16384
+    },
+    "consumer": {
+      "auto_offset_reset": "latest",
+      "enable_auto_commit": true,
+      "session_timeout_ms": 30000
+    }
+  },
+  "database": {
+    "use_sqlite": true,
+    "db_file": "ev_charging.db",
+    "backup_interval": 3600,
+    "max_backups": 7
+  },
+  "logging": {
+    "level": "INFO",
+    "log_to_file": true,
+    "log_to_console": true,
+    "log_dir": "logs",
+    "max_log_size": 10485760,
+    "backup_count": 5
+  },
+  "charging_points": {
+    "default_price": 0.25,
+    "max_charging_time": 3600,
+    "health_check_interval": 1,
+    "telemetry_interval": 1
+  },
+  "drivers": {
+    "max_concurrent_requests": 5,
+    "request_timeout": 30,
+    "batch_delay": 4
+  },
+  "network": {
+    "socket_timeout": 30,
+    "connection_retry_attempts": 3,
+    "connection_retry_delay": 5,
+    "keepalive": true
+  },
+  "security": {
+    "enable_encryption": false,
+    "cert_file": null,
+    "key_file": null,
+    "ca_file": null
+  },
+  "monitoring": {
+    "enable_metrics": true,
+    "metrics_interval": 60,
+    "alert_thresholds": {
+      "error_rate": 0.1,
+      "response_time": 5.0,
+      "connection_failures": 3
+    }
+  }
+}
+

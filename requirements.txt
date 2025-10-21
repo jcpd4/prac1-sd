@@ -1,0 +1,2 @@
+# Dependencias para el sistema de puntos de recarga EV
+kafka-python==2.0.2

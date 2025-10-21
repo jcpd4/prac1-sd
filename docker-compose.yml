@@ -1,0 +1,170 @@
+# docker-compose.yml para el sistema distribuido de puntos de recarga EV
+# Despliegue en 3 PCs distintos según especificaciones
+
+version: '3.8'
+
+services:
+  # Servicio Kafka (Broker de mensajería)
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: ev-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    depends_on:
+      - zookeeper
+    networks:
+      - ev-network
+
+  # Zookeeper para Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: ev-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ev-network
+
+  # Central de Control (PC 1)
+  central:
+    build: .
+    container_name: ev-central
+    ports:
+      - "8000:8000"
+    environment:
+      - CENTRAL_PORT=8000
+      - KAFKA_BROKER=kafka:9092
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "EV_Central.py", "8000", "kafka:9092"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Punto de Recarga 1 - Engine (PC 2)
+  cp1-engine:
+    build: .
+    container_name: ev-cp1-engine
+    ports:
+      - "8001:8001"
+    environment:
+      - ENGINE_PORT=8001
+      - KAFKA_BROKER=kafka:9092
+      - CP_ID=MAD-01
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_E.py", "8001", "kafka:9092", "MAD-01"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Punto de Recarga 1 - Monitor (PC 2)
+  cp1-monitor:
+    build: .
+    container_name: ev-cp1-monitor
+    environment:
+      - CENTRAL_IP=central
+      - CENTRAL_PORT=8000
+      - ENGINE_IP=cp1-engine
+      - ENGINE_PORT=8001
+      - CP_ID=MAD-01
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_M.py", "central", "8000", "cp1-engine", "8001", "MAD-01"]
+    depends_on:
+      - central
+      - cp1-engine
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Punto de Recarga 2 - Engine (PC 3)
+  cp2-engine:
+    build: .
+    container_name: ev-cp2-engine
+    ports:
+      - "8002:8002"
+    environment:
+      - ENGINE_PORT=8002
+      - KAFKA_BROKER=kafka:9092
+      - CP_ID=VAL-03
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_E.py", "8002", "kafka:9092", "VAL-03"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Punto de Recarga 2 - Monitor (PC 3)
+  cp2-monitor:
+    build: .
+    container_name: ev-cp2-monitor
+    environment:
+      - CENTRAL_IP=central
+      - CENTRAL_PORT=8000
+      - ENGINE_IP=cp2-engine
+      - ENGINE_PORT=8002
+      - CP_ID=VAL-03
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_M.py", "central", "8000", "cp2-engine", "8002", "VAL-03"]
+    depends_on:
+      - central
+      - cp2-engine
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Driver 1 (PC 1 o cualquier PC)
+  driver1:
+    build: .
+    container_name: ev-driver1
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - CLIENT_ID=DRIVER-101
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_Driver.py", "kafka:9092", "DRIVER-101"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # Driver 2 (PC 2 o cualquier PC)
+  driver2:
+    build: .
+    container_name: ev-driver2
+    environment:
+      - KAFKA_BROKER=kafka:9092
+      - CLIENT_ID=DRIVER-102
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_Driver.py", "kafka:9092", "DRIVER-102"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+networks:
+  ev-network:
+    driver: bridge
+
+volumes:
+  kafka-data:
+  zookeeper-data:

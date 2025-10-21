@@ -1,0 +1,168 @@
+# docker-compose-distributed.yml
+# Configuración para despliegue distribuido en 3 PCs distintos
+# Cada PC ejecuta un subconjunto de servicios
+
+# ===========================================
+# PC 1 - CENTRAL + KAFKA + DRIVER
+# ===========================================
+# Ejecutar: docker-compose -f docker-compose-distributed.yml -p pc1 up central kafka zookeeper driver1
+
+# ===========================================
+# PC 2 - CP1 (Engine + Monitor) + DRIVER
+# ===========================================
+# Ejecutar: docker-compose -f docker-compose-distributed.yml -p pc2 up cp1-engine cp1-monitor driver2
+
+# ===========================================
+# PC 3 - CP2 (Engine + Monitor)
+# ===========================================
+# Ejecutar: docker-compose -f docker-compose-distributed.yml -p pc3 up cp2-engine cp2-monitor
+
+version: '3.8'
+
+services:
+  # ========== SERVICIOS PARA PC 1 (CENTRAL) ==========
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: ev-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ev-network
+
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: ev-kafka
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    depends_on:
+      - zookeeper
+    networks:
+      - ev-network
+
+  central:
+    build: .
+    container_name: ev-central
+    ports:
+      - "8000:8000"
+    environment:
+      - CENTRAL_PORT=8000
+      - KAFKA_BROKER=localhost:9092
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    command: ["python", "EV_Central.py", "8000", "localhost:9092"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  driver1:
+    build: .
+    container_name: ev-driver1
+    environment:
+      - KAFKA_BROKER=localhost:9092
+      - CLIENT_ID=DRIVER-101
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_Driver.py", "localhost:9092", "DRIVER-101"]
+    depends_on:
+      - kafka
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # ========== SERVICIOS PARA PC 2 (CP1) ==========
+  cp1-engine:
+    build: .
+    container_name: ev-cp1-engine
+    ports:
+      - "8001:8001"
+    environment:
+      - ENGINE_PORT=8001
+      - KAFKA_BROKER=localhost:9092
+      - CP_ID=MAD-01
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_E.py", "8001", "localhost:9092", "MAD-01"]
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  cp1-monitor:
+    build: .
+    container_name: ev-cp1-monitor
+    environment:
+      - CENTRAL_IP=localhost  # Cambiar por IP del PC 1
+      - CENTRAL_PORT=8000
+      - ENGINE_IP=localhost
+      - ENGINE_PORT=8001
+      - CP_ID=MAD-01
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_M.py", "localhost", "8000", "localhost", "8001", "MAD-01"]
+    depends_on:
+      - cp1-engine
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  driver2:
+    build: .
+    container_name: ev-driver2
+    environment:
+      - KAFKA_BROKER=localhost:9092
+      - CLIENT_ID=DRIVER-102
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_Driver.py", "localhost:9092", "DRIVER-102"]
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  # ========== SERVICIOS PARA PC 3 (CP2) ==========
+  cp2-engine:
+    build: .
+    container_name: ev-cp2-engine
+    ports:
+      - "8002:8002"
+    environment:
+      - ENGINE_PORT=8002
+      - KAFKA_BROKER=localhost:9092
+      - CP_ID=VAL-03
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_E.py", "8002", "localhost:9092", "VAL-03"]
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+  cp2-monitor:
+    build: .
+    container_name: ev-cp2-monitor
+    environment:
+      - CENTRAL_IP=localhost  # Cambiar por IP del PC 1
+      - CENTRAL_PORT=8000
+      - ENGINE_IP=localhost
+      - ENGINE_PORT=8002
+      - CP_ID=VAL-03
+    volumes:
+      - ./logs:/app/logs
+    command: ["python", "EV_CP_M.py", "localhost", "8000", "localhost", "8002", "VAL-03"]
+    depends_on:
+      - cp2-engine
+    networks:
+      - ev-network
+    restart: unless-stopped
+
+networks:
+  ev-network:
+    driver: bridge
