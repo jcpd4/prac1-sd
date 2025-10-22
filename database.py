@@ -14,13 +14,11 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Diccionario para almacenar los CPs. Clave: ID_CP
-
-CP_DATA = {}
-DRIVER_DATA = {}
-TRANSACTION_HISTORY = []
+# Diccionario para almacenar los CPs. Clave: ID_CP (1)
+import sqlite3
+DB_FILE = "ev_charging.db"
+USE_SQLITE = True
 db_lock = threading.Lock()
-DB_FILE = 'cps_data.json' # Nombre del fichero que usaremos como base de datos
 
 def _save_to_disk():
     """Función interna para guardar el diccionario CP_DATA en el fichero JSON."""
@@ -106,78 +104,139 @@ def setup_database():
     else:
         logger.info("[DB] Base de datos inicializada (Diccionario en memoria)")
 
-def register_cp(cp_id, location, price_per_kwh=None):
-    """Registra o actualiza un CP y guarda los cambios en el disco."""
-    with db_lock:
-        first_time_register = cp_id not in CP_DATA
-        if first_time_register:
-            CP_DATA[cp_id] = {'id': cp_id, 'location': location, 'status': 'DESCONECTADO', 'driver_id': None}
-        
-        # Actualiza la ubicación por si cambia
-        CP_DATA[cp_id]['location'] = location
-
-        # Actualiza/guarda el precio si se proporciona
-        if price_per_kwh is not None:
-            CP_DATA[cp_id]['price'] = float(price_per_kwh)
-
-    # Solo guardamos si es un registro nuevo o se actualiza algo importante
-    _save_to_disk()
-    print(f"[DB] CP {cp_id} registrado/actualizado.")
-
+# --- MODIFICACIÓN 2: Reemplazar la función register_cp ---(1)
+def register_cp(cp_id, location, price_per_kwh=0.25):
+    """Registra un nuevo CP o actualiza uno existente en la BD SQLite."""
+    if not USE_SQLITE: return # Si no usamos SQLite, no hacemos nada
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            # Intenta insertar; si el CP ya existe, no hace nada.
+            cursor.execute(
+                "INSERT OR IGNORE INTO charging_points (id, location, status, price) VALUES (?, ?, 'DESCONECTADO', ?)",
+                (cp_id, location, price_per_kwh)
+            )
+            # Siempre actualiza la ubicación y el precio por si cambian.
+            cursor.execute(
+                "UPDATE charging_points SET location = ?, price = ? WHERE id = ?",
+                (location, price_per_kwh, cp_id)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al registrar CP {cp_id} en SQLite: {e}")
+# --- FIN MODIFICACIÓN 2 ---
+# --- MODIFICACIÓN 4: Reemplazar la función update_cp_status ---(1)
 def update_cp_status(cp_id, status):
-    """Actualiza solo el estado del CP. No es necesario guardar en disco cada cambio de estado volátil."""
-    with db_lock:
-        if cp_id in CP_DATA:
-            CP_DATA[cp_id]['status'] = status
-    # No llamamos a _save_to_disk() aquí para no escribir en el disco constantemente.
-    # El estado se considera volátil y se restablecerá a DESCONECTADO al reiniciar.
-    print(f"[DB] Estado de CP {cp_id} actualizado a {status}.")
+    """Actualiza el estado de un CP en la BD SQLite."""
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE charging_points SET status = ? WHERE id = ?", (status, cp_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al actualizar estado de {cp_id} en SQLite: {e}")
+# --- FIN MODIFICACIÓN 4 ---
 
 def get_cp_status(cp_id):
-    """Obtiene el estado actual de un CP."""
-    with db_lock:
-        return CP_DATA.get(cp_id, {}).get('status', 'NO_EXISTE')
+    if not USE_SQLITE: return 'NO_EXISTE'
+    status = 'NO_EXISTE'
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT status FROM charging_points WHERE id = ?", (cp_id,))
+            result = cursor.fetchone()
+            if result:
+                status = result[0]
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al obtener estado de {cp_id} en SQLite: {e}")
+    return status
 
+# --- MODIFICACIÓN 3: Reemplazar la función get_all_cps ---(1)
 def get_all_cps():
-    """Devuelve la lista de todos los CPs registrados."""
-    with db_lock:
-        return list(CP_DATA.values())
+    """Obtiene todos los CPs de la BD SQLite y los devuelve como una lista de diccionarios."""
+    if not USE_SQLITE: return []
+    cps = []
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            conn.row_factory = sqlite3.Row  # Esto permite obtener resultados como diccionarios
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM charging_points")
+            rows = cursor.fetchall()
+            cps = [dict(row) for row in rows]
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al obtener todos los CPs desde SQLite: {e}")
+    return cps
+# --- FIN MODIFICACIÓN 3 ---
         
-# --- Las funciones de consumo no necesitan cambios ---
 def update_cp_consumption(cp_id, kwh, importe, driver_id):
-    """Actualiza la telemetría del CP (se marca SUMINISTRANDO)."""
-    with db_lock:
-        if cp_id in CP_DATA:
-            CP_DATA[cp_id]['status'] = 'SUMINISTRANDO'
-            CP_DATA[cp_id]['kwh'] = float(kwh)
-            CP_DATA[cp_id]['importe'] = float(importe)
-            CP_DATA[cp_id]['driver_id'] = driver_id
-    print(f"[DB] Consumo CP {cp_id} -> {kwh} kWh, {importe} €, driver {driver_id}")
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE charging_points SET status = 'SUMINISTRANDO', kwh = ?, importe = ?, driver_id = ? WHERE id = ?",
+                (kwh, importe, driver_id, cp_id)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al actualizar consumo de {cp_id} en SQLite: {e}")
 
 def clear_cp_consumption(cp_id):
-    """Limpia los campos de consumo tras SUPPLY_END y deja el CP en ACTIVO (ACTIVADO)."""
-    with db_lock:
-        if cp_id in CP_DATA:
-            CP_DATA[cp_id].pop('kwh', None)
-            CP_DATA[cp_id].pop('importe', None)
-            CP_DATA[cp_id].pop('driver_id', None)
-            CP_DATA[cp_id]['status'] = 'ACTIVADO'
-    print(f"[DB] Campos de consumo de CP {cp_id} limpiados. Estado -> ACTIVADO")
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE charging_points SET status = 'ACTIVADO', kwh = NULL, importe = NULL, driver_id = NULL WHERE id = ?",
+                (cp_id,)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al limpiar consumo de {cp_id} en SQLite: {e}")
 
 def get_cp_price(cp_id):
-    """Devuelve el precio €/kWh almacenado para el CP, o None si no existe."""
-    with db_lock:
-        return CP_DATA.get(cp_id, {}).get('price', None)
+    if not USE_SQLITE: return None
+    price = None
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT price FROM charging_points WHERE id = ?", (cp_id,))
+            result = cursor.fetchone()
+            if result:
+                price = result[0]
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al obtener precio de {cp_id} en SQLite: {e}")
+    return price
 
 def clear_cp_telemetry_only(cp_id):
-    """Limpia kwh/importe/driver_id SIN cambiar el estado actual del CP."""
-    with db_lock:
-        if cp_id in CP_DATA:
-            CP_DATA[cp_id].pop('kwh', None)
-            CP_DATA[cp_id].pop('importe', None)
-            CP_DATA[cp_id].pop('driver_id', None)
-            current_status = CP_DATA[cp_id].get('status')
-    print(f"[DB] Telemetría de CP {cp_id} limpiada. Estado se mantiene.")
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE charging_points SET kwh = NULL, importe = NULL, driver_id = NULL WHERE id = ?",
+                (cp_id,)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al limpiar telemetría de {cp_id} en SQLite: {e}")
 
 # --- NUEVAS FUNCIONES MEJORADAS ---
 
