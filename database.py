@@ -1,5 +1,6 @@
 # JUANKY A SEVA --> CUIDADO CON LA DATABASE QUE LA ESTAMOS HACIENDO DE DOS FORMAS DISTINTAS!!!
 
+
 # Fichero: database.py (MEJORADO)
 # Base de datos mejorada con persistencia y más funcionalidades
 # Soporte para SQLite y funcionalidades avanzadas
