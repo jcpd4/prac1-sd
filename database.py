@@ -1,4 +1,4 @@
-
+# JUANKY A SEVA --> CUIDADO CON LA DATABASE QUE LA ESTAMOS HACIENDO DE DOS FORMAS DISTINTAS!!!
 # Fichero: database.py (MEJORADO)
 # Base de datos mejorada con persistencia y más funcionalidades
 # Soporte para SQLite y funcionalidades avanzadas
@@ -238,7 +238,7 @@ def clear_cp_telemetry_only(cp_id):
     except Exception as e:
         print(f"[DB] ERROR al limpiar telemetría de {cp_id} en SQLite: {e}")
 
-# --- NUEVAS FUNCIONES MEJORADAS ---
+# --- NUEVAS FUNCIONES MEJORADAS---
 
 def register_driver(driver_id, name=None, email=None):
     """Registra un nuevo conductor."""
