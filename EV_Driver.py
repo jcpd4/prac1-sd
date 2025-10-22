@@ -156,15 +156,15 @@ def display_driver_panel(messages):
         time.sleep(1)
 # ===================================================================
 
+# En EV_Driver.py
 def start_driver_interactive_logic(producer, messages):
     """
     Lógica interactiva del conductor. Lee comandos y envía solicitudes a Kafka.
     """
-    messages.append("Modo interactivo activo. Escribe 'SOLICITAR <CP_ID>' para pedir recarga.")
+    messages.append("Modo interactivo activo. Escribe 'SOLICITAR <CP_ID>' o 'BATCH <fichero>'")
     
     while True:
         try:
-            # Solo una lectura de input()
             command_line = input("DRIVER> ").strip()
             if not command_line:
                 continue
@@ -179,69 +179,58 @@ def start_driver_interactive_logic(producer, messages):
                     messages.append("Uso: SOLICITAR <CP_ID>")
                     continue
                 cp_id = parts[1]
-
-                print(f"[DRIVER] Solicitando carga en CP {cp_id}...")
-                request_message = {
-                    "type": "REQUEST_CHARGE",
-                    "user_id": CLIENT_ID,
-                    "cp_id": cp_id,
-                    "timestamp": time.time()
-                }
-
+                request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time() }
                 try:
-                    print(f"[DRIVER] Esperando respuesta de CENTRAL...")
-                    fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
-                    fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER] enviado -> {rm} (ack={rec})"))
-                    fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER] fallo al enviar -> {rm} : {exc}"))
+                    producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
                 except Exception as e:
                     messages.append(f"[ERROR KAFKA] No se pudo enviar la petición: {e}")
-                    print(f"[DRIVER] fallo al enviar -> {request_message} : {e}")
 
-            # Envío por lotes desde un archivo: cada línea contiene un ID de CP
+            # === INICIO DE LA CORRECCIÓN: Lógica BATCH Síncrona ===
             elif command == 'BATCH' and len(parts) == 2:
                 file_path = parts[1]
                 try:
-                    with open(file_path, 'r', encoding='utf-8') as fh:
-                        lines = [l.strip() for l in fh.readlines()]
+                    with open(file_path, 'r') as fh:
+                        cps_to_request = [line.strip() for line in fh if line.strip()]
                 except Exception as e:
-                    messages.append(f"[ERROR] No se pudo leer el archivo de batch: {e}")
+                    messages.append(f"[ERROR] No se pudo leer el fichero: {e}")
                     continue
 
-                messages.append(f"Iniciando envíos en lote desde {file_path} ({len(lines)} entradas)")
-                print(f"[DRIVER][BATCH] Iniciando envíos desde {file_path} ({len(lines)} entradas)")
-                for line in lines:
-                    if not line:
-                        continue
-                    cp_id = line
-                    request_message = {
-                        "type": "REQUEST_CHARGE",
-                        "user_id": CLIENT_ID,
-                        "cp_id": cp_id,
-                        "timestamp": time.time()
-                    }
-                    try:
-                        fut = producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
-                        fut.add_callback(lambda rec, rm=request_message: print(f"[DRIVER][BATCH] enviado -> {rm} (ack={rec})"))
-                        fut.add_errback(lambda exc, rm=request_message: print(f"[DRIVER][BATCH] fallo -> {rm} : {exc}"))
-                        messages.append(f"-> (BATCH) Petición enviada a Central para CP {cp_id}")
-                    except Exception as e:
-                        messages.append(f"[ERROR KAFKA] No se pudo enviar la petición (CP {cp_id}): {e}")
-                        print(f"[DRIVER] fallo al enviar (BATCH) -> {request_message} : {e}")
-                    # pequeño retardo para no saturar
-                    time.sleep(0.3)
+                messages.append(f"Iniciando proceso BATCH desde '{file_path}'...")
+                
+                for i, cp_id in enumerate(cps_to_request):
+                    messages.append(f"BATCH ({i+1}/{len(cps_to_request)}): Solicitando recarga en {cp_id}")
+                    
+                    # 1. Enviar la petición de recarga
+                    request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time() }
+                    producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
+                    
+                    # 2. Esperar a que la recarga sea autorizada y comience
+                    #    (Podríamos añadir un timeout aquí para más robustez)
+                    time.sleep(5) # Damos un margen para que llegue la autorización
+
+                    # 3. Bucle de espera: se queda aquí hasta que la recarga termine
+                    #    La recarga termina cuando `active_charge_info` se vacía (tras TICKET o ERROR)
+                    messages.append(f"Esperando a que la recarga en {cp_id} concluya...")
+                    while True:
+                        with charge_lock:
+                            if not active_charge_info:
+                                break # La recarga ha terminado, salimos del bucle de espera
+                        time.sleep(1)
+                    
+                    messages.append(f"Recarga en {cp_id} concluida. Esperando 4 segundos...")
+                    time.sleep(4) # Espera de 4 segundos entre recargas como pide la práctica
+
+                messages.append("Proceso BATCH finalizado.")
+            # === FIN DE LA CORRECCIÓN ===
 
             else:
-                messages.append("Comando inválido. Uso: SOLICITAR <CP_ID> o BATCH <FILE>")
+                messages.append("Comando inválido.")
 
-        except EOFError:
-            time.sleep(0.1)
-        except KeyboardInterrupt:
-            # Propagar para que main capture y cierre limpio
+        except (EOFError, KeyboardInterrupt):
             raise
         except Exception as e:
             messages.append(f"Error en el procesamiento de comandos del Driver: {e}")
-
 
 # --- Punto de Entrada Principal ---
 if __name__ == "__main__":
