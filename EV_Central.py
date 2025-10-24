@@ -107,7 +107,8 @@ def get_status_color(status):
         "DESCONECTADO": "\033[90m", # Gris
         "SUMINISTRANDO": "\033[94m",# Azul
         "AVERIADO": "\033[91m",      # Rojo
-        "FUERA_DE_SERVICIO": "\033[93m" # Naranja/Amarillo
+        "FUERA_DE_SERVICIO": "\033[93m", # Naranja/Amarillo
+        "RESERVADO": "\033[96m"      # <<<--- AÑADE ESTA LÍNEA AQUÍ (Cyan)(4)
     }
     END_COLOR = "\033[0m"
     return f"{colors.get(status, '')}{status}{END_COLOR}"
@@ -286,6 +287,9 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 
                 if cp_status == 'ACTIVADO' and (action in ['', 'REQUEST_CHARGE']):
                     print(f"[CENTRAL] Enviando START_SESSION al CP...")
+                    # <<<--- AÑADE ESTA LÍNEA AQUÍ ---(4)<<<
+                    database.update_cp_status(cp_id, 'RESERVADO') # Reservamos el CP inmediatamente
+                    # >>>-------------------------------->>>
                     # Registrar driver como conectado y abrir sesión en el CP
                     with active_cp_lock:
                         connected_drivers.add(user_id)
