@@ -17,6 +17,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Diccionario para almacenar los CPs. Clave: ID_CP (1)
+CP_DATA = {}  # Fallback para funciones que aún usan dicts
+DRIVER_DATA = {}
+TRANSACTION_HISTORY = []
 import sqlite3
 DB_FILE = "ev_charging.db"
 USE_SQLITE = True
@@ -50,6 +53,10 @@ def _load_from_disk():
 DB_FILE = "ev_charging.db"
 USE_SQLITE = True  # Cambiar a False para usar solo diccionarios en memoria
 
+
+# --- Funciones de gestión de la base de datos ---
+
+# Funcion para inicializar la base de datos
 def setup_database():
     """Inicializa la base de datos (SQLite o memoria)."""
     if USE_SQLITE:
@@ -106,7 +113,7 @@ def setup_database():
     else:
         logger.info("[DB] Base de datos inicializada (Diccionario en memoria)")
 
-# --- MODIFICACIÓN 2: Reemplazar la función register_cp ---(1)
+# Funcion para registrar un nuevo CP o actualizar uno existente en la BD SQLite
 def register_cp(cp_id, location, price_per_kwh=0.25):
     """Registra un nuevo CP o actualiza uno existente en la BD SQLite."""
     if not USE_SQLITE: return # Si no usamos SQLite, no hacemos nada
@@ -128,8 +135,13 @@ def register_cp(cp_id, location, price_per_kwh=0.25):
             conn.close()
     except Exception as e:
         print(f"[DB] ERROR al registrar CP {cp_id} en SQLite: {e}")
-# --- FIN MODIFICACIÓN 2 ---
-# --- MODIFICACIÓN 4: Reemplazar la función update_cp_status ---(1)
+
+
+
+
+#---Funciones de gestión de CPs---
+
+# Funcion para actualizar el estado de un CP en la BD SQLite
 def update_cp_status(cp_id, status):
     """Actualiza el estado de un CP en la BD SQLite."""
     if not USE_SQLITE: return
@@ -142,8 +154,10 @@ def update_cp_status(cp_id, status):
             conn.close()
     except Exception as e:
         print(f"[DB] ERROR al actualizar estado de {cp_id} en SQLite: {e}")
-# --- FIN MODIFICACIÓN 4 ---
 
+
+
+# Funcion para obtener el estado de un CP en la BD SQLite
 def get_cp_status(cp_id):
     if not USE_SQLITE: return 'NO_EXISTE'
     status = 'NO_EXISTE'
@@ -160,7 +174,7 @@ def get_cp_status(cp_id):
         print(f"[DB] ERROR al obtener estado de {cp_id} en SQLite: {e}")
     return status
 
-# --- MODIFICACIÓN 3: Reemplazar la función get_all_cps ---(1)
+# Funcion para obtener todos los CPs de la BD SQLite (1)
 def get_all_cps():
     """Obtiene todos los CPs de la BD SQLite y los devuelve como una lista de diccionarios."""
     if not USE_SQLITE: return []
@@ -177,8 +191,12 @@ def get_all_cps():
     except Exception as e:
         print(f"[DB] ERROR al obtener todos los CPs desde SQLite: {e}")
     return cps
-# --- FIN MODIFICACIÓN 3 ---
-        
+
+
+
+#---Funciones de consumo de CPs---
+
+# Funcion para actualizar el consumo de un CP en la BD SQLite
 def update_cp_consumption(cp_id, kwh, importe, driver_id):
     if not USE_SQLITE: return
     try:
@@ -194,6 +212,7 @@ def update_cp_consumption(cp_id, kwh, importe, driver_id):
     except Exception as e:
         print(f"[DB] ERROR al actualizar consumo de {cp_id} en SQLite: {e}")
 
+# Funcion para limpiar el consumo de un CP en la BD SQLite
 def clear_cp_consumption(cp_id):
     if not USE_SQLITE: return
     try:
@@ -209,6 +228,8 @@ def clear_cp_consumption(cp_id):
     except Exception as e:
         print(f"[DB] ERROR al limpiar consumo de {cp_id} en SQLite: {e}")
 
+
+# Funcion para obtener el precio de un CP en la BD SQLite
 def get_cp_price(cp_id):
     if not USE_SQLITE: return None
     price = None
@@ -225,6 +246,8 @@ def get_cp_price(cp_id):
         print(f"[DB] ERROR al obtener precio de {cp_id} en SQLite: {e}")
     return price
 
+
+# Funcion para limpiar la telemetría de un CP en la BD SQLite
 def clear_cp_telemetry_only(cp_id):
     if not USE_SQLITE: return
     try:
@@ -240,8 +263,9 @@ def clear_cp_telemetry_only(cp_id):
     except Exception as e:
         print(f"[DB] ERROR al limpiar telemetría de {cp_id} en SQLite: {e}")
 
-# --- NUEVAS FUNCIONES MEJORADAS---
+#---Funciones de gestión de drivers---
 
+# Funcion para registrar un nuevo driver en la BD SQLite
 def register_driver(driver_id, name=None, email=None):
     """Registra un nuevo conductor."""
     with db_lock:
@@ -253,11 +277,14 @@ def register_driver(driver_id, name=None, email=None):
         }
     logger.info(f"[DB] Driver {driver_id} registrado")
 
+
+# Funcion para obtener un driver en la BD SQLite
 def get_driver(driver_id):
     """Obtiene información de un conductor."""
     with db_lock:
         return DRIVER_DATA.get(driver_id, None)
 
+# Funcion para iniciar una nueva transacción de recarga en la BD SQLite
 def start_transaction(cp_id, driver_id):
     """Inicia una nueva transacción de recarga."""
     with db_lock:
@@ -272,6 +299,8 @@ def start_transaction(cp_id, driver_id):
         logger.info(f"[DB] Transacción iniciada: CP {cp_id} -> Driver {driver_id}")
         return transaction['id']
 
+
+# Funcion para finalizar una transacción de recarga en la BD SQLite
 def end_transaction(transaction_id, kwh, importe, status='COMPLETADA'):
     """Finaliza una transacción."""
     with db_lock:
@@ -285,6 +314,7 @@ def end_transaction(transaction_id, kwh, importe, status='COMPLETADA'):
                 return True
         return False
 
+# Funcion para obtener el historial de transacciones en la BD SQLite
 def get_transaction_history(driver_id=None, cp_id=None, limit=100):
     """Obtiene el historial de transacciones."""
     with db_lock:
@@ -300,6 +330,8 @@ def get_transaction_history(driver_id=None, cp_id=None, limit=100):
         filtered_transactions.sort(key=lambda x: x.get('start_time', ''), reverse=True)
         return filtered_transactions[:limit]
 
+
+# Funcion para obtener las estadísticas de un CP en la BD SQLite
 def get_cp_statistics(cp_id):
     """Obtiene estadísticas de un CP."""
     with db_lock:
@@ -337,6 +369,7 @@ def get_cp_statistics(cp_id):
             'avg_session_duration': avg_duration
         }
 
+# Funcion para obtener las estadísticas generales del sistema en la BD SQLite
 def get_system_statistics():
     """Obtiene estadísticas generales del sistema."""
     with db_lock:
@@ -355,6 +388,8 @@ def get_system_statistics():
             'total_transactions': total_transactions
         }
 
+
+# Funcion para crear una copia de seguridad de la base de datos en la BD SQLite
 def backup_database():
     """Crea una copia de seguridad de la base de datos."""
     try:
@@ -378,6 +413,8 @@ def backup_database():
         logger.error(f"[DB] Error creando backup: {e}")
         return None
 
+
+# Funcion para restaurar la base de datos desde un backup en la BD SQLite
 def restore_database(backup_file):
     """Restaura la base de datos desde un backup."""
     try:
