@@ -28,7 +28,22 @@ active_cp_lock = threading.Lock()
 # Sesiones actuales autorizadas/activas: { cp_id: { 'driver_id': str, 'status': 'authorized'|'charging' } }
 current_sessions = {}
 
+# Comandos pendientes por CP para poder confirmar o revertir con ACK/NACK
+# Formato: { cp_id: { 'command': 'PARAR'|'REANUDAR', 'prev_status': str } }
+pending_cp_commands = {}
 
+# Ventana de gracia tras RECOVER/REANUDAR para evitar parpadeo a DESCONECTADO
+# { cp_id: timestamp }
+recent_recover_events = {}
+
+# CPs que ya se han conectado al menos una vez desde que arrancó esta CENTRAL (para diferenciar primera conexión de sesión)
+connected_once_this_session = set()
+
+# Control de verbosidad del protocolo (solo imprime si es True)
+DEBUG_PROTOCOL = False
+
+# Control de verbosidad de consola en CENTRAL (reduce prints en stdout)
+CENTRAL_VERBOSE = False
 
 # --- Funciones auxiliares ---
 def push_message(msg_list, msg, maxlen=200):
@@ -37,6 +52,340 @@ def push_message(msg_list, msg, maxlen=200):
     if len(msg_list) > maxlen:
         # eliminar los más antiguos
         del msg_list[0:len(msg_list)-maxlen]
+
+# --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
+
+# Constantes del protocolo
+STX = bytes([0x02])  # Start of Text
+ETX = bytes([0x03])  # End of Text
+ENQ = bytes([0x05])  # Enquiry (handshake inicial)
+ACK = bytes([0x06])  # Acknowledgement (respuesta positiva)
+NACK = bytes([0x15]) # Negative Acknowledgement (respuesta negativa)
+EOT = bytes([0x04])  # End of Transmission (cierre de conexión)
+
+def calculate_lrc(message_bytes):
+    """
+    Calcula el LRC (Longitudinal Redundancy Check) mediante XOR byte a byte.
+    El LRC es una técnica de detección de errores que calcula el XOR de todos los bytes del mensaje.
+    
+    Args:
+        message_bytes: Bytes del mensaje completo (STX + DATA + ETX)
+    
+    Returns:
+        int: Valor del LRC (0-255)
+    """
+    #Paso 1: Inicializar LRC en 0
+    lrc = 0
+    #Paso 2: Calcular XOR de todos los bytes del mensaje
+    for byte in message_bytes:
+        lrc ^= byte
+    #Paso 3: Devolver el valor del LRC
+    return lrc
+
+def build_frame(data_string):
+    """
+    Construye una trama completa siguiendo el protocolo <STX><DATA><ETX><LRC>.
+    Esta función toma un string de datos y lo empaqueta con los delimitadores y checksum.
+    
+    Args:
+        data_string: String con los datos a enviar (ej: "REGISTER#CP01#Ubicacion")
+    
+    Returns:
+        bytes: Trama completa lista para enviar por socket
+    """
+    #Paso 1: Convertir el string de datos a bytes UTF-8
+    data = data_string.encode('utf-8')
+    #Paso 2: Construir el mensaje completo: STX + DATA + ETX
+    message = STX + data + ETX
+    #Paso 3: Calcular el LRC del mensaje completo
+    lrc_value = calculate_lrc(message)
+    #Paso 4: Añadir el LRC al final de la trama
+    frame = message + bytes([lrc_value])
+    #Paso 5: Mostrar en consola la trama construida (solo para depuración)
+    if DEBUG_PROTOCOL:
+        print(f"[PROTOCOLO] Trama construida: STX + '{data_string}' + ETX + LRC={lrc_value:02X}")
+    #Paso 6: Devolver la trama completa
+    return frame
+
+def parse_frame(frame_bytes):
+    """
+    Parsea una trama recibida y valida el LRC para detectar errores de transmisión.
+    Esta función extrae los datos del mensaje y verifica la integridad mediante el LRC.
+    
+    Args:
+        frame_bytes: Bytes recibidos del socket (debe contener STX + DATA + ETX + LRC)
+    
+    Returns:
+        tuple: (data_string, is_valid) donde:
+            - data_string: String con los datos extraídos o None si hay error
+            - is_valid: True si el LRC es válido, False en caso contrario
+    """
+    #Paso 1: Verificar que la trama tenga el tamaño mínimo (STX + al menos 1 byte DATA + ETX + LRC)
+    if len(frame_bytes) < 4:
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR: Trama demasiado corta ({len(frame_bytes)} bytes). Mínimo necesario: 4 bytes")
+        return None, False
+    
+    #Paso 2: Verificar que el primer byte sea STX (0x02)
+    if frame_bytes[0] != 0x02:
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR: Primer byte no es STX (recibido: 0x{frame_bytes[0]:02X}, esperado: 0x02)")
+        return None, False
+    
+    #Paso 3: Buscar la posición del byte ETX (0x03) en la trama
+    etx_pos = -1
+    for i in range(1, len(frame_bytes) - 1):  # -1 porque después del ETX debe venir el LRC
+        if frame_bytes[i] == 0x03:  # ETX encontrado
+            etx_pos = i
+            break
+    
+    #Paso 4: Verificar que se encontró el ETX
+    if etx_pos == -1:
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR: No se encontró ETX en la trama recibida")
+        return None, False
+    
+    #Paso 5: Extraer los bytes de datos (entre STX y ETX)
+    data_bytes = frame_bytes[1:etx_pos]
+    #Paso 6: Extraer el LRC recibido (byte después del ETX)
+    received_lrc = frame_bytes[etx_pos + 1]
+    
+    #Paso 7: Reconstruir el mensaje original (STX + DATA + ETX) para calcular LRC esperado
+    message_with_delimiters = STX + data_bytes + ETX
+    #Paso 8: Calcular el LRC esperado
+    expected_lrc = calculate_lrc(message_with_delimiters)
+    
+    #Paso 9: Comparar el LRC recibido con el esperado
+    if received_lrc != expected_lrc:
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR: LRC no coincide. Recibido: 0x{received_lrc:02X}, Esperado: 0x{expected_lrc:02X}")
+        return None, False  # LRC no coincide, hay error en la transmisión
+    
+    #Paso 10: Decodificar los datos a string UTF-8
+    try:
+        data = data_bytes.decode('utf-8')
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] Trama parseada correctamente: '{data}' (LRC válido: 0x{received_lrc:02X})")
+        return data, True
+    except UnicodeDecodeError as e:
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR: No se pudo decodificar los datos como UTF-8: {e}")
+        return None, False
+
+def send_frame(socket_ref, data_string, central_messages=None):
+    """
+    Envía una trama completa a través de un socket usando el protocolo <STX><DATA><ETX><LRC>.
+    
+    Args:
+        socket_ref: Referencia al socket donde enviar la trama
+        data_string: String con los datos a enviar
+        central_messages: (Opcional) Lista de mensajes para logs
+    
+    Returns:
+        bool: True si el envío fue exitoso, False en caso contrario
+    """
+    try:
+        #Paso 1: Construir la trama con el protocolo
+        frame = build_frame(data_string)
+        #Paso 2: Enviar la trama por el socket
+        socket_ref.sendall(frame)
+        #Paso 3: Mostrar confirmación en consola
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] Trama enviada correctamente: '{data_string}'")
+        #Paso 4: Si hay lista de mensajes, agregar el mensaje
+        if central_messages is not None:
+            push_message(central_messages, f"[PROTOCOLO] Enviado: {data_string}")
+        return True
+    except Exception as e:
+        #Paso 5: Manejar errores de envío
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR al enviar trama '{data_string}': {e}")
+        if central_messages is not None:
+            push_message(central_messages, f"[PROTOCOLO] ERROR enviando: {data_string} - {e}")
+        return False
+
+def receive_frame(socket_ref, central_messages=None, timeout=None):
+    """
+    Recibe una trama completa desde un socket y la parsea según el protocolo <STX><DATA><ETX><LRC>.
+    
+    Args:
+        socket_ref: Referencia al socket de donde recibir la trama
+        central_messages: (Opcional) Lista de mensajes para logs
+        timeout: (Opcional) Timeout en segundos para la recepción
+    
+    Returns:
+        tuple: (data_string, is_valid) donde:
+            - data_string: String con los datos recibidos o None si hay error
+            - is_valid: True si la trama es válida, False en caso contrario
+    """
+    try:
+        #Paso 1: Configurar timeout si se especifica
+        if timeout is not None:
+            socket_ref.settimeout(timeout)
+        else:
+            socket_ref.settimeout(None)
+        
+        #Paso 2: Recibir los bytes del socket (hasta 1024 bytes)
+        frame_bytes = socket_ref.recv(1024)
+        
+        #Paso 3: Si no se recibieron datos, la conexión se cerró
+        if not frame_bytes:
+            if DEBUG_PROTOCOL:
+                print("[PROTOCOLO] Conexión cerrada por el remoto (no se recibieron datos)")
+            return None, False
+        
+        #Paso 4: Parsear la trama recibida
+        data, is_valid = parse_frame(frame_bytes)
+        #Paso 5: Si hay lista de mensajes, agregar el mensaje
+        if central_messages is not None and data is not None:
+            push_message(central_messages, f"[PROTOCOLO] Recibido: {data} (Válido: {is_valid})")
+        
+        return data, is_valid
+        
+    except socket.timeout:
+        #Paso 6: Manejar timeout
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] Timeout esperando trama (timeout={timeout}s)")
+        return None, False
+    except Exception as e:
+        #Paso 7: Manejar otros errores
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR al recibir trama: {e}")
+        if central_messages is not None:
+            push_message(central_messages, f"[PROTOCOLO] ERROR recibiendo: {e}")
+        return None, False
+
+def handshake_client(socket_ref, central_messages=None):
+    """
+    Realiza el handshake inicial (ENQ/ACK) desde el lado cliente.
+    El cliente envía ENQ y espera ACK o NACK del servidor.
+    
+    Args:
+        socket_ref: Referencia al socket de conexión
+        central_messages: (Opcional) Lista de mensajes para logs
+    
+    Returns:
+        bool: True si el handshake fue exitoso (se recibió ACK), False en caso contrario
+    """
+    try:
+        #Paso 1: Enviar ENQ (Enquiry) al servidor
+        if DEBUG_PROTOCOL:
+            print("[PROTOCOLO] Enviando ENQ (handshake inicial)...")
+        socket_ref.sendall(ENQ)
+        
+        #Paso 2: Esperar respuesta del servidor (ACK o NACK)
+        response = socket_ref.recv(1)
+        
+        #Paso 3: Verificar la respuesta recibida
+        if not response:
+            if DEBUG_PROTOCOL:
+                print("[PROTOCOLO] ERROR: No se recibió respuesta al ENQ")
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] ERROR: No respuesta al handshake ENQ")
+            return False
+        
+        #Paso 4: Decodificar la respuesta
+        if response == ACK:
+            if DEBUG_PROTOCOL:
+                print("[PROTOCOLO] Handshake exitoso: Servidor respondió ACK")
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] Handshake exitoso (ACK recibido)")
+            return True
+        elif response == NACK:
+            if DEBUG_PROTOCOL:
+                print("[PROTOCOLO] Handshake fallido: Servidor respondió NACK")
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] Handshake fallido (NACK recibido)")
+            return False
+        else:
+            if DEBUG_PROTOCOL:
+                print(f"[PROTOCOLO] ERROR: Respuesta de handshake inválida (recibido: 0x{response[0]:02X})")
+            if central_messages is not None:
+                push_message(central_messages, f"[PROTOCOLO] ERROR: Respuesta inválida al handshake")
+            return False
+            
+    except Exception as e:
+        #Paso 5: Manejar errores durante el handshake
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR durante handshake: {e}")
+        if central_messages is not None:
+            push_message(central_messages, f"[PROTOCOLO] ERROR en handshake: {e}")
+        return False
+
+def handshake_server(socket_ref, central_messages=None):
+    """
+    Realiza el handshake inicial (ENQ/ACK) desde el lado servidor.
+    El servidor espera ENQ del cliente y responde con ACK.
+    
+    Args:
+        socket_ref: Referencia al socket de conexión (cliente conectado)
+        central_messages: (Opcional) Lista de mensajes para logs
+    
+    Returns:
+        bool: True si el handshake fue exitoso, False en caso contrario
+    """
+    try:
+        #Paso 1: Configurar timeout para el handshake
+        socket_ref.settimeout(5)  # Esperar máximo 5 segundos por el ENQ
+        
+        #Paso 2: Esperar ENQ del cliente
+        if DEBUG_PROTOCOL:
+            print("[PROTOCOLO] Esperando ENQ del cliente...")
+        enq = socket_ref.recv(1)
+        
+        #Paso 3: Verificar que se recibió ENQ
+        if not enq or enq != ENQ:
+            if DEBUG_PROTOCOL:
+                print(f"[PROTOCOLO] ERROR: No se recibió ENQ válido (recibido: {enq.hex() if enq else 'vacío'})")
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] ERROR: ENQ inválido o no recibido")
+            return False
+        
+        #Paso 4: Responder con ACK al cliente
+        if DEBUG_PROTOCOL:
+            print("[PROTOCOLO] ENQ recibido. Enviando ACK...")
+        socket_ref.sendall(ACK)
+        if DEBUG_PROTOCOL:
+            print("[PROTOCOLO] Handshake exitoso: ACK enviado al cliente")
+        if central_messages is not None:
+            push_message(central_messages, "[PROTOCOLO] Handshake exitoso (ENQ recibido, ACK enviado)")
+        
+        #Paso 5: Restaurar timeout normal (None = blocking)
+        socket_ref.settimeout(None)
+        return True
+        
+    except socket.timeout:
+        #Paso 6: Manejar timeout esperando ENQ
+        if DEBUG_PROTOCOL:
+            print("[PROTOCOLO] ERROR: Timeout esperando ENQ del cliente")
+        if central_messages is not None:
+            push_message(central_messages, "[PROTOCOLO] ERROR: Timeout en handshake (no se recibió ENQ)")
+        return False
+    except Exception as e:
+        #Paso 7: Manejar otros errores
+        if DEBUG_PROTOCOL:
+            print(f"[PROTOCOLO] ERROR durante handshake del servidor: {e}")
+        if central_messages is not None:
+            push_message(central_messages, f"[PROTOCOLO] ERROR en handshake servidor: {e}")
+        return False
+
+def send_ack(socket_ref):
+    """Envía ACK (confirmación positiva) por el socket."""
+    socket_ref.sendall(ACK)
+    if DEBUG_PROTOCOL:
+        print("[PROTOCOLO] ACK enviado")
+
+def send_nack(socket_ref):
+    """Envía NACK (confirmación negativa) por el socket."""
+    socket_ref.sendall(NACK)
+    if DEBUG_PROTOCOL:
+        print("[PROTOCOLO] NACK enviado")
+
+def send_eot(socket_ref):
+    """Envía EOT (End of Transmission) para indicar cierre de conexión."""
+    socket_ref.sendall(EOT)
+    if DEBUG_PROTOCOL:
+        print("[PROTOCOLO] EOT enviado (fin de transmisión)")
 
 def cleanup_disconnected_drivers():
     """Limpia drivers que no han enviado peticiones recientemente."""
@@ -89,8 +438,8 @@ def get_status_color(status):
         "DESCONECTADO": "\033[90m", # Gris
         "SUMINISTRANDO": "\033[94m",# Azul
         "AVERIADO": "\033[91m",      # Rojo
-        "FUERA_DE_SERVICIO": "\033[93m", # Naranja/Amarillo
-        "RESERVADO": "\033[96m"      # preguntar a juanky
+        "FUERA_DE_SERVICIO": "\033[38;5;208m", # Naranja (256-color)
+        "RESERVADO": "\033[96m"      # 
     }
     END_COLOR = "\033[0m"
     return f"{colors.get(status, '')}{status}{END_COLOR}"
@@ -118,10 +467,7 @@ def display_panel(central_messages, driver_requests):
                 price = database.get_cp_price(cp['id'])
                 price_str = f"{price:.2f} €/kWh" if price is not None else "N/A"
                 colored_status = get_status_color(cp['status'])
-                legend = ""
-                if cp['status'] == 'FUERA_DE_SERVICIO':
-                    legend = " (Out of Order)"
-                print(f"{cp['id']:<10} | {cp['location']:<25} | {price_str:<12} | {colored_status}{legend}")
+                print(f"{cp['id']:<10} | {cp['location']:<25} | {price_str:<12} | {colored_status}")
 
                 # Si está suministrando, mostramos datos de consumo acumulado
                 if cp.get('status') == 'SUMINISTRANDO':
@@ -150,7 +496,9 @@ def display_panel(central_messages, driver_requests):
             else:
                 print("No hay drivers conectados.")
         
+        
         #3. --- Sección Peticiones de Conductores (Kafka) ---
+        print("-" * 80)
         print("\n*** PETICIONES DE CONDUCTORES EN CURSO (Kafka) ***")
         #Lista todas las solicitudes Kafka del topic driver_requests
         if driver_requests:
@@ -158,12 +506,57 @@ def display_panel(central_messages, driver_requests):
                 print(f"[{req['timestamp']}] Driver {req['user_id']} solicita recarga en CP {req['cp_id']}")
         else:
             print("No hay peticiones pendientes.")
-        
-        #4. --- Sección de Mensajes de Aplicación (Kafka/General) ---
+        #4. --- Sección de Mensajes del Sistema ---
+        print("-" * 80)
         print("\n*** MENSAJES DEL SISTEMA ***")
         if central_messages:
+            # Separar mensajes del protocolo y otros mensajes
+            protocol_msgs = []
+            other_msgs = []
             for msg in central_messages:
-                print(msg)
+                if "[PROTOCOLO]" in msg or "PROTOCOLO" in msg or "Handshake" in msg:
+                    protocol_msgs.append(msg)
+                else:
+                    other_msgs.append(msg)
+            
+            # Mostrar solo los últimos 8 mensajes no-protocolo
+            if other_msgs:
+                for msg in other_msgs[-7:]:
+                    print(msg)
+        
+        #5. --- Sección de Mensajes del Protocolo (separada, como en Monitor) ---
+        print("-" * 80)
+        print("\n*** MENSAJES DEL PROTOCOLO (últimos 7) ***")
+        print("-" * 80)
+        if central_messages:
+            # Extraer solo mensajes del protocolo
+            protocol_msgs = []
+            for msg in central_messages:
+                if "[PROTOCOLO]" in msg or "PROTOCOLO" in msg or "Handshake" in msg:
+                    protocol_msgs.append(msg)
+            
+            if protocol_msgs:
+                for msg in protocol_msgs[-7:]:
+                    # Limpiar formato para mejor legibilidad
+                    clean_msg = msg.replace("[PROTOCOLO] ", "")
+                    clean_msg = clean_msg.replace("Handshake exitoso (ENQ recibido, ACK enviado)", "Handshake exitoso")
+                    clean_msg = clean_msg.replace("Recibido: ", "← ")
+                    clean_msg = clean_msg.replace("Enviado: ", "→ ")
+                    # Ocultar ruido de handshakes y REGISTER que no aportan en el panel
+                    if clean_msg.startswith("← REGISTER#") or clean_msg.startswith("→ REGISTER#"):
+                        continue
+                    if "Handshake exitoso" in clean_msg or "Realizando handshake" in clean_msg:
+                        continue
+                    # Mantener mensajes específicos añadidos por nosotros
+                    # Ocultar mensajes de error de desconexión normales (WinError 10054)
+                    if "ERROR recibiendo:" in clean_msg and "WinError 10054" in clean_msg:
+                        clean_msg = "⚠ Conexión cerrada (reconexión automática)"
+                    elif "ERROR recibiendo:" in clean_msg:
+                        # Mantener otros errores visibles
+                        clean_msg = clean_msg.replace("ERROR recibiendo: ", "⚠ ")
+                    print(f"  {clean_msg}")
+            else:
+                print("  No hay mensajes del protocolo.")
         
         print("="*50)
         #Instrucciones para que el operador de la Central escriba comandos para controlar los CPs.
@@ -214,7 +607,8 @@ def send_notification_to_driver(producer, driver_id, notification):
         producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=notification)
         producer.flush()
         #Paso 2.2: Mostrar mensaje de notificación en la consola
-        print(f"[CENTRAL] Notificación enviada a Driver {driver_id}: {notification['type']}")
+        if CENTRAL_VERBOSE:
+            print(f"[CENTRAL] Notificación enviada a Driver {driver_id}: {notification['type']}")
         return True
     except Exception as e:
         #Paso 2.3: Mostrar mensaje de error en la consola
@@ -265,8 +659,31 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 ts = time.strftime('%H:%M:%S') # Usar 'timestamp' para compatibilizar con display_panel
                 driver_requests.append({'cp_id': cp_id, 'user_id': user_id, 'timestamp': ts})
                 # Log inmediato en consola para trazabilidad
-                print(f"[CENTRAL] Solicitud recibida del driver {user_id} para CP {cp_id}...")
-                print(f"[CENTRAL] Comprobando estado del CP...")
+                if CENTRAL_VERBOSE:
+                    print(f"[CENTRAL] Solicitud recibida del driver {user_id} para CP {cp_id}...")
+                # Si el driver cierra su app, liberar reservas inmediatamente
+                if action == 'DRIVER_QUIT':
+                    with active_cp_lock:
+                        connected_drivers.discard(user_id)
+                        # Liberar cualquier CP reservado por este driver
+                        to_release = []
+                        for cp_k, sess in list(current_sessions.items()):
+                            if sess.get('driver_id') == user_id and sess.get('status') == 'authorized':
+                                to_release.append(cp_k)
+                        for cp_k in to_release:
+                            del current_sessions[cp_k]
+                            try:
+                                if database.get_cp_status(cp_k) == 'RESERVADO':
+                                    database.update_cp_status(cp_k, 'ACTIVADO')
+                                    push_message(central_messages, f"RESERVA liberada: CP {cp_k} vuelve a ACTIVADO (driver {user_id} salió)")
+                            except Exception:
+                                pass
+                    # eliminar cualquier petición pendiente del driver
+                    for i, req in list(enumerate(driver_requests)):
+                        if req.get('user_id') == user_id:
+                            del driver_requests[i]
+                    continue
+
                 #Paso 2.1.1: Registrar/actualizar que el driver está conectado
                 with active_cp_lock:
                     connected_drivers.add(user_id)
@@ -280,11 +697,8 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     central_messages.append(f"DENEGADO: Driver {user_id} -> CP {cp_id} (ya conectado a otro CP)")
                     #Paso 2.1.2.3: Mostrar mensaje de denegación en la consola
                     print(f"[CENTRAL] DENEGACIÓN enviada a Driver {user_id} para CP {cp_id} (ya conectado a otro CP)")
-                    #Paso 2.1.2.4: Eliminar petición procesada
-                    for i, req in enumerate(driver_requests):
-                        if req.get('cp_id') == cp_id and req.get('user_id') == user_id:
-                            del driver_requests[i]
-                            break
+                    #Paso 2.1.2.4: Eliminar peticiones procesadas de forma segura (sin índices)
+                    driver_requests[:] = [req for req in driver_requests if not (req.get('cp_id') == cp_id and req.get('user_id') == user_id)]
                     continue
                 #Paso 2.1.3: Verificar si el CP ya está siendo usado por otro driver (sesión activa)
                 if cp_id in current_sessions:
@@ -295,23 +709,20 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     central_messages.append(f"DENEGADO: Driver {user_id} -> CP {cp_id} (CP ya en uso)")
                     #Paso 2.1.3.3: Mostrar mensaje de denegación en la consola
                     print(f"[CENTRAL] DENEGACIÓN enviada a Driver {user_id} para CP {cp_id} (CP ya en uso)")
-                    #Paso 2.1.3.4: Eliminar petición procesada
-                    for i, req in enumerate(driver_requests):
-                        if req.get('cp_id') == cp_id and req.get('user_id') == user_id:
-                            del driver_requests[i]
-                            break
+                    #Paso 2.1.3.4: Eliminar peticiones procesadas de forma segura
+                    driver_requests[:] = [req for req in driver_requests if not (req.get('cp_id') == cp_id and req.get('user_id') == user_id)]
                     continue
 
 
                 
                 #Paso 2.2: Cargar el estado del CP
                 cp_status = database.get_cp_status(cp_id)
-                print(f"[CENTRAL] Estado del CP: {cp_status}") # Mostrar el estado del CP
                 
 
                 #Paso 2.3: Autorizar solo si CP está ACTIVADO y disponible
                 if cp_status == 'ACTIVADO' and (action in ['', 'REQUEST_CHARGE']):
-                    print(f"[CENTRAL] Enviando START_SESSION al CP...")
+                    if CENTRAL_VERBOSE:
+                        print(f"[CENTRAL] Enviando START_SESSION al CP...")
                     #Paso 2.3.1: Reservar el CP inmediatamente
                     database.update_cp_status(cp_id, 'RESERVADO') # Reservamos el CP inmediatamente
                     #Paso 2.3.2: Registrar driver como conectado y abrir sesión en el CP
@@ -319,15 +730,19 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                         connected_drivers.add(user_id)
                         current_sessions[cp_id] = { 'driver_id': user_id, 'status': 'authorized' }
                     
-                    #Paso 2.3.3: Enviar comando de autorización al Monitor del CP vía SOCKET
+                    #Paso 2.3.3: Enviar comando de autorización al Monitor del CP vía SOCKET usando protocolo
                     if cp_id in active_cp_sockets:
                         try:
                             cp_socket = active_cp_sockets[cp_id]
                             # Emular START_SESSION semánticamente con AUTORIZAR_SUMINISTRO hacia el CP
                             auth_command = f"AUTORIZAR_SUMINISTRO#{user_id}"
-                            cp_socket.sendall(auth_command.encode('utf-8'))
-                            print(f"[CENTRAL] Comando AUTORIZAR_SUMINISTRO enviado a Monitor de CP {cp_id} para Driver {user_id}")
-                            print(f"[CENTRAL] Esperando confirmación del CP...")
+                            # Usar protocolo para enviar comando
+                            if send_frame(cp_socket, auth_command, central_messages):
+                                if CENTRAL_VERBOSE:
+                                    print(f"[CENTRAL] Comando AUTORIZAR_SUMINISTRO enviado a Monitor de CP {cp_id} para Driver {user_id}")
+                                    print(f"[CENTRAL] Esperando confirmación del CP...")
+                            else:
+                                central_messages.append(f"ERROR: No se pudo enviar comando de autorización a CP {cp_id}")
                         except Exception as e:
                             central_messages.append(f"ERROR: No se pudo enviar comando de autorización a CP {cp_id}: {e}")
                     #Paso 2.3.4: Enviar notificación de autorización al driver
@@ -337,7 +752,8 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     #Paso 2.3.4.2: Agregar mensaje de autorización a la lista de mensajes
                     central_messages.append(f"AUTORIZADO: Driver {user_id} -> CP {cp_id}")
                     #Paso 2.3.4.3: Mostrar mensaje de autorización en la consola
-                    print(f"[CENTRAL] AUTORIZACIÓN enviada a Driver {user_id} para CP {cp_id}")
+                    if CENTRAL_VERBOSE:
+                        print(f"[CENTRAL] AUTORIZACIÓN enviada a Driver {user_id} para CP {cp_id}")
                 else:
                     #Paso 2.3.5: Enviar notificación de denegación al driver
                     print(f"[CENTRAL] Enviando DENEGACIÓN al driver...")
@@ -348,11 +764,8 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     central_messages.append(f"DENEGADO: Driver {user_id} -> CP {cp_id} (estado={cp_status})")
                     #Paso 2.3.5.3: Mostrar mensaje de denegación en la consola
                     print(f"[CENTRAL] DENEGACIÓN enviada a Driver {user_id} para CP {cp_id} (estado={cp_status})")
-                    # Eliminar petición procesada
-                    for i, req in enumerate(driver_requests):
-                        if req.get('cp_id') == cp_id and req.get('user_id') == user_id:
-                            del driver_requests[i]
-                            break
+                    # Eliminar peticiones procesadas de forma segura
+                    driver_requests[:] = [req for req in driver_requests if not (req.get('cp_id') == cp_id and req.get('user_id') == user_id)]
 
 
 
@@ -420,12 +833,10 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
 
                 # Paso 2.4.3: Procesar el fin de suministro: generar ticket final o notificar error si fue interrumpido
                 elif msg_type == 'SUPPLY_END':
-                    print(f"[CENTRAL] DEBUG: Procesando SUPPLY_END para CP {cp_id}")
                     kwh = float(payload.get('kwh', 0)) # Consumo en kWh
                     importe = float(payload.get('importe', 0)) # Importe en euros
                     driver_id = payload.get('user_id') or payload.get('driver_id')
                     current_status = database.get_cp_status(cp_id) # Estado del CP
-                    print(f"[CENTRAL] DEBUG: SUPPLY_END - CP: {cp_id}, Driver: {driver_id}, kWh: {kwh}, Importe: {importe}, Estado: {current_status}")
 
                     # Paso 2.4.3.1: Si el CP está FUERA_DE_SERVICIO, significa que fue parado durante la carga
                     if current_status == 'FUERA_DE_SERVICIO':
@@ -444,7 +855,6 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                         central_messages.append(
                             f"CARGA INTERRUMPIDA: CP {cp_id} - driver {driver_id} - Parcial: {kwh:.3f} kWh / {importe:.2f} €"
                         )
-                        print(f"[CENTRAL] Carga interrumpida en CP {cp_id} (FUERA_DE_SERVICIO). Notificando a driver {driver_id}")
                         #Paso 2.4.3.1.3: Limpiar telemetría pero mantener estado FUERA_DE_SERVICIO
                         database.clear_cp_telemetry_only(cp_id)
                         
@@ -452,7 +862,6 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                         #Paso 2.4.3.2: Caso normal: generar ticket y dejar CP disponible
                         database.clear_cp_consumption(cp_id)  # Esto pone estado en ACTIVADO
 
-                        print(f"[CENTRAL] Generando ticket final para driver {driver_id}...")
                         central_messages.append(
                             f"TICKET FINAL: CP {cp_id} - driver {driver_id} - {kwh:.3f} kWh - {importe:.2f} €"
                         )
@@ -467,12 +876,8 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                                 "importe": importe
                             }
                             #Paso 2.4.3.2.1.1: Enviar el ticket al driver
-                            print(f"[CENTRAL] Enviando ticket a Driver {driver_id}...")
-                            success = send_notification_to_driver(producer, driver_id, ticket_msg)
-                            if success:
-                                print(f"[CENTRAL] Ticket enviado exitosamente a Driver {driver_id}: {kwh} kWh, {importe} €")
-                            else:
-                                print(f"[CENTRAL] ERROR: No se pudo enviar ticket a Driver {driver_id}")
+                            send_notification_to_driver(producer, driver_id, ticket_msg)
+    
                         except Exception as e:
                             central_messages.append(f"ERROR: no se pudo notificar ticket a driver {driver_id}: {e}")
                             print(f"[CENTRAL] EXCEPTION al enviar ticket: {e}")
@@ -480,11 +885,9 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                         #Paso 2.4.3.2.1.2: Cerrar sesión y liberar la asignación del driver al CP
                         with active_cp_lock:
                             if cp_id in current_sessions:
-                                del current_sessions[cp_id]
-                                print(f"[CENTRAL] Sesión cerrada: CP {cp_id} liberado")
+                                del current_sessions[cp_id]   
 
                         #Paso 2.4.3.2.1.3: Actualizar estado del CP a ACTIVADO
-                        print(f"[CENTRAL] CP {cp_id} vuelve a estado ACTIVADO")
                         database.update_cp_status(cp_id, 'ACTIVADO')
 
                 # Paso 2.4.4: Procesar los eventos de avería / pérdida de conexión
@@ -542,20 +945,26 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
 # --- Funciones del Servidor de Sockets ---
 
 # Funcion Socket para procesar los mensajes que llegan desde el CP (Monitor)
-def process_socket_data2(data, cp_id, address, client_socket, central_messages, kafka_broker):
+def process_socket_data2(data_string, cp_id, address, client_socket, central_messages, kafka_broker):
     """
     Procesa los mensajes que llegan desde el CP (Monitor).
+    Ahora recibe el string de datos ya parseado del protocolo <STX><DATA><ETX><LRC>.
     """
-    #FASE 1: Decodificar el mensaje recibido
-    raw = data.decode('utf-8').strip()
+    #FASE 1: Verificar que hay datos válidos
+    if not data_string:
+        print(f"[CENTRAL] ERROR: Mensaje vacío recibido de CP {cp_id}")
+        return
+    
+    #FASE 2: Parsear el mensaje recibido
     # Normalizar el comando (solo la parte del comando), pero mantenemos el resto
-    parts = raw.split('#')
+    parts = data_string.split('#')
     #Extraer el comando
     command = parts[0].upper() if parts else ""
     # Mostrar el mensaje recibido
-    print(f"[CENTRAL] Recibido de CP {cp_id}: {raw}")
+    if CENTRAL_VERBOSE:
+        print(f"[CENTRAL] Recibido de CP {cp_id}: {data_string}")
     #Mostrar el mensaje recibido en el panel de estado
-    push_message(central_messages, f"CP {cp_id} -> CENTRAL: {raw}")
+    push_message(central_messages, f"CP {cp_id} -> CENTRAL: {data_string}")
 
 
 
@@ -565,7 +974,6 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
 
     #FASE 2.1: Reporte de avería desde el Monitor
     if command == 'FAULT':
-        print(f"[CENTRAL] CP {cp_id} reporta AVERÍA. Actualizando estado a ROJO.")
         
         #Cargar información del CP
         cp_data = database.get_all_cps()
@@ -615,7 +1023,6 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
             # CP no estaba suministrando
             msg = f" AVERÍA en CP {cp_id} - Estado actualizado a ROJO"
             central_messages.append(msg)
-            print(f"[CENTRAL] {msg}")
         
         # Actualizar estado a AVERIADO
         database.update_cp_status(cp_id, 'AVERIADO')
@@ -624,13 +1031,13 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
 
     #FASE 2.2: Recuperación de avería desde el Monitor
     elif command == 'RECOVER':
-        print(f"[CENTRAL]  CP {cp_id} reporta RECUPERACIÓN. Actualizando estado a VERDE.")
         # 2.2.1 Actualizar estado a ACTIVADO
         database.update_cp_status(cp_id, 'ACTIVADO')
-        # 2.2.2 Log del mensaje
-        msg = f" CP {cp_id} se ha recuperado de la avería - Estado actualizado a VERDE"
-        central_messages.append(msg)
-        print(f"[CENTRAL] {msg}")
+        # 2.2.2 Marcar evento de recuperación reciente para evitar parpadeo a DESCONECTADO
+        try:
+            recent_recover_events[cp_id] = time.time()
+        except Exception:
+            pass
 
     
     
@@ -640,22 +1047,52 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
             action = parts[1]
             # 2.3.1 Reanudar el CP
             if action == 'REANUDAR':
-                print(f"[CENTRAL]  CP {cp_id} confirmó REANUDAR. Actualizando a VERDE.")
+                if CENTRAL_VERBOSE:
+                    print(f"[CENTRAL]  CP {cp_id} confirmó REANUDAR. Actualizando a VERDE.")
                 database.update_cp_status(cp_id, 'ACTIVADO')
                 central_messages.append(
                     f"CP {cp_id} confirmó REANUDAR. Estado actualizado a VERDE."
                 )
+                # Confirmar y limpiar pendiente si existía
+                if pending_cp_commands.pop(cp_id, None):
+                    push_message(central_messages, f"Comando REANUDAR confirmado por {cp_id}")
+                # Registrar evento reciente para evitar parpadeo a DESCONECTADO si se reconecta justo después
+                try:
+                    recent_recover_events[cp_id] = time.time()
+                except Exception:
+                    pass
             # 2.3.2 Parar el CP
             elif action == 'PARAR':
-                print(f"[CENTRAL]  CP {cp_id} confirmó PARAR. Actualizando a NARANJA (Out of Order).")
+                if CENTRAL_VERBOSE:
+                    print(f"[CENTRAL]  CP {cp_id} confirmó PARAR. Actualizando a NARANJA (Out of Order).")
+                # IMPORTANTE: Actualizar estado ANTES de cualquier otra operación
+                # Esto asegura que el estado esté actualizado incluso si la conexión se cierra después
                 database.update_cp_status(cp_id, 'FUERA_DE_SERVICIO')
-                central_messages.append(
-                    f" CP {cp_id} confirmó PARAR. Estado actualizado a NARANJA (Out of Order)."
-                )
+                push_message(central_messages, f"CP {cp_id} confirmó PARAR. Estado actualizado a FUERA_DE_SERVICIO (NARANJA - Out of Order).")
+                # Verificar que el estado se actualizó correctamente
+                verify_status = database.get_cp_status(cp_id)
+                if verify_status != 'FUERA_DE_SERVICIO':
+                    print(f"[CENTRAL] WARNING: Estado no se actualizó correctamente. Esperado: FUERA_DE_SERVICIO, Actual: {verify_status}")
+                else:
+                    print(f"[CENTRAL] Estado verificado: CP {cp_id} está en {verify_status}")
+                # Confirmar y limpiar pendiente si existía
+                if pending_cp_commands.pop(cp_id, None):
+                    push_message(central_messages, f"Comando PARAR confirmado por {cp_id}")
 
     elif command == 'NACK':
-        print(f"[CENTRAL]  CP {cp_id} RECHAZÓ el comando: {raw}")
-        central_messages.append(f" CP {cp_id} rechazó el comando: {raw}")
+        if CENTRAL_VERBOSE:
+            print(f"[CENTRAL]  CP {cp_id} RECHAZÓ el comando: {data_string}")
+        central_messages.append(f" CP {cp_id} rechazó el comando: {data_string}")
+        # Revertir estado si había actualización optimista
+        try:
+            pending = pending_cp_commands.pop(cp_id, None)
+            if pending:
+                prev_status = pending.get('prev_status')
+                if prev_status:
+                    database.update_cp_status(cp_id, prev_status)
+                    push_message(central_messages, f"Revertido estado de {cp_id} a {prev_status} por NACK")
+        except Exception as e:
+            print(f"[CENTRAL] WARNING: No se pudo revertir estado tras NACK para {cp_id}: {e}")
 
     
     
@@ -671,16 +1108,22 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
                 assigned_driver = sess.get('driver_id') if sess else None
                 # 2.4.4 Verificar que exista sesión y el driver esté conectado
                 if sess and assigned_driver and assigned_driver in connected_drivers:
-                    client_socket.sendall(assigned_driver.encode('utf-8'))
+                    # Usar protocolo para enviar respuesta
+                    send_frame(client_socket, assigned_driver, central_messages)
+                    send_ack(client_socket)  # Confirmar recepción
                     print(f"[CENTRAL] Sesión válida para CP {requested_cp_id} con Driver {assigned_driver} (status={sess.get('status')})")
                 else:
-                    client_socket.sendall(b"NO_DRIVER")
+                    # Usar protocolo para enviar respuesta negativa
+                    send_frame(client_socket, "NO_DRIVER", central_messages)
+                    send_ack(client_socket)
                     if assigned_driver:
                         print(f"[CENTRAL] Sesión encontrada pero driver no conectado para CP {requested_cp_id}")
                     else:
                         print(f"[CENTRAL] No hay sesión activa para CP {requested_cp_id}")
         else:
-            client_socket.sendall(b"NO_DRIVER")
+            # Usar protocolo para enviar respuesta negativa
+            send_frame(client_socket, "NO_DRIVER", central_messages)
+            send_ack(client_socket)
 
     # FASE 2.5: Consulta de sesión activa autorizada
     elif command == 'CHECK_SESSION':
@@ -696,29 +1139,43 @@ def process_socket_data2(data, cp_id, address, client_socket, central_messages, 
                 if sess and sess.get('status') in ['authorized', 'charging']:
                     # 2.5.5 Cargar el driver asignado al CP
                     assigned_driver = sess.get('driver_id')
-                    # 2.5.6 Enviar el driver asignado al CP
-                    client_socket.sendall(assigned_driver.encode('utf-8'))
+                    # 2.5.6 Enviar el driver asignado al CP usando protocolo
+                    send_frame(client_socket, assigned_driver, central_messages)
+                    send_ack(client_socket)  # Confirmar recepción
                     print(f"[CENTRAL] Sesión autorizada confirmada para CP {requested_cp_id} con Driver {assigned_driver} (status={sess.get('status')})")
                 else:
-                    client_socket.sendall(b"NO_SESSION")
+                    # Usar protocolo para enviar respuesta negativa
+                    send_frame(client_socket, "NO_SESSION", central_messages)
+                    send_ack(client_socket)
                     print(f"[CENTRAL] No hay sesión autorizada para CP {requested_cp_id}")
         else:
-            client_socket.sendall(b"NO_SESSION")
+            # Usar protocolo para enviar respuesta negativa
+            send_frame(client_socket, "NO_SESSION", central_messages)
+            send_ack(client_socket)
 
     # --- Otros mensajes no reconocidos ---
     else:
-        print(f"[CENTRAL]  Mensaje no reconocido de CP {cp_id}: {raw}")
-        central_messages.append(f" Mensaje no reconocido de CP {cp_id}: {raw}")
+        print(f"[CENTRAL]  Mensaje no reconocido de CP {cp_id}: {data_string}")
+        central_messages.append(f" Mensaje no reconocido de CP {cp_id}: {data_string}")
 
 
 
 # Funcion Socket para manejar la conexión de un único CP
 def handle_client(client_socket, address, central_messages, kafka_broker):
-    """Maneja la conexión de un único CP."""
+    """Maneja la conexión de un único CP usando el protocolo <STX><DATA><ETX><LRC>."""
     #Inicializa cp_id para identificar qué CP se conecta (se sabrá tras el REGISTER#...)
     cp_id = None
     try:
-        # FASE 1: Leer primer mensaje desde el CP/cliente
+        # FASE 1: Realizar handshake inicial (ENQ/ACK)
+        #Paso 1.1: Esperar ENQ del cliente y responder con ACK
+        if CENTRAL_VERBOSE:
+            print(f"[CENTRAL] Nueva conexión desde {address}. Iniciando handshake...")
+        push_message(central_messages, f"[CONN] Nueva conexión {address}")
+        if not handshake_server(client_socket, central_messages):
+            print(f"[CENTRAL] ERROR: Handshake fallido con {address}. Cerrando conexión.")
+            return
+        
+        # FASE 2: Recibir primer mensaje usando el protocolo
         #¿Qué puede recibir?**
         # `REGISTER#CP_ID#LOCATION#PRICE` → Registro de CP
         # `CHECK_SESSION#CP_ID` → Consulta de sesión
@@ -727,20 +1184,63 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
         # `ACK#COMANDO` → Confirmación
         # `NACK#COMANDO` → Rechazo de comando
         # `RECOVER#CP_ID` → Recuperación de avería
-        # Espera hasta 1024 bytes de datos
-        # Decodifica: b'REGISTER#MAD-01#...' → 'REGISTER#MAD-01#... (cadena de texto)'
-        message = client_socket.recv(1024).decode('utf-8')
-        parts = message.strip().split('#')
+        if CENTRAL_VERBOSE:
+            print(f"[CENTRAL] Esperando primer mensaje de {address}...")
+        push_message(central_messages, f"[CONN] Esperando ENQ/primer mensaje de {address}")
+        data_string, is_valid = receive_frame(client_socket, central_messages)
+        
+        #Paso 2.1: Verificar que la trama es válida
+        if not is_valid or not data_string:
+            print(f"[CENTRAL] ERROR: Trama inválida recibida de {address}. Cerrando conexión.")
+            send_nack(client_socket)  # Informar al cliente que hubo error
+            return
+        
+        #Paso 2.2: Enviar ACK confirmando recepción válida
+        send_ack(client_socket)
+        
+        #Paso 2.3: Parsear el mensaje recibido
+        parts = data_string.split('#')
 
         
         
-        # FASE 2: Procesar el mensaje recibido
-        # FASE 2.1: Soportar consultas rápidas CHECK_SESSION / CHECK_DRIVER en nuevas conexiones (sin REGISTER)
+        # FASE 3: Procesar el mensaje recibido
+        # FASE 3.1: Soportar consultas rápidas CHECK_SESSION / CHECK_DRIVER en nuevas conexiones (sin REGISTER)
         if parts and parts[0] in ['CHECK_SESSION', 'CHECK_DRIVER']:
-            process_socket_data2(message.encode('utf-8'), None, address, client_socket, central_messages, KAFKA_BROKER)
+            try:
+                cmd = parts[0]
+                target_cp = parts[1] if len(parts) >= 2 else None
+                if cmd == 'CHECK_SESSION' and target_cp:
+                    with active_cp_lock:
+                        sess = current_sessions.get(target_cp)
+                        if sess and sess.get('status') in ['authorized', 'charging']:
+                            driver_id = sess.get('driver_id') or ""
+                            send_frame(client_socket, driver_id, central_messages)
+                        else:
+                            send_frame(client_socket, "NO_SESSION", central_messages)
+                    send_ack(client_socket)
+                elif cmd == 'CHECK_DRIVER' and target_cp:
+                    with active_cp_lock:
+                        sess = current_sessions.get(target_cp)
+                        driver_id = sess.get('driver_id') if sess else None
+                        if driver_id and driver_id in connected_drivers:
+                            send_frame(client_socket, driver_id, central_messages)
+                        else:
+                            send_frame(client_socket, "NO_DRIVER", central_messages)
+                    send_ack(client_socket)
+                else:
+                    send_frame(client_socket, "ERROR", central_messages)
+                    send_ack(client_socket)
+            except Exception:
+                # Silenciar errores de consultas rápidas para evitar ruido en logs
+                pass
+            finally:
+                try:
+                    send_eot(client_socket)  # Indicar fin de transmisión
+                except Exception:
+                    pass
             return
 
-        # FASE 2.2: Registrar el CP si se envía un mensaje REGISTER
+        # FASE 3.2: Registrar el CP si se envía un mensaje REGISTER
         if len(parts) >= 3 and parts[0] == 'REGISTER':
             cp_id = parts[1]
             location = parts[2]
@@ -752,11 +1252,58 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 except Exception:
                     price = None
 
-            #Fase2.2.1: Registrar en la BD 
+            #Fase2.2.1: Registrar en la BD (si no existía) o actualizar ubicación/precio
+            # Detectar si ya existía para ajustar los mensajes de sistema
+            pre_status = database.get_cp_status(cp_id)
+            first_time_in_db = pre_status in [None, 'NO_EXISTE']
+            first_time_this_session = cp_id not in connected_once_this_session
             database.register_cp(cp_id, location, price_per_kwh=price)
-            #Fase2.2.2: Actualizar estado a ACTIVADO
-            database.update_cp_status(cp_id, 'ACTIVADO')
-            push_message(central_messages, f"CP '{cp_id}' registrado/actualizado desde {address}. Estado: ACTIVADO (price={price})")
+            #Fase2.2.2: Solo actualizar estado a ACTIVADO si no está ya en AVERIADO o FUERA_DE_SERVICIO
+            # Esto evita que reconexiones reseteen estados de avería o fuera de servicio
+            current_status = database.get_cp_status(cp_id)
+            new_status = current_status  # Por defecto mantener el estado actual
+            
+            # Política: Tras REGISTER el CP queda ACTIVO, salvo estados especiales previos
+            if first_time_in_db or first_time_this_session:
+                database.update_cp_status(cp_id, 'ACTIVADO')
+                new_status = 'ACTIVADO'
+            else:
+                # Reconexión: mantener estados especiales; sólo ACTIVADO si no hay estados especiales
+                if current_status not in ['AVERIADO', 'FUERA_DE_SERVICIO', 'SUMINISTRANDO']:
+                    new_status = 'ACTIVADO'
+                else:
+                    if CENTRAL_VERBOSE:
+                        print(f"[CENTRAL] CP {cp_id} se reconectó manteniendo estado '{current_status}' (no reseteado a ACTIVADO)")
+            
+            # Mensajería más clara según si es alta inicial o reconexión
+            if first_time_in_db:
+                push_message(central_messages, f"CP '{cp_id}' registrado (primera vez en BD) desde {address}. Estado: {new_status} (price={price})")
+                push_message(central_messages, f"[PROTOCOLO] REGISTRO_INICIAL CP {cp_id} (estado {new_status})")
+                # Informar al Monitor explícitamente del resultado del registro
+                try:
+                    send_frame(client_socket, f"REGISTER_RESULT#FIRST", central_messages)
+                except Exception:
+                    pass
+            elif first_time_this_session:
+                push_message(central_messages, f"[CONN] Primera conexión de sesión de CP '{cp_id}' desde {address}. Estado: {new_status}")
+                push_message(central_messages, f"[PROTOCOLO] PRIMERA_CONEXION_SESION CP {cp_id} (estado {new_status})")
+                # Informar al Monitor explícitamente del resultado del registro
+                try:
+                    send_frame(client_socket, f"REGISTER_RESULT#FIRST", central_messages)
+                except Exception:
+                    pass
+            else:
+                push_message(central_messages, f"[CONN] Reconexión de CP '{cp_id}' desde {address}. Estado: {new_status}")
+                push_message(central_messages, f"[PROTOCOLO] RECONEXION CP {cp_id} (estado {new_status})")
+                # Informar al Monitor de que la CENTRAL lo considera una reconexión
+                try:
+                    send_frame(client_socket, f"REGISTER_RESULT#RECONNECT", central_messages)
+                except Exception:
+                    pass
+            # Aplicar el estado calculado DESPUÉS de registrar y loguear (para que el panel muestre primero el handshake/REGISTER)
+            if new_status != current_status:
+                database.update_cp_status(cp_id, new_status)
+
             #Fase2.2.3: Guardamos la referencia del socket para envíos síncronos (autorización/órdenes)
             with active_cp_lock:
                 #¿Por qué guardar el socket?
@@ -765,22 +1312,46 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 # 
                 # active_cp_sockets['MAD-01'].sendall(b"PARAR#CENTRAL")
                 active_cp_sockets[cp_id] = client_socket 
+                connected_once_this_session.add(cp_id)
             
             
             
-            #Fase 3: Bucle de Escucha de mensajes del CP
+            #FASE 4: Bucle de Escucha de mensajes del CP usando protocolo
             while True:
                 #**¿Qué puede recibir mientras está conectado?**
                 # `FAULT#MAD-01` → Reporte de avería
                 # `RECOVER#MAD-01` → CP recuperado
                 # `ACK#COMANDO` → Confirmación de comando
                 # `NACK#COMANDO` → Rechazo de comando
-                data = client_socket.recv(1024)
-                #Si el socket se cierra, rompe el bucle
-                if not data:
-                    break # Conexión cerrada por el cliente
-                # Procesar mensajes de control/averías
-                process_socket_data2(data, cp_id, address, client_socket, central_messages, KAFKA_BROKER)
+                # `EOT` → Fin de transmisión
+                
+                #Paso 4.1: Recibir trama usando protocolo (con timeout para no bloquear)
+                data_string, is_valid = receive_frame(client_socket, central_messages, timeout=5)
+                
+                #Paso 4.2: Si no hay datos, continuar esperando (posible timeout)
+                if not data_string:
+                    if 'empty_reads' in locals():
+                        empty_reads = 0
+                    continue
+                
+                #Paso 4.3: Verificar validez de la trama
+                if not is_valid:
+                    print(f"[CENTRAL] Trama inválida recibida de CP {cp_id}. Enviando NACK...")
+                    send_nack(client_socket)
+                    continue  # Continuar esperando siguiente mensaje
+                
+                #Paso 4.4: Enviar ACK confirmando recepción válida
+                send_ack(client_socket)
+                if 'empty_reads' in locals():
+                    empty_reads = 0
+                
+                #Paso 4.5: Verificar si es EOT (fin de transmisión)
+                if data_string == "EOT":
+                    print(f"[CENTRAL] CP {cp_id} envió EOT. Cerrando conexión.")
+                    break
+                
+                #Paso 4.6: Procesar mensajes de control/averías
+                process_socket_data2(data_string, cp_id, address, client_socket, central_messages, kafka_broker)
                 
         else:
             central_messages.append(f"ERROR: Mensaje de registro inválido de {address}. Cerrando conexión.")
@@ -790,13 +1361,34 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
     finally:
         # FASE 4: Desconexión
         if cp_id:
-            push_message(central_messages, f"Conexión con CP '{cp_id}' perdida.")
-            # Solo marcar DESCONECTADO si NO estaba ya AVERIADO
+            # IMPORTANTE: Verificar el estado ANTES de cualquier mensaje
+            # Esto evita condiciones de carrera donde el estado cambia después de una desconexión
             current_status = database.get_cp_status(cp_id)
-            if current_status not in ['AVERIADO', 'FUERA_DE_SERVICIO']:
+            if cp_id in pending_cp_commands:
+                push_message(central_messages, f"[CONN] Conexión cerrada mientras había comando pendiente para {cp_id}. Estado mantenido.")
+                with active_cp_lock:
+                    if cp_id in active_cp_sockets:
+                        del active_cp_sockets[cp_id]
+                client_socket.close()
+                return
+            try:
+                ts = recent_recover_events.get(cp_id)
+                within_grace = ts is not None and (time.time() - ts) <= 5
+            except Exception:
+                within_grace = False
+
+            # Solo cambiar a DESCONECTADO si estaba en ACTIVADO o DESCONECTADO
+            # NO cambiar si está en FUERA_DE_SERVICIO, AVERIADO o SUMINISTRANDO
+            if current_status not in ['AVERIADO', 'FUERA_DE_SERVICIO', 'SUMINISTRANDO', 'DESCONECTADO'] and not within_grace:
+                # Solo estaba en ACTIVADO, cambiar a DESCONECTADO
                 database.update_cp_status(cp_id, 'DESCONECTADO')
+                push_message(central_messages, f"Conexión con CP '{cp_id}' perdida. Estado: ACTIVADO → DESCONECTADO")
+            elif current_status in ['AVERIADO', 'FUERA_DE_SERVICIO', 'SUMINISTRANDO'] or within_grace:
+                # Mantener el estado actual (no cambiar a DESCONECTADO)
+                push_message(central_messages, f"[CONN] CP {cp_id} cerró conexión estando en estado '{current_status}'. Estado mantenido.")
             else:
-                push_message(central_messages, f"INFO: CP {cp_id} cerró conexión estando en estado '{current_status}'.")
+                # Ya estaba DESCONECTADO, no hacer nada
+                push_message(central_messages, f"[CONN] CP {cp_id} ya estaba DESCONECTADO.")
 
             with active_cp_lock:
                 if cp_id in active_cp_sockets:
@@ -830,7 +1422,7 @@ def start_socket_server(host, port, central_messages, kafka_broker):
 
 # --- Funciones de Comandos de CENTRAL (13ª Mecánica) ---
 def send_cp_command(cp_id, command, central_messages):
-    """Envía un comando (Parar/Reanudar) a un CP específico a través del socket síncrono.
+    """Envía un comando (Parar/Reanudar) a un CP específico a través del socket síncrono usando protocolo <STX><DATA><ETX><LRC>.
     La confirmación ACK/NACK la procesará handle_client() en segundo plano."""
     
     ## 1. Verificamos que el CP esté conectado
@@ -845,14 +1437,40 @@ def send_cp_command(cp_id, command, central_messages):
         # 2. Recuperamos el socket activo
         socket_ref = active_cp_sockets[cp_id]
         
-        # 3. Enviamos el comando al CP
-        # Usamos formato simple: "COMMAND#PARAMETRO". Ej: "PARAR#CENTRAL"
-        message = f"{command.upper()}#CENTRAL".encode('utf-8') 
-        print(f"[CENTRAL]  Enviando comando {command} a CP {cp_id}...")
-        socket_ref.sendall(message)
-       
-        # 4. Registramos la acción en los logs
-        central_messages.append(f" Comando '{command}' enviado a CP {cp_id}. Esperando ACK/NACK...")
+        # 3. Enviamos el comando al CP usando protocolo <STX><DATA><ETX><LRC>
+        # Usamos formato: "COMMAND#PARAMETRO". Ej: "PARAR#CENTRAL"
+        command_message = f"{command.upper()}#CENTRAL"
+        if CENTRAL_VERBOSE:
+            print(f"[CENTRAL]  Enviando comando {command} a CP {cp_id} usando protocolo...")
+
+        # 3.1 Actualización optimista de estado y registro de comando pendiente
+        try:
+            prev_status = database.get_cp_status(cp_id)
+            if command.upper() == 'PARAR':
+                database.update_cp_status(cp_id, 'FUERA_DE_SERVICIO')
+                pending_cp_commands[cp_id] = { 'command': 'PARAR', 'prev_status': prev_status }
+                push_message(central_messages, f"Estado {cp_id}: FUERA_DE_SERVICIO (pendiente ACK)")
+            elif command.upper() == 'REANUDAR':
+                database.update_cp_status(cp_id, 'ACTIVADO')
+                pending_cp_commands[cp_id] = { 'command': 'REANUDAR', 'prev_status': prev_status }
+                push_message(central_messages, f"Estado {cp_id}: ACTIVADO (pendiente ACK)")
+        except Exception as e:
+            print(f"[CENTRAL] WARNING: No se pudo preparar estado optimista para {cp_id}: {e}")
+        
+        # 4. Usar función send_frame para enviar con protocolo
+        if send_frame(socket_ref, command_message, central_messages):
+            # Log de protocolo explícito con el CP destino
+            push_message(central_messages, f"[PROTOCOLO] → {cp_id}: {command_message}")
+            # 5. Esperar ACK/NACK del CP
+            # El ACK/NACK llegará como mensaje normal que será procesado por process_socket_data2
+            if CENTRAL_VERBOSE:
+                print(f"[CENTRAL] Comando '{command}' enviado a CP {cp_id}. Esperando ACK/NACK...")
+            central_messages.append(f" Comando '{command}' enviado a CP {cp_id}. Esperando ACK/NACK...")
+        else:
+            msg = f"ERROR: No se pudo enviar comando a CP {cp_id}"
+            if CENTRAL_VERBOSE:
+                print(f"[CENTRAL] {msg}")
+            central_messages.append(msg)
         
     except Exception as e:
         msg = f"ERROR al enviar comando a CP {cp_id}: {e}"
@@ -873,14 +1491,6 @@ def process_user_input(central_messages):
     """Maneja los comandos de la interfaz de CENTRAL (punto 13 de la mecánica)."""
     while True:
         try:
-            # Mostrar prompt con comandos disponibles
-            print("\nComandos disponibles:")
-            print("  P <CP_ID>  o  PARAR <CP_ID>    - Parar un CP específico")
-            print("  R <CP_ID>  o  REANUDAR <CP_ID> - Reanudar un CP específico")
-            print("  PT o PARAR_TODOS               - Parar todos los CPs")
-            print("  RT o REANUDAR_TODOS            - Reanudar todos los CPs")
-            print("  Q  o  QUIT                     - Salir")
-            
             # Esperamos el input del usuario
             command_line = input("\n> ").strip().upper()
             
@@ -895,7 +1505,8 @@ def process_user_input(central_messages):
             if command in ['P', 'PARAR']:
                 if len(parts) == 2:
                     cp_id = parts[1]
-                    print(f"\n[CENTRAL] Iniciando comando PARAR para CP {cp_id}...")
+                    if CENTRAL_VERBOSE:
+                        print(f"\n[CENTRAL] Iniciando comando PARAR para CP {cp_id}...")
                     central_messages.append(f" Iniciando comando PARAR para CP {cp_id}...")
                     send_cp_command(cp_id, 'PARAR', central_messages)
                 else:
@@ -905,7 +1516,8 @@ def process_user_input(central_messages):
             elif command in ['R', 'REANUDAR']:
                 if len(parts) == 2:
                     cp_id = parts[1]
-                    print(f"\n[CENTRAL]  Iniciando comando REANUDAR para CP {cp_id}...")
+                    if CENTRAL_VERBOSE:
+                        print(f"\n[CENTRAL]  Iniciando comando REANUDAR para CP {cp_id}...")
                     central_messages.append(f" Iniciando comando REANUDAR para CP {cp_id}...")
                     send_cp_command(cp_id, 'REANUDAR', central_messages)
                 else:
@@ -914,22 +1526,41 @@ def process_user_input(central_messages):
             
             # --- Comandos para TODOS los CPs ---
             elif command in ['PA', 'PT', 'PARAR_TODOS']:
-                print("\n[CENTRAL]  Enviando comando PARAR a todos los CPs conectados...")
+                if CENTRAL_VERBOSE:
+                    print("\n[CENTRAL]  Enviando comando PARAR a todos los CPs conectados...")
                 central_messages.append(" Iniciando comando PARAR para TODOS los CPs...")
                 with active_cp_lock:
                     for cp_id in list(active_cp_sockets.keys()):
+                        # Evitar enviar PARAR a CPs ya fuera de servicio
+                        try:
+                            st = database.get_cp_status(cp_id)
+                            if st == 'FUERA_DE_SERVICIO':
+                                push_message(central_messages, f"[SKIP] CP {cp_id} ya está FUERA_DE_SERVICIO. No se envía PARAR.")
+                                continue
+                        except Exception:
+                            pass
                         send_cp_command(cp_id, 'PARAR', central_messages)
             
             elif command in ['RA', 'RT', 'REANUDAR_TODOS']:
-                print("\n[CENTRAL]  Enviando comando REANUDAR a todos los CPs conectados...")
+                if CENTRAL_VERBOSE:
+                    print("\n[CENTRAL]  Enviando comando REANUDAR a todos los CPs conectados...")
                 central_messages.append(" Iniciando comando REANUDAR para TODOS los CPs...")
                 with active_cp_lock:
                     for cp_id in list(active_cp_sockets.keys()):
+                        # Enviar REANUDAR solo si procede
+                        try:
+                            st = database.get_cp_status(cp_id)
+                            if st not in ['FUERA_DE_SERVICIO', 'AVERIADO', 'DESCONECTADO']:
+                                push_message(central_messages, f"[SKIP] CP {cp_id} en estado {st}. No se envía REANUDAR.")
+                                continue
+                        except Exception:
+                            pass
                         send_cp_command(cp_id, 'REANUDAR', central_messages)
             
             # Comando desconocido
             else:
-                print(f"\n[CENTRAL]  Comando desconocido: {command}")
+                if CENTRAL_VERBOSE:
+                    print(f"\n[CENTRAL]  Comando desconocido: {command}")
                 central_messages.append(f" Comando desconocido: {command}")
                 
         except EOFError:
