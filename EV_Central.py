@@ -246,6 +246,7 @@ def receive_frame(socket_ref, central_messages=None, timeout=None):
         if not frame_bytes:
             if DEBUG_PROTOCOL:
                 print("[PROTOCOLO] Conexión cerrada por el remoto (no se recibieron datos)")
+            # Conexión realmente cerrada
             return None, False
         
         #Paso 4: Parsear la trama recibida
@@ -260,7 +261,8 @@ def receive_frame(socket_ref, central_messages=None, timeout=None):
         #Paso 6: Manejar timeout
         if DEBUG_PROTOCOL:
             print(f"[PROTOCOLO] Timeout esperando trama (timeout={timeout}s)")
-        return None, False
+        # Señalizar timeout con un valor centinela
+        return "__TIMEOUT__", False
     except Exception as e:
         #Paso 7: Manejar otros errores
         if DEBUG_PROTOCOL:
@@ -503,7 +505,7 @@ def display_panel(central_messages, driver_requests):
                     line_ids += f"| {cp_id:<{CELL_WIDTH}} "
                     line_locations += f"| {location:<{CELL_WIDTH}} "
                     # Requerimiento: "Color: [emoji] [Estado]"
-                    line_status += f"| Color: {emoji} {colored_status:<{CELL_WIDTH-9}} " # -9 por "Color: 🟢 "
+                    line_status += f"    | Color: {emoji} {colored_status:<{CELL_WIDTH-9}} " # -9 por "Color: 🟢 "
 
                     # Si está suministrando, preparar la línea de suministro
                     if status == 'SUMINISTRANDO':
@@ -1362,11 +1364,19 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 #Paso 4.1: Recibir trama usando protocolo (con timeout para no bloquear)
                 data_string, is_valid = receive_frame(client_socket, central_messages, timeout=5)
                 
-                #Paso 4.2: Si no hay datos, continuar esperando (posible timeout)
-                if not data_string:
-                    if 'empty_reads' in locals():
-                        empty_reads = 0
+                #Paso 4.2: Gestionar timeouts vs. cierre real
+                if data_string == "__TIMEOUT__":
+                    # No hay tráfico, seguimos esperando sin penalizar
                     continue
+                if not data_string:
+                    if 'empty_reads' not in locals():
+                        empty_reads = 0
+                    empty_reads += 1
+                    if empty_reads >= 2:
+                        push_message(central_messages, f"[CONN] Conexión cerrada por CP {cp_id}")
+                        break
+                    else:
+                        continue
                 
                 #Paso 4.3: Verificar validez de la trama
                 if not is_valid:
@@ -1411,18 +1421,22 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             except Exception:
                 within_grace = False
 
-            # Solo cambiar a DESCONECTADO si estaba en ACTIVADO o DESCONECTADO
-            # NO cambiar si está en FUERA_DE_SERVICIO, AVERIADO o SUMINISTRANDO
-            if current_status not in ['AVERIADO', 'FUERA_DE_SERVICIO', 'SUMINISTRANDO', 'DESCONECTADO'] and not within_grace:
-                # Solo estaba en ACTIVADO, cambiar a DESCONECTADO
-                database.update_cp_status(cp_id, 'DESCONECTADO')
-                push_message(central_messages, f"Conexión con CP '{cp_id}' perdida. Estado: ACTIVADO → DESCONECTADO")
-            elif current_status in ['AVERIADO', 'FUERA_DE_SERVICIO', 'SUMINISTRANDO'] or within_grace:
-                # Mantener el estado actual (no cambiar a DESCONECTADO)
-                push_message(central_messages, f"[CONN] CP {cp_id} cerró conexión estando en estado '{current_status}'. Estado mantenido.")
+            # No degradar a DESCONECTADO si hay sesión autorizada/cargando o estado ya es RESERVADO/SUMINISTRANDO
+            try:
+                status_now = database.get_cp_status(cp_id)
+            except Exception:
+                status_now = current_status
+            with active_cp_lock:
+                sess = current_sessions.get(cp_id)
+
+            if (sess and sess.get('status') in ('authorized', 'charging')) or status_now in ('RESERVADO', 'SUMINISTRANDO'):
+                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado, se mantiene {status_now} (sesión activa/reserva).")
             else:
-                # Ya estaba DESCONECTADO, no hacer nada
-                push_message(central_messages, f"[CONN] CP {cp_id} ya estaba DESCONECTADO.")
+                database.update_cp_status(cp_id, 'DESCONECTADO')
+                if current_status == 'SUMINISTRANDO':
+                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
+                else:
+                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
 
             with active_cp_lock:
                 if cp_id in active_cp_sockets:

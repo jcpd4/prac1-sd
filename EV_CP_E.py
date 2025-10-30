@@ -291,7 +291,9 @@ def send_nack(socket_ref):
 
 # --- Variables de Estado del Engine ---
 ENGINE_STATUS = {"health": "OK", "is_charging": False, "driver_id": None}
-KAFKA_PRODUCER = None
+KAFKA_PRODUCER = None 
+TELEMETRY_BUFFER = []  # Buffer de resiliencia cuando el broker no está disponible
+LAST_MONITOR_TS = 0.0   # Marca de tiempo del último latido/orden del Monitor
 CP_ID = ""
 BROKER = None 
 # Creamos un Lock global para proteger el acceso concurrente a ENGINE_STATUS.
@@ -317,6 +319,23 @@ def init_kafka_producer(broker):
             )
             #Paso 1.2: Imprimir mensaje de éxito
             print(f"[ENGINE] Kafka producer conectado a {broker}")
+            # Intentar vaciar buffer pendiente
+            try:
+                if TELEMETRY_BUFFER:
+                    pending = list(TELEMETRY_BUFFER)
+                    TELEMETRY_BUFFER.clear()
+                    for payload in pending:
+                        try:
+                            KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=payload)
+                        except Exception:
+                            TELEMETRY_BUFFER.append(payload)
+                            break
+                    try:
+                        KAFKA_PRODUCER.flush()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except NoBrokersAvailable:
             #Paso 1.3: Manejar error de broker no disponible
             print(f"[ENGINE] WARNING: broker {broker} no disponible. Los mensajes se descartarán hasta reconexión.")
@@ -368,17 +387,23 @@ def send_telemetry_message(payload):
     
     #Paso 2: Verificar que el productor esté inicializado
     if KAFKA_PRODUCER is None:
-        #Paso 2.1: Descartar mensaje si no hay productor
-        print(f"[ENGINE] AVISO: Kafka producer no inicializado. Mensaje descartado.")
+        TELEMETRY_BUFFER.append(payload)
+        print(f"[ENGINE] AVISO: Broker no disponible. Telemetría en buffer ({len(TELEMETRY_BUFFER)} pendientes).")
         return
     try:
-        #Paso 2.2: Enviar mensaje al topic de telemetría
+        # Enviar pendientes primero
+        if TELEMETRY_BUFFER:
+            for p in list(TELEMETRY_BUFFER):
+                try:
+                    KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=p)
+                    TELEMETRY_BUFFER.remove(p)
+                except Exception:
+                    break
         KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=payload)
-        #Paso 2.3: Forzar envío inmediato
         KAFKA_PRODUCER.flush()
     except Exception as e:
-        #Paso 2.4: Manejar errores de envío
-        print(f"[ENGINE] Error enviando telemetry: {e}")
+        print(f"[ENGINE] Error enviando telemetry: {e}. Guardando en buffer.")
+        TELEMETRY_BUFFER.append(payload)
 
 # --- Funciones de Utilidad ---
 def clear_screen():
@@ -468,6 +493,12 @@ def handle_monitor_connection(monitor_socket, monitor_address):
         
         #Paso 2.4: Enviar ACK confirmando recepción válida (modo silencioso para health checks)
         send_ack(monitor_socket, silent=is_health_check)
+        # Actualizar último latido del Monitor
+        try:
+            global LAST_MONITOR_TS
+            LAST_MONITOR_TS = time.time()
+        except Exception:
+            pass
         
         #Paso 3: Bloquear el acceso a ENGINE_STATUS mientras procesamos este comando
         #   Esto impide que otro hilo lo modifique al mismo tiempo
@@ -585,13 +616,16 @@ def start_health_server(host, port):
         sys.exit(1)
     
     
-    #Paso 2: Bucle principal del servidor
+        #Paso 2: Bucle principal del servidor
     while True:
         try:
             #Paso 2.1: Esperar una conexión del Monitor
             #monitor_socket: el socket activo para hablar con ese cliente
             #address: la IP y puerto del cliente (Monitor)
             monitor_socket, address = server_socket.accept()
+            # Marca latido del monitor (conexión entrante)
+            global LAST_MONITOR_TS
+            LAST_MONITOR_TS = time.time()
             #Paso 2.2: Crear un nuevo hilo para manejar la conexión
             monitor_thread = threading.Thread(
                 target=handle_monitor_connection, 
@@ -655,6 +689,24 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
                     send_telemetry_message(payload_fault)
                     aborted_due_to_fault = True
                     return
+
+            #Paso 3.2.5: Verificar latidos del Monitor (resiliencia R1)
+            try:
+                if LAST_MONITOR_TS and (time.time() - LAST_MONITOR_TS) > 6:
+                    print("[ENGINE] Monitor no responde. Finalizando suministro de forma segura.")
+                    with status_lock:
+                        ENGINE_STATUS['is_charging'] = False
+                    # Enviar fin normal con los acumulados actuales
+                    send_telemetry_message({
+                        "type": "SUPPLY_END",
+                        "cp_id": cp_id,
+                        "user_id": driver_id,
+                        "kwh": round(total_kwh, 3),
+                        "importe": round(total_importe, 2)
+                    })
+                    break
+            except Exception:
+                pass
 
             #Paso 3.3: Incrementar consumo cada segundo
             total_kwh += step_kwh
