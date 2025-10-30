@@ -55,6 +55,20 @@ def push_message(msg_list, msg, maxlen=200):
 
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
+# En EV_Central.py, añádelo cerca de get_status_color
+
+def get_status_emoji(status):
+    """Devuelve un emoji para el panel-matriz basado en el estado."""
+    emojis = {
+        "ACTIVADO": "🟢",
+        "DESCONECTADO": "⚪",
+        "SUMINISTRANDO": "🔵",
+        "AVERIADO": "🔴",
+        "FUERA_DE_SERVICIO": "🟠",
+        "RESERVADO": "🟣",
+    }
+    return emojis.get(status, "❓") # Emoji por defecto para estados desconocidos
+
 # Constantes del protocolo
 STX = bytes([0x02])  # Start of Text
 ETX = bytes([0x03])  # End of Text
@@ -444,51 +458,86 @@ def get_status_color(status):
     END_COLOR = "\033[0m"
     return f"{colors.get(status, '')}{status}{END_COLOR}"
 
+# En EV_Central.py, REEMPLAZA tu función display_panel por esta:
+
 def display_panel(central_messages, driver_requests):
-    """Muestra el estado de todos los CPs y mensajes en un panel."""
+    """Muestra el estado de todos los CPs en una matriz y los mensajes del sistema."""
+    
+    # --- Parámetros de la Matriz ---
+    GRID_COLUMNS = 3  # Número de CPs por fila. Puedes ajustarlo (ej. 4 o 5)
+    CELL_WIDTH = 28   # Ancho de cada celda en caracteres. Ajústalo a tu gusto
     
     while True:
-        #Limpia el terminal
         clear_screen()
-        #Imprime la cabecera del panel.
         print("--- PANEL DE MONITORIZACIÓN DE EV CHARGING ---")
-        print("="*80)
+        print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Ancho total de la matriz
         
-        #1. --- Sección de Puntos de Recarga (CPs) ---
-        #Recupera todos los CPs registrados en la base de datos.
-        all_cps = database.get_all_cps()
+        # 1. --- Sección Matriz de Puntos de Recarga (CPs) ---
+        print(f"--- MATRIZ DE PUNTOS DE RECARGA (CPs) [Columnas={GRID_COLUMNS}] ---")
+        all_cps = database.get_all_cps() #
+        
         if not all_cps:
             print("No hay Puntos de Recarga registrados.")
         else:
-            # Añadimos columna de precio
-            print(f"{'ID':<10} | {'UBICACIÓN':<25} | {'PRECIO':<12} | {'ESTADO':<20}")
-            print("-"*80)
-            for cp in all_cps:
-                price = database.get_cp_price(cp['id'])
-                price_str = f"{price:.2f} €/kWh" if price is not None else "N/A"
-                colored_status = get_status_color(cp['status'])
-                print(f"{cp['id']:<10} | {cp['location']:<25} | {price_str:<12} | {colored_status}")
+            # Iterar por los CPs en filas de GRID_COLUMNS
+            for i in range(0, len(all_cps), GRID_COLUMNS):
+                row_cps = all_cps[i:i + GRID_COLUMNS]
+                
+                # Preparar las líneas de texto para la fila actual
+                line_ids = ""
+                line_locations = ""
+                line_status = ""
+                line_supply = ""
 
-                # Si está suministrando, mostramos datos de consumo acumulado
-                if cp.get('status') == 'SUMINISTRANDO':
-                    kwh = cp.get('kwh', 0.0)
-                    importe = cp.get('importe', 0.0)
-                    driver = cp.get('driver_id', 'N/A')
-                    print(f"    -> SUMINISTRANDO: {kwh:.3f} kWh  |  {importe:.2f} €  |  driver: {driver}")
-        print("="*80)
+                for cp in row_cps:
+                    # Extraer datos del CP
+                    cp_id = cp.get('id', 'N/A')
+                    location = cp.get('location', 'N/A')[:CELL_WIDTH-2] # Truncar ubicación
+                    status = cp.get('status', 'DESCONECTADO')
+                    
+                    # Obtener representaciones visuales
+                    emoji = get_status_emoji(status)
+                    colored_status = get_status_color(status) #
+                    
+                    # Formatear cada línea para la celda
+                    line_ids += f"| {cp_id:<{CELL_WIDTH}} "
+                    line_locations += f"| {location:<{CELL_WIDTH}} "
+                    # Requerimiento: "Color: [emoji] [Estado]"
+                    line_status += f"| Color: {emoji} {colored_status:<{CELL_WIDTH-9}} " # -9 por "Color: 🟢 "
 
-        #2. --- Sección Drivers Conectados ---
+                    # Si está suministrando, preparar la línea de suministro
+                    if status == 'SUMINISTRANDO':
+                        kwh = cp.get('kwh', 0.0)
+                        importe = cp.get('importe', 0.0)
+                        driver = cp.get('driver_id', 'N/A')
+                        supply_str = f"{driver} | {kwh:.1f}kWh | {importe:.1f}€"
+                        line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} " # Truncar info de suministro
+                    else:
+                        line_supply += f"| {' ':<{CELL_WIDTH}} " # Celda vacía para alinear
+
+                # Imprimir las líneas de la fila
+                print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador de fila
+                print(line_ids + "|")
+                print(line_locations + "|")
+                print(line_status + "|")
+                # Solo imprimir la línea de suministro si tiene contenido
+                if line_supply.strip().replace("|", ""):
+                    print(line_supply + "|")
+            
+            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador final de la matriz
+        
+        # --- Resto del panel (Drivers, Peticiones, Mensajes) ---
+        # (Esta parte es la misma que ya tenías)
+        
         print("\n*** DRIVERS CONECTADOS ***")
         with active_cp_lock:
-            if connected_drivers:
+            if connected_drivers: #
                 for driver_id in connected_drivers:
-                    # Verificar si el driver está asignado a algún CP
                     assigned_cp = None
-                    for cp_id, assigned_driver in cp_driver_assignments.items():
+                    for cp_id, assigned_driver in cp_driver_assignments.items(): #
                         if assigned_driver == driver_id:
                             assigned_cp = cp_id
                             break
-                    
                     if assigned_cp:
                         print(f"Driver {driver_id} -> CP {assigned_cp} (ASIGNADO)")
                     else:
@@ -496,21 +545,17 @@ def display_panel(central_messages, driver_requests):
             else:
                 print("No hay drivers conectados.")
         
-        
-        #3. --- Sección Peticiones de Conductores (Kafka) ---
         print("-" * 80)
         print("\n*** PETICIONES DE CONDUCTORES EN CURSO (Kafka) ***")
-        #Lista todas las solicitudes Kafka del topic driver_requests
-        if driver_requests:
+        if driver_requests: #
             for req in driver_requests:
                 print(f"[{req['timestamp']}] Driver {req['user_id']} solicita recarga en CP {req['cp_id']}")
         else:
             print("No hay peticiones pendientes.")
-        #4. --- Sección de Mensajes del Sistema ---
+        
         print("-" * 80)
         print("\n*** MENSAJES DEL SISTEMA ***")
-        if central_messages:
-            # Separar mensajes del protocolo y otros mensajes
+        if central_messages: #
             protocol_msgs = []
             other_msgs = []
             for msg in central_messages:
@@ -519,17 +564,14 @@ def display_panel(central_messages, driver_requests):
                 else:
                     other_msgs.append(msg)
             
-            # Mostrar solo los últimos 8 mensajes no-protocolo
             if other_msgs:
                 for msg in other_msgs[-7:]:
                     print(msg)
         
-        #5. --- Sección de Mensajes del Protocolo (separada, como en Monitor) ---
         print("-" * 80)
         print("\n*** MENSAJES DEL PROTOCOLO (últimos 7) ***")
         print("-" * 80)
         if central_messages:
-            # Extraer solo mensajes del protocolo
             protocol_msgs = []
             for msg in central_messages:
                 if "[PROTOCOLO]" in msg or "PROTOCOLO" in msg or "Handshake" in msg:
@@ -537,34 +579,26 @@ def display_panel(central_messages, driver_requests):
             
             if protocol_msgs:
                 for msg in protocol_msgs[-7:]:
-                    # Limpiar formato para mejor legibilidad
                     clean_msg = msg.replace("[PROTOCOLO] ", "")
                     clean_msg = clean_msg.replace("Handshake exitoso (ENQ recibido, ACK enviado)", "Handshake exitoso")
                     clean_msg = clean_msg.replace("Recibido: ", "← ")
                     clean_msg = clean_msg.replace("Enviado: ", "→ ")
-                    # Ocultar ruido de handshakes y REGISTER que no aportan en el panel
                     if clean_msg.startswith("← REGISTER#") or clean_msg.startswith("→ REGISTER#"):
                         continue
                     if "Handshake exitoso" in clean_msg or "Realizando handshake" in clean_msg:
                         continue
-                    # Mantener mensajes específicos añadidos por nosotros
-                    # Ocultar mensajes de error de desconexión normales (WinError 10054)
                     if "ERROR recibiendo:" in clean_msg and "WinError 10054" in clean_msg:
                         clean_msg = "⚠ Conexión cerrada (reconexión automática)"
                     elif "ERROR recibiendo:" in clean_msg:
-                        # Mantener otros errores visibles
                         clean_msg = clean_msg.replace("ERROR recibiendo: ", "⚠ ")
                     print(f"  {clean_msg}")
             else:
                 print("  No hay mensajes del protocolo.")
         
-        print("="*50)
-        #Instrucciones para que el operador de la Central escriba comandos para controlar los CPs.
+        print("="*80)
         print("Comandos: [P]arar <CP_ID> | [R]eanudar <CP_ID> | [PT] Parar todos | [RT] Reanudar todos | [Q]uit")
         print(f"Última actualización: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         time.sleep(2) # El panel se refresca cada 2 segundos
-
-
 
 
 # --- Funciones de Kafka ---
