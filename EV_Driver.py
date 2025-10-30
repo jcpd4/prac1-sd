@@ -27,6 +27,18 @@ def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
+def colorize_status(status):
+    """Devuelve el estado coloreado similar al panel de la Central."""
+    colors = {
+        'ACTIVADO': '\033[92m',       # Verde
+        'DESCONECTADO': '\033[90m',  # Gris
+        'SUMINISTRANDO': '\033[94m', # Azul
+        'AVERIADO': '\033[91m',      # Rojo
+        'FUERA_DE_SERVICIO': '\033[38;5;208m', # Naranja
+    }
+    end = '\033[0m'
+    return f"{colors.get(status,'')}{status}{end}"
+
 
 # HILO 1: Funcion Kafka que porcesa las notificaciones de la central 
 def process_central_notifications(kafka_broker, client_id, messages):
@@ -136,38 +148,63 @@ def process_network_updates(kafka_broker):
 
 # HILO 3: Función para mostrar el panel del conductor (11)
 def display_driver_panel(messages):
-    """Muestra el panel de mensajes del conductor de forma continua."""
+    """Muestra el panel de la app del Driver con un diseño similar a Central/Monitor."""
+    icons = {
+        'ACTIVADO': '✓',
+        'DESCONECTADO': '·',
+        'SUMINISTRANDO': '⚡',
+        'AVERIADO': '✗',
+        'FUERA_DE_SERVICIO': '⏸',
+    }
     while True:
         clear_screen()
-        print(f"--- EV DRIVER APP: CLIENTE {CLIENT_ID} ---")
-        print("="*50)
-        
-        #Paso 1: Estado de la recarga personal
+        # Cabecera
+        print("--- EV DRIVER APP ---")
+        print(f"Cliente: {CLIENT_ID}")
+        print("="*80)
+
+        # 1) Estado personal
+        print("*** ESTADO DEL CLIENTE ***")
         with charge_lock:
             if not active_charge_info:
-                print("ESTADO: Listo para solicitar recarga.")
+                print("  Listo para solicitar recarga.")
             else:
                 for cp_id, data in active_charge_info.items():
-                    print(f"ESTADO: 🔋 Suministrando en {cp_id}...")
-                    print(f"   Consumo: {data['kwh']:.3f} kWh")
-                    print(f"   Coste actual: {data['importe']:.2f} €")
-        
-        #Paso 2: Puntos de recarga disponibles
-        print("\n--- PUNTOS DE RECARGA DISPONIBLES ---")
-        with network_status_lock:
-            #Paso 2.1: Filtrar los puntos de recarga disponibles
-            available_cps = {cp_id: data for cp_id, data in network_status.items() if data['status'] == 'ACTIVADO'}
-            if not available_cps:
-                print("Buscando puntos de recarga en la red...")
-            else:
-                for cp_id, data in available_cps.items():
-                    print(f"  -> {cp_id:<10} ({data['location']})")
+                    print(f"  Estado: Suministrando en {cp_id}")
+                    print(f"    Consumo: {data['kwh']:.3f} kWh    Importe: {data['importe']:.2f} €")
 
-        print("="*50)
-        print("COMANDOS: SOLICITAR <CP_ID> | [Q]UIT")
-        print("\n*** LOG DE COMUNICACIONES (últimas) ***")
-        for msg in list(messages):
-            print(msg)
+        # 2) Mapa rápido de CPs disponibles (y resumen)
+        print("-"*80)
+        print("*** ESTADO DE LA RED (vista rápida) ***")
+        with network_status_lock:
+            if not network_status:
+                print("  Obteniendo estado de la red…")
+            else:
+                # Contadores por estado
+                counts = {'ACTIVADO':0,'DESCONECTADO':0,'SUMINISTRANDO':0,'AVERIADO':0,'FUERA_DE_SERVICIO':0}
+                for _, data in network_status.items():
+                    st = data.get('status','DESCONECTADO')
+                    if st in counts: counts[st] += 1
+                print("  Disponibles para pedir:")
+                for cp_id, data in network_status.items():
+                    st = data['status']
+                    if st == 'ACTIVADO':
+                        print(f"     {cp_id:<10} | {data['location']} | {colorize_status(st)}")
+
+        # 3) Comandos
+        print("-"*80)
+        print("*** COMANDOS ***")
+        print("  SOLICITAR <CP_ID>    Realiza una petición de recarga en el CP indicado")
+        print("  BATCH <ruta.txt>     Envía múltiples peticiones (una por línea)")
+        print("  Q/QUIT               Salir")
+
+        # 4) Mensajes recientes
+        print("-"*80)
+        print("*** MENSAJES (últimos 7) ***")
+        for msg in list(messages)[-7:]:
+            print(f"  {msg}")
+
+        print("="*80)
         time.sleep(1)
 
 
@@ -315,6 +352,13 @@ if __name__ == "__main__":
         start_driver_interactive_logic(kafka_producer, driver_messages)
 
     except KeyboardInterrupt:
+        # Avisar a CENTRAL para liberar reservas del driver
+        try:
+            quit_msg = {"type": "DRIVER_QUIT", "user_id": CLIENT_ID, "timestamp": time.time()}
+            kafka_producer.send(KAFKA_TOPIC_REQUESTS, value=quit_msg)
+            kafka_producer.flush()
+        except Exception:
+            pass
         print("\nDriver detenido por el usuario.")
         sys.exit(0)
     except Exception as e:
