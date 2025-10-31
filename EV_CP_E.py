@@ -693,7 +693,11 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
             #Paso 3.2.5: Verificar latidos del Monitor (resiliencia R1)
             try:
                 if LAST_MONITOR_TS and (time.time() - LAST_MONITOR_TS) > 6:
-                    print("[ENGINE] Monitor no responde. Finalizando suministro de forma segura.")
+                    # === INICIO DE LA CORRECCIÓN ===
+                    msg = "[ENGINE] Monitor no responde. Finalizando suministro."
+                    print(msg) # Lo dejamos por si acaso
+                    add_protocol_message(msg) # Añadimos el mensaje al panel
+                    # === FIN DE LA CORRECCIÓN ===
                     with status_lock:
                         ENGINE_STATUS['is_charging'] = False
                     # Enviar fin normal con los acumulados actuales

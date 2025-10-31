@@ -509,9 +509,19 @@ def display_panel(central_messages, driver_requests):
 
                     # Si está suministrando, preparar la línea de suministro
                     if status == 'SUMINISTRANDO':
-                        kwh = cp.get('kwh', 0.0)
-                        importe = cp.get('importe', 0.0)
+                        
+                        # === INICIO DE LA CORRECCIÓN ===
+                        # Obtener los valores; pueden ser None si la BD se limpió
+                        kwh_val = cp.get('kwh')
+                        importe_val = cp.get('importe')
+                        
+                        # Si son None (por la condición de carrera), usar 0.0 para mostrar
+                        kwh = kwh_val if kwh_val is not None else 0.0
+                        importe = importe_val if importe_val is not None else 0.0
+                        
                         driver = cp.get('driver_id', 'N/A')
+                        # === FIN DE LA CORRECCIÓN ===
+                        
                         supply_str = f"{driver} | {kwh:.1f}kWh | {importe:.1f}€"
                         line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} " # Truncar info de suministro
                     else:
@@ -871,7 +881,7 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 elif msg_type == 'SUPPLY_END':
                     kwh = float(payload.get('kwh', 0)) # Consumo en kWh
                     importe = float(payload.get('importe', 0)) # Importe en euros
-                    driver_id = payload.get('user_id') or payload.get('driver_id')
+                    driver_id = payload.get('user_id') or payload.get('driver_id') #
                     current_status = database.get_cp_status(cp_id) # Estado del CP
 
                     # Paso 2.4.3.1: Si el CP está FUERA_DE_SERVICIO, significa que fue parado durante la carga
@@ -885,22 +895,37 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                             "kwh_partial": kwh,
                             "importe_partial": importe
                         }
-                        producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=error_msg)
-                        producer.flush()
+                        producer.send(KAFKA_TOPIC_DRIVER_NOTIFY, value=error_msg) #
+                        producer.flush() #
                         #Paso 2.4.3.1.2: Agregar mensaje de error a la lista de mensajes
                         central_messages.append(
                             f"CARGA INTERRUMPIDA: CP {cp_id} - driver {driver_id} - Parcial: {kwh:.3f} kWh / {importe:.2f} €"
-                        )
+                        ) #
                         #Paso 2.4.3.1.3: Limpiar telemetría pero mantener estado FUERA_DE_SERVICIO
-                        database.clear_cp_telemetry_only(cp_id)
+                        database.clear_cp_telemetry_only(cp_id) #
                         
                     else:
-                        #Paso 2.4.3.2: Caso normal: generar ticket y dejar CP disponible
-                        database.clear_cp_consumption(cp_id)  # Esto pone estado en ACTIVADO
+                        # === INICIO DE LA CORRECCIÓN ===
+                        # Paso 2.4.3.2: Caso normal O caso de crash del Monitor
+                        
+                        # Comprobar si el Monitor de este CP sigue conectado por socket
+                        with active_cp_lock:
+                            is_cp_still_connected = cp_id in active_cp_sockets #
+
+                        if is_cp_still_connected:
+                            # Caso normal: El Monitor está vivo. La carga terminó (ej: 'E' en Engine).
+                            # Poner en estado de reposo ACTIVADO.
+                            database.clear_cp_consumption(cp_id)  # Esto pone estado en ACTIVADO
+                        else:
+                            # Caso Crash Monitor: El Monitor ya no está. El Engine envió esto (watchdog).
+                            # NO poner en ACTIVADO. Dejar el estado que puso el socket thread (DESCONECTADO).
+                            # Solo limpiar los datos de telemetría.
+                            database.clear_cp_telemetry_only(cp_id) #
+                        # === FIN DE LA CORRECCIÓN ===
 
                         central_messages.append(
                             f"TICKET FINAL: CP {cp_id} - driver {driver_id} - {kwh:.3f} kWh - {importe:.2f} €"
-                        )
+                        ) #
 
                         #Paso 2.4.3.2.1: Notificar ticket normal al driver asignado
                         try:
@@ -910,21 +935,23 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                                 "user_id": driver_id,
                                 "kwh": kwh,
                                 "importe": importe
-                            }
+                            } #
                             #Paso 2.4.3.2.1.1: Enviar el ticket al driver
-                            send_notification_to_driver(producer, driver_id, ticket_msg)
+                            send_notification_to_driver(producer, driver_id, ticket_msg) #
     
                         except Exception as e:
-                            central_messages.append(f"ERROR: no se pudo notificar ticket a driver {driver_id}: {e}")
-                            print(f"[CENTRAL] EXCEPTION al enviar ticket: {e}")
+                            central_messages.append(f"ERROR: no se pudo notificar ticket a driver {driver_id}: {e}") #
+                            print(f"[CENTRAL] EXCEPTION al enviar ticket: {e}") #
                         
                         #Paso 2.4.3.2.1.2: Cerrar sesión y liberar la asignación del driver al CP
                         with active_cp_lock:
                             if cp_id in current_sessions:
-                                del current_sessions[cp_id]   
+                                del current_sessions[cp_id]   #
+                        
+                        # === CORRECCIÓN: Eliminar esta línea redundante ===
+                        # La lógica de estado ya se ha manejado arriba
+                        # database.update_cp_status(cp_id, 'ACTIVADO') #
 
-                        #Paso 2.4.3.2.1.3: Actualizar estado del CP a ACTIVADO
-                        database.update_cp_status(cp_id, 'ACTIVADO')
 
                 # Paso 2.4.4: Procesar los eventos de avería / pérdida de conexión
                 elif msg_type in ('AVERIADO', 'CONEXION_PERDIDA', 'FAULT'):
