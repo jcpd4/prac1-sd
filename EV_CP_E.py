@@ -724,6 +724,20 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
                 "kwh": round(total_kwh, 3),
                 "importe": round(total_importe, 2)
             }
+            # === INICIO DE LA MODIFICACIÓN (Persistencia de Suministro) ===
+            try:
+                # Guardar el estado actual en un fichero por si hay un "crash"
+                current_charge_state = {
+                    "driver_id": driver_id,
+                    "total_kwh": total_kwh,
+                    "total_importe": total_importe
+                }
+                # Usamos el CP_ID en el nombre del fichero para hacerlo único
+                with open(f"cp_state_{cp_id}.json", "w") as f:
+                    json.dump(current_charge_state, f)
+            except Exception as e:
+                add_protocol_message(f"ERROR: No se pudo guardar estado: {e}")
+            # === FIN DE LA MODIFICACIÓN ===
             #Paso 3.5: Enviar telemetría de consumo
             send_telemetry_message(payload)
             #Paso 3.6: Esperar un segundo antes del siguiente incremento
@@ -745,7 +759,13 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
             }
             #Paso 5.1.2: Enviar mensaje de fin de suministro
             send_telemetry_message(payload_end)
-
+        # === AÑADIR ESTO ===
+        try:
+            if os.path.exists(f"cp_state_{cp_id}.json"):
+                os.remove(f"cp_state_{cp_id}.json")
+        except Exception as e:
+            print(f"[ENGINE] WARNING: No se pudo borrar el fichero de estado: {e}")
+        # === FIN AÑADIDO ===
         #Paso 5.2: Limpiar estado del Engine
         with status_lock:
             ENGINE_STATUS['is_charging'] = False
@@ -878,7 +898,32 @@ if __name__ == "__main__":
         # Paso 4: Inicializar el Productor Kafka (una sola vez)
         init_kafka_producer(KAFKA_BROKER)
         print(f"[Engine] Productor Kafka inicializado para {KAFKA_BROKER}")
-
+        # === INICIO DE LA MODIFICACIÓN (Persistencia de Suministro) ===
+        STATE_FILE = f"cp_state_{CP_ID}.json"
+        if os.path.exists(STATE_FILE):
+            try:
+                print(f"[ENGINE] (!) Detectado fichero de estado: {STATE_FILE}.")
+                print("[ENGINE] (!) Intentando recuperar suministro interrumpido...")
+                with open(STATE_FILE, "r") as f:
+                    previous_state = json.load(f)
+                
+                # Enviar el estado final (ticket) del suministro interrumpido
+                payload_end = {
+                    "type": "SUPPLY_END",
+                    "cp_id": CP_ID,
+                    "user_id": previous_state.get('driver_id'),
+                    "kwh": previous_state.get('total_kwh', 0),
+                    "importe": previous_state.get('total_importe', 0)
+                }
+                send_telemetry_message(payload_end)
+                print(f"[ENGINE] (!) Estado final del suministro anterior enviado a Central.")
+                
+                # Limpiar el fichero de estado
+                os.remove(STATE_FILE)
+                print(f"[ENGINE] (!) Fichero de estado {STATE_FILE} limpiado.")
+            except Exception as e:
+                print(f"[ENGINE] ERROR: No se pudo procesar el fichero de estado: {e}")
+        # === FIN DE LA MODIFICACIÓN ===
         
         # Paso 5: Iniciar los hilos
         # Paso 5.1: Iniciar el servidor TCP de sockets para el Monitor (hilo de salud)

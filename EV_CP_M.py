@@ -525,10 +525,10 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                     #Paso 2.6.2.1: Enviar RECOVER a Central si está conectada usando protocolo
                     if central_socket_ref[0]:
                         try:
-                            # Enviar RECOVER protegido por lock para evitar carreras con otros hilos
-                            with central_socket_lock:
+                            # === INICIO DE LA CORRECCIÓN ===
+                            with central_socket_lock: # Proteger el socket
                                 send_frame(central_socket_ref[0], f"RECOVER#{cp_id}")
-                                # Consumir el ACK (1 byte) que envía la Central por recibir una trama válida
+                                # Consumir el ACK (1 byte)
                                 try:
                                     central_socket_ref[0].settimeout(0.5)
                                     _ack = central_socket_ref[0].recv(1)
@@ -536,6 +536,7 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                                     pass
                                 finally:
                                     central_socket_ref[0].settimeout(5.0)
+                            # === FIN DE LA CORRECCIÓN ===
                         except Exception as e:
                             print(f"[Monitor] Error enviando RECOVER: {e}")
                     engine_failed = False  # Marcar que ahora está recuperado
@@ -555,9 +556,12 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                 #Paso 2.7.1.1: Enviar FAULT a Central si está conectada usando protocolo
                 if central_socket_ref[0]:
                     try:
-                        send_frame(central_socket_ref[0], f"FAULT#{cp_id}")
-                        # Esperar ACK de Central
-                        ack_response = central_socket_ref[0].recv(1)
+                        # === INICIO DE LA CORRECCIÓN ===
+                        with central_socket_lock: # Proteger el socket
+                            send_frame(central_socket_ref[0], f"FAULT#{cp_id}")
+                            # Esperar ACK de Central
+                            ack_response = central_socket_ref[0].recv(1)
+                        # === FIN DE LA CORRECCIÓN ===
                         if ack_response == ACK:
                             if MONITOR_VERBOSE:
                                 print(f"[Monitor] Central confirmó recepción de FAULT")
@@ -956,8 +960,13 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                     # IMPORTANTE: usamos timeout explícito para no bloquear indefinidamente y evitar
                     # falsos cierres por lecturas vacías intermitentes. Si no llega nada, seguimos.
                     # Si la Central envía un comando PARAR/REANUDAR, lo recibiremos aquí
-                    data_string, is_valid = receive_frame(central_socket, timeout=5)
                     
+                    # === INICIO DE LA CORRECCIÓN ===
+                    # Adquirir el lock ANTES de intentar leer del socket
+                    with central_socket_lock:
+                        # Usar un timeout corto para no bloquear el lock mucho tiempo
+                        data_string, is_valid = receive_frame(central_socket, timeout=1.0) #
+                    # === FIN DE LA CORRECCIÓN ===
                     #Paso 2.4.2.2: Si no se recibieron datos, continuar esperando (posible timeout)
                     if not data_string:
                         # No asumimos cierre por una lectura vacía/timeout aislado; continuamos
