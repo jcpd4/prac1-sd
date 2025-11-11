@@ -12,7 +12,6 @@ import database # Módulo de base de datos (se asume implementado)
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
 KAFKA_TOPIC_STATUS = 'cp_telemetry'      # CP -> Central (Telemetría/Averías/Consumo)
-KAFKA_TOPIC_CENTRAL_ACTIONS = 'central_actions' # Central -> CP (Parar/Reanudar)
 KAFKA_TOPIC_DRIVER_NOTIFY = 'driver_notifications' # Central -> Drivers
 KAFKA_TOPIC_NETWORK_STATUS = 'network_status' # anunciar el estado de la red (11)
 # Diccionario para almacenar la referencia a los sockets de los CPs activos
@@ -35,6 +34,16 @@ pending_cp_commands = {}
 # Ventana de gracia tras RECOVER/REANUDAR para evitar parpadeo a DESCONECTADO
 # { cp_id: timestamp }
 recent_recover_events = {}
+
+# Última vez que se recibió actividad desde el monitor (socket) y desde el engine (telemetría)
+monitor_last_seen = {}  # { cp_id: timestamp }
+engine_last_seen = {}   # { cp_id: timestamp }
+engine_health_status = {}  # { cp_id: 'OK'|'KO' }
+
+# Timeouts para considerar que un monitor o un engine están caídos
+MONITOR_HEARTBEAT_TIMEOUT = 6     # segundos sin mensajes del monitor ⇒ DESCONECTADO
+ENGINE_TELEMETRY_TIMEOUT = 5      # segundos sin telemetría ⇒ AVERIADO
+RECONCILE_INTERVAL = 1.0          # segundos entre comprobaciones del reconciliador
 
 # CPs que ya se han conectado al menos una vez desde que arrancó esta CENTRAL (para diferenciar primera conexión de sesión)
 connected_once_this_session = set()
@@ -441,6 +450,93 @@ def cleanup_disconnected_drivers():
         except Exception as e:
             print(f"[CENTRAL] Error en limpieza de drivers: {e}")
 
+def reconcile_cp_states(central_messages):
+    """
+    Reconciliador periódico que ajusta el estado de los CPs según la actividad reciente
+    del monitor (socket) y del engine (telemetría). El objetivo es garantizar la tabla de
+    verdad especificada en la guía de corrección:
+        Monitor_OK & Engine_OK  -> ACTIVADO (verde)
+        Monitor_OK & Engine_KO  -> AVERIADO (rojo)
+        Monitor_KO  (Engine OK o KO) -> DESCONECTADO (gris)
+    Además respeta estados manuales críticos como FUERA_DE_SERVICIO o sesiones en curso.
+    """
+    while True:
+        try:
+            now = time.time()
+            cps = database.get_all_cps()
+
+            for cp in cps:
+                cp_id = cp.get('id')
+                if not cp_id:
+                    continue
+
+                current_status = cp.get('status') or 'DESCONECTADO'
+                driver_attached = cp.get('driver_id')
+
+                # Determinar si el monitor sigue vivo (socket activo y latido reciente)
+                with active_cp_lock:
+                    monitor_connected = cp_id in active_cp_sockets
+                last_monitor = monitor_last_seen.get(cp_id)
+                monitor_alive = False
+                if monitor_connected:
+                    if last_monitor is None:
+                        monitor_alive = True
+                    else:
+                        monitor_alive = (now - last_monitor) <= MONITOR_HEARTBEAT_TIMEOUT
+
+                # Determinar si el engine sigue vivo (telemetría reciente)
+                last_engine = engine_last_seen.get(cp_id)
+                engine_state_flag = engine_health_status.get(cp_id)
+                engine_alive = True
+                if engine_state_flag == 'KO':
+                    engine_alive = False
+                elif driver_attached or current_status == 'SUMINISTRANDO':
+                    # Durante suministro/driver asignado esperamos telemetría frecuente
+                    if last_engine is None or (now - last_engine) > ENGINE_TELEMETRY_TIMEOUT:
+                        engine_alive = False
+
+                target_status = None
+
+                # 1) Si el monitor ha caído, el estado debe ser DESCONECTADO
+                if not monitor_alive:
+                    if current_status != 'DESCONECTADO':
+                        target_status = 'DESCONECTADO'
+
+                else:
+                    # 2) Monitor OK. Respetar estados manuales (Fuera de servicio) hasta nueva orden
+                    if current_status == 'FUERA_DE_SERVICIO':
+                        target_status = None
+                    # Durante suministro, solo degradar si detectamos engine KO
+                    elif current_status == 'SUMINISTRANDO':
+                        if not engine_alive:
+                            target_status = 'AVERIADO'
+                    # Estado reservado: mantener mientras haya driver asignado
+                    elif current_status == 'RESERVADO':
+                        if not engine_alive:
+                            target_status = 'AVERIADO'
+                    else:
+                        # Situaciones normales: decidir entre ACTIVADO y AVERIADO
+                        if not engine_alive:
+                            if current_status != 'AVERIADO':
+                                target_status = 'AVERIADO'
+                        else:
+                            if current_status in ['DESCONECTADO', 'AVERIADO']:
+                                # Si no hay driver asociado, volvemos a ACTIVADO
+                                if not driver_attached:
+                                    target_status = 'ACTIVADO'
+
+                if target_status and target_status != current_status:
+                    try:
+                        database.update_cp_status(cp_id, target_status)
+                        push_message(central_messages, f"[RECON] CP {cp_id}: {current_status} -> {target_status}")
+                    except Exception as e:
+                        push_message(central_messages, f"[RECON] Error actualizando {cp_id} a {target_status}: {e}")
+
+            time.sleep(RECONCILE_INTERVAL)
+        except Exception as e:
+            push_message(central_messages, f"[RECON] Error reconciliando estados: {e}")
+            time.sleep(RECONCILE_INTERVAL)
+
 # --- Funciones del Panel de Monitorización ---
 def clear_screen():
     """Limpia la pantalla de la terminal."""
@@ -811,6 +907,13 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 msg_type = payload.get('type', '').upper() # Tipo de mensaje (CONSUMO, SESSION_STARTED, SUPPLY_END, etc.)
                 cp_id = payload.get('cp_id') # ID del CP
 
+                if cp_id:
+                    try:
+                        engine_last_seen[cp_id] = time.time()
+                        engine_health_status[cp_id] = 'OK'
+                    except Exception:
+                        pass
+
                 #Paso 2.4.1: Procesar el consumo periódico (ENGINE envía cada segundo)
                 if msg_type == 'CONSUMO':
                     kwh = float(payload.get('kwh', 0)) # Consumo en kWh
@@ -929,6 +1032,11 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 # Paso 2.4.4: Procesar los eventos de avería / pérdida de conexión
                 elif msg_type in ('AVERIADO', 'CONEXION_PERDIDA', 'FAULT'):
                     #Paso 2.4.4.1: Comprobar si hay suministro en curso
+                    try:
+                        engine_health_status[cp_id] = 'KO'
+                        engine_last_seen.pop(cp_id, None)
+                    except Exception:
+                        pass
                     cp_data = database.get_all_cps()
                     cp_info = next((cp for cp in cp_data if cp['id'] == cp_id), None)
                     
@@ -986,6 +1094,11 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
     Procesa los mensajes que llegan desde el CP (Monitor).
     Ahora recibe el string de datos ya parseado del protocolo <STX><DATA><ETX><LRC>.
     """
+    # Registrar actividad reciente del monitor
+    try:
+        monitor_last_seen[cp_id] = time.time()
+    except Exception:
+        pass
     #FASE 1: Verificar que hay datos válidos
     if not data_string:
         print(f"[CENTRAL] ERROR: Mensaje vacío recibido de CP {cp_id}")
@@ -1010,6 +1123,11 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
 
     #FASE 2.1: Reporte de avería desde el Monitor
     if command == 'FAULT':
+        try:
+            engine_health_status[cp_id] = 'KO'
+            engine_last_seen.pop(cp_id, None)
+        except Exception:
+            pass
         
         #Cargar información del CP
         cp_data = database.get_all_cps()
@@ -1069,6 +1187,11 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
     elif command == 'RECOVER':
         # 2.2.1 Actualizar estado a ACTIVADO
         database.update_cp_status(cp_id, 'ACTIVADO')
+        try:
+            engine_health_status[cp_id] = 'OK'
+            engine_last_seen[cp_id] = time.time()
+        except Exception:
+            pass
         # 2.2.2 Marcar evento de recuperación reciente para evitar parpadeo a DESCONECTADO
         try:
             recent_recover_events[cp_id] = time.time()
@@ -1280,6 +1403,11 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
         if len(parts) >= 3 and parts[0] == 'REGISTER':
             cp_id = parts[1]
             location = parts[2]
+            try:
+                monitor_last_seen[cp_id] = time.time()
+                engine_health_status.setdefault(cp_id, 'OK')
+            except Exception:
+                pass
             # Si se envía precio opcional: REGISTER#CP_ID#LOCATION#PRICE
             price = None
             if len(parts) >= 4:
@@ -1366,6 +1494,10 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 
                 #Paso 4.2: Gestionar timeouts vs. cierre real
                 if data_string == "__TIMEOUT__":
+                    try:
+                        monitor_last_seen[cp_id] = time.time()
+                    except Exception:
+                        pass
                     # No hay tráfico, seguimos esperando sin penalizar
                     continue
                 if not data_string:
@@ -1421,26 +1553,22 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             except Exception:
                 within_grace = False
 
-            # No degradar a DESCONECTADO si hay sesión autorizada/cargando o estado ya es RESERVADO/SUMINISTRANDO
-            try:
-                status_now = database.get_cp_status(cp_id)
-            except Exception:
-                status_now = current_status
-            with active_cp_lock:
-                sess = current_sessions.get(cp_id)
-
-            if (sess and sess.get('status') in ('authorized', 'charging')) or status_now in ('RESERVADO', 'SUMINISTRANDO'):
-                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado, se mantiene {status_now} (sesión activa/reserva).")
+            # Política corregida: El estado DESCONECTADO depende exclusivamente del Monitor.
+            # Si el Monitor cae, el CP pasa a DESCONECTADO independientemente del estado previo (incluido AVERIADO/FDS).
+            database.update_cp_status(cp_id, 'DESCONECTADO')
+            if current_status == 'SUMINISTRANDO':
+                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
             else:
-                database.update_cp_status(cp_id, 'DESCONECTADO')
-                if current_status == 'SUMINISTRANDO':
-                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
-                else:
-                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
+                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
 
             with active_cp_lock:
                 if cp_id in active_cp_sockets:
                     del active_cp_sockets[cp_id]
+            try:
+                monitor_last_seen.pop(cp_id, None)
+                engine_health_status.pop(cp_id, None)
+            except Exception:
+                pass
         client_socket.close()
 
 # Funcion Socket para iniciar el servidor de sockets
@@ -1706,6 +1834,11 @@ if __name__ == "__main__":
         cleanup_thread = threading.Thread(target=cleanup_disconnected_drivers)
         cleanup_thread.daemon = True
         cleanup_thread.start()
+
+        # Paso 11 bis: Iniciar reconciliador de estados Monitor/Engine
+        reconcile_thread = threading.Thread(target=reconcile_cp_states, args=(central_messages,))
+        reconcile_thread.daemon = True
+        reconcile_thread.start()
 
         # Paso 11: Panel de Monitorización
         # Bucle infinito que muestra el estado del sistema
