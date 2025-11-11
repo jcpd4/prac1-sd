@@ -71,7 +71,7 @@ def process_central_notifications(kafka_broker, client_id, messages):
                 if payload.get('user_id') != client_id:
                     continue
             #Paso 2.3: Filtrar los mensajes de consumo
-            elif msg_type in ['CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR']:
+            elif msg_type in ['CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR', 'SESSION_CANCELLED']:
                 cp_id_del_mensaje = payload.get('cp_id')
                 with charge_lock:
                     if cp_id_del_mensaje not in active_charge_info:
@@ -103,8 +103,13 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     reason = payload.get('reason', 'Carga interrumpida')
                     kwh_p = payload.get('kwh_partial', 0)
                     imp_p = payload.get('importe_partial', 0)
-                    messages.append(f" [ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {payload['cp_id']}")
+                    messages.append(f" [ERROR SUMINISTRO ENGINE] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {payload['cp_id']}")
                     #Paso 2.4.4.1: Limpiar la recarga activa, ya que se ha interrumpido
+                    if payload['cp_id'] in active_charge_info:
+                        del active_charge_info[payload['cp_id']]
+                elif msg_type == 'SESSION_CANCELLED':
+                    reason = payload.get('reason', 'Sesión interrumpida')
+                    messages.append(f" [CANCELADA] La sesión en CP {payload['cp_id']} se cerró: {reason}.")
                     if payload['cp_id'] in active_charge_info:
                         del active_charge_info[payload['cp_id']]
 

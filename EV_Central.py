@@ -694,10 +694,10 @@ def display_panel(central_messages, driver_requests):
 
                     # Si está suministrando, preparar la línea de suministro
                     if status == 'SUMINISTRANDO':
-                        kwh = cp.get('kwh', 0.0)
-                        importe = cp.get('importe', 0.0)
+                        kwh_value = cp.get('kwh', 0.0) or 0.0
+                        importe_value = cp.get('importe', 0.0) or 0.0
                         driver = cp.get('driver_id', 'N/A')
-                        supply_str = f"{driver} | {kwh:.1f}kWh | {importe:.1f}€"
+                        supply_str = f"{driver} | {kwh_value:.1f}kWh | {importe_value:.1f}€"
                         line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} " # Truncar info de suministro
                     else:
                         line_supply += f"| {' ':<{CELL_WIDTH}} " # Celda vacía para alinear
