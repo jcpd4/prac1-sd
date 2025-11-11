@@ -645,8 +645,6 @@ def get_status_color(status):
     END_COLOR = "\033[0m"
     return f"{colors.get(status, '')}{status}{END_COLOR}"
 
-# En EV_Central.py, REEMPLAZA tu función display_panel por esta:
-
 def display_panel(central_messages, driver_requests):
     """Muestra el estado de todos los CPs en una matriz y los mensajes del sistema."""
     
@@ -657,15 +655,18 @@ def display_panel(central_messages, driver_requests):
     while True:
         clear_screen()
         print("--- PANEL DE MONITORIZACIÓN DE EV CHARGING ---")
-        print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Ancho total de la matriz
         
         # 1. --- Sección Matriz de Puntos de Recarga (CPs) ---
         print(f"--- MATRIZ DE PUNTOS DE RECARGA (CPs) [Columnas={GRID_COLUMNS}] ---")
-        all_cps = database.get_all_cps() #
+        all_cps = database.get_all_cps()
         
         if not all_cps:
             print("No hay Puntos de Recarga registrados.")
+            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Borde inferior
         else:
+            # Imprimir el borde superior de la matriz
+            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS))
+
             # Iterar por los CPs en filas de GRID_COLUMNS
             for i in range(0, len(all_cps), GRID_COLUMNS):
                 row_cps = all_cps[i:i + GRID_COLUMNS]
@@ -684,34 +685,53 @@ def display_panel(central_messages, driver_requests):
                     
                     # Obtener representaciones visuales
                     emoji = get_status_emoji(status)
-                    colored_status = get_status_color(status) #
+                    colored_status = get_status_color(status) # (ej. \033[92mACTIVADO\033[0m)
                     
-                    # Formatear cada línea para la celda
-                    line_ids += f"| {cp_id:<{CELL_WIDTH}} "
-                    line_locations += f"| {location:<{CELL_WIDTH}} "
-                    # Requerimiento: "Color: [emoji] [Estado]"
-                    line_status += f"    | Color: {emoji} {colored_status:<{CELL_WIDTH-9}} " # -9 por "Color: 🟢 "
+                    # --- Lógica de alineación ---
 
-                    # Si está suministrando, preparar la línea de suministro
+                    # Línea de IDs
+                    line_ids += f"| {cp_id:<{CELL_WIDTH}} "
+
+                    # Línea de Ubicaciones
+                    line_locations += f"| {location:<{CELL_WIDTH}} "
+
+                    # Línea de Estado (CORREGIDA PARA CÓDIGOS DE COLOR)
+                    prefix_str = f"Color: {emoji} "
+                    status_visible_len = len(status)
+                    padding_len = CELL_WIDTH - (len(prefix_str) + status_visible_len)
+                    if padding_len < 0:
+                        padding_len = 0
+                    padding = " " * padding_len
+                    line_status += f"| {prefix_str}{colored_status}{padding}"
+                    
+                    # Línea de Suministro
                     if status == 'SUMINISTRANDO':
                         kwh = cp.get('kwh', 0.0)
                         importe = cp.get('importe', 0.0)
                         driver = cp.get('driver_id', 'N/A')
                         supply_str = f"{driver} | {kwh:.1f}kWh | {importe:.1f}€"
-                        line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} " # Truncar info de suministro
+                        line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} "
                     else:
                         line_supply += f"| {' ':<{CELL_WIDTH}} " # Celda vacía para alinear
 
                 # Imprimir las líneas de la fila
-                print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador de fila
                 print(line_ids + "|")
                 print(line_locations + "|")
                 print(line_status + "|")
-                # Solo imprimir la línea de suministro si tiene contenido
-                if line_supply.strip().replace("|", ""):
-                    print(line_supply + "|")
-            
-            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador final de la matriz
+                
+                # CORRECCIÓN: Imprimir siempre la línea de suministro (incluso vacía)
+                print(line_supply + "|")
+                
+                # --- CORRECCIÓN: Lógica del borde inferior ---
+                is_last_row = (i + GRID_COLUMNS) >= len(all_cps)
+                
+                if is_last_row:
+                    # Para la última fila, calcular borde basado en celdas *en esta fila*
+                    num_cells_in_row = len(row_cps)
+                    print("=" * ((CELL_WIDTH + 3) * num_cells_in_row))
+                else:
+                    # Para una fila completa, imprimir un borde de ancho completo
+                    print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS))
         
         # --- Resto del panel (Drivers, Peticiones, Mensajes) ---
         # (Esta parte es la misma que ya tenías)
@@ -783,11 +803,9 @@ def display_panel(central_messages, driver_requests):
                 print("  No hay mensajes del protocolo.")
         
         print("="*80)
-        print("Comandos: [P]arar <CP_ID> | [R]eanudar <CP_ID> | [PT] Parar todos | [RT] Reanudar todos | [Q]uit")
+        print("Comandos: [P]arar <CP_ID> | [R]eanudar <CP_ID> | [PT] Parar todos | [RT] Reanuduar todos | [Q]uit")
         print(f"Última actualización: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         time.sleep(2) # El panel se refresca cada 2 segundos
-
-
 # --- Funciones de Kafka ---
 
 # Funcion de Kafka para enviar el estado de la red a todos los drivers
