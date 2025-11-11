@@ -94,6 +94,7 @@ def display_monitor_panel(cp_id):
 # Constantes de configuracion (ajustalas segun tu necesidad de prueba)
 HEARTBEAT_INTERVAL_TO_CENTRAL = 15 # Cada 15s, informamos a la Central (No usado aun)
 HEARTBEAT_INTERVAL_TO_ENGINE = 1  # Cada 1s, comprobamos el Engine
+ENGINE_COMMAND_GRACE_WINDOW = 3   # Segundos de gracia tras enviar comando al Engine
 PANEL_UPDATE_INTERVAL = 2  # Cada 2s, actualizamos el panel visual
 
 # --- Variables globales para UI del Monitor ---
@@ -108,6 +109,13 @@ monitor_state = {
 
 # Lock para proteger envíos/lecturas por el socket compartido con la Central
 central_socket_lock = threading.Lock()
+last_engine_command_ts = [0.0]
+
+def recently_sent_engine_command():
+    try:
+        return (time.time() - last_engine_command_ts[0]) <= ENGINE_COMMAND_GRACE_WINDOW
+    except Exception:
+        return False
 
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
@@ -439,14 +447,25 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
           
             #Paso 2.4: Realizar handshake inicial (ENQ/ACK) con Engine (modo silencioso para health checks)
             if not handshake_client(engine_socket, silent=True):
+                engine_socket.close()
+                if recently_sent_engine_command():
+                    time.sleep(0.3)
+                    continue
                 if MONITOR_VERBOSE:
                     print(f"[Monitor] ERROR: Handshake fallido con Engine. Reintentando...")
                 engine_failed = True
                 continue
             
             #Paso 2.5: Enviar mensaje de comprobacion de salud al Engine usando protocolo (modo silencioso)
-            health_message = f"HEALTH_CHECK#{cp_id}"
+            health_suffix = ""
+            if recently_sent_engine_command():
+                health_suffix = "#AFTER_CMD"
+            health_message = f"HEALTH_CHECK#{cp_id}{health_suffix}"
             if not send_frame(engine_socket, health_message, silent=True):
+                engine_socket.close()
+                if recently_sent_engine_command():
+                    time.sleep(0.3)
+                    continue
                 if MONITOR_VERBOSE:
                     print(f"[Monitor] ERROR: No se pudo enviar HEALTH_CHECK al Engine")
                 engine_failed = True
@@ -455,6 +474,10 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
             #Paso 2.6: Esperar ACK del Engine (sin imprimir)
             ack_response = engine_socket.recv(1)
             if ack_response != ACK:
+                engine_socket.close()
+                if recently_sent_engine_command():
+                    time.sleep(0.3)
+                    continue
                 if MONITOR_VERBOSE:
                     print(f"[Monitor] ERROR: Engine no confirmó recepción de HEALTH_CHECK")
                 engine_failed = True
@@ -465,6 +488,10 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
             
             #Paso 2.8: Verificar validez de la respuesta
             if not is_valid or not response_string:
+                engine_socket.close()
+                if recently_sent_engine_command():
+                    time.sleep(0.3)
+                    continue
                 if MONITOR_VERBOSE:
                     print(f"[Monitor] ERROR: Respuesta inválida del Engine")
                 engine_failed = True
@@ -549,6 +576,10 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
             
             push_health_message("ERROR: Engine inalcanzable")
             
+            if recently_sent_engine_command():
+                time.sleep(0.3)
+                continue
+
             if not engine_failed:
                 print(f"[Monitor] Engine inalcanzable → Enviando FAULT#{cp_id}")
                 push_protocol_message(f"Enviando FAULT#{cp_id} a Central (Engine inalcanzable)")
@@ -569,6 +600,9 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
             
         #Paso 2.8: Capturar cualquier otro error inesperado que no sea de red    
         except Exception as e:
+            if recently_sent_engine_command():
+                time.sleep(0.3)
+                continue
             print(f"Error inesperado en la monitorizacion del Engine: {e}")
             
         finally:
@@ -587,6 +621,10 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
 def send_command_to_engine(engine_host, engine_port, command, central_socket):
     """Envía el comando PARAR o REANUDAR al Engine local usando protocolo y responde con ACK/NACK a la Central."""
     try:
+        try:
+            last_engine_command_ts[0] = time.time()
+        except Exception:
+            pass
         #Paso 1: Crear conexión con el Engine
         engine_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         #Paso 1.1: Conectar al Engine
@@ -957,21 +995,25 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                     # falsos cierres por lecturas vacías intermitentes. Si no llega nada, seguimos.
                     # Si la Central envía un comando PARAR/REANUDAR, lo recibiremos aquí
                     data_string, is_valid = receive_frame(central_socket, timeout=5)
-                    
-                    #Paso 2.4.2.2: Si no se recibieron datos, continuar esperando (posible timeout)
+
+                    #Paso 2.4.2.2: Gestionar timeouts explícitos sin afectar la conexión
+                    if data_string == "__TIMEOUT__":
+                        empty_reads = 0
+                        continue
+
+                    #Paso 2.4.2.3: Si no se recibieron datos, continuar esperando (posible cierre remoto transitorio)
                     if not data_string:
                         # No asumimos cierre por una lectura vacía/timeout aislado; continuamos
                         empty_reads = 0
                         continue
                     
-                    #Paso 2.4.2.3: Verificar validez de la trama
+                    #Paso 2.4.2.4: Verificar validez de la trama
                     if not is_valid:
                         if MONITOR_VERBOSE:
-                            print("[Monitor] Trama inválida recibida de Central. Enviando NACK...")
-                        send_nack(central_socket)
-                        continue  # Continuar esperando siguiente mensaje
+                            print("[Monitor] Trama inválida recibida de Central. Ignorando y esperando siguiente trama...")
+                        continue  # Evitar enviar NACK crudo para no cerrar la conexión
                     
-                    #Paso 2.4.2.4: Enviar ACK confirmando recepción válida
+                    #Paso 2.4.2.5: Enviar ACK confirmando recepción válida
                     send_ack(central_socket)
                     empty_reads = 0
                     
