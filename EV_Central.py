@@ -45,6 +45,9 @@ MONITOR_HEARTBEAT_TIMEOUT = 6     # segundos sin mensajes del monitor ⇒ DESCON
 ENGINE_TELEMETRY_TIMEOUT = 5      # segundos sin telemetría ⇒ AVERIADO
 RECONCILE_INTERVAL = 1.0          # segundos entre comprobaciones del reconciliador
 
+# Desconexiones pendientes (gracia antes de marcar DESCONECTADO definitivo)
+pending_monitor_disconnects = {}  # { cp_id: timestamp }
+
 # CPs que ya se han conectado al menos una vez desde que arrancó esta CENTRAL (para diferenciar primera conexión de sesión)
 connected_once_this_session = set()
 
@@ -61,6 +64,56 @@ def push_message(msg_list, msg, maxlen=200):
     if len(msg_list) > maxlen:
         # eliminar los más antiguos
         del msg_list[0:len(msg_list)-maxlen]
+
+def force_release_cp_session(cp_id, central_messages=None, reason="", target_status=None, notify_driver=True, clear_metrics=True):
+    """
+    Libera de forma explícita cualquier sesión y telemetría asociada a un CP.
+    Se utiliza cuando un CP pierde su monitor/engine o cuando se fuerza un cambio de estado
+    (avería, fuera de servicio, desconexión, recuperación) para que el driver tenga que volver a solicitar servicio.
+    """
+    driver_id = None
+    session_status = None
+
+    with active_cp_lock:
+        session = current_sessions.pop(cp_id, None)
+        if session:
+            driver_id = session.get('driver_id')
+            session_status = session.get('status')
+        assigned_driver = cp_driver_assignments.pop(cp_id, None)
+        if assigned_driver and not driver_id:
+            driver_id = assigned_driver
+
+    if driver_id and central_messages is not None:
+        push_message(central_messages, f"[RELEASE] CP {cp_id}: sesión con driver {driver_id} finalizada ({reason or 'liberación forzada'}).")
+        if notify_driver and shared_producer_ref:
+            cancel_msg = {
+                "type": "SESSION_CANCELLED",
+                "cp_id": cp_id,
+                "user_id": driver_id,
+                "reason": reason or "Sesión interrumpida",
+                "previous_status": session_status
+            }
+            try:
+                send_notification_to_driver(shared_producer_ref, driver_id, cancel_msg)
+            except Exception as e:
+                if central_messages is not None:
+                    push_message(central_messages, f"[RELEASE] Error notificando cancelación a driver {driver_id}: {e}")
+
+    if clear_metrics:
+        try:
+            database.clear_cp_telemetry_only(cp_id)
+        except Exception as e:
+            if central_messages is not None:
+                push_message(central_messages, f"[RELEASE] Error limpiando telemetría de {cp_id}: {e}")
+
+    if target_status:
+        try:
+            database.update_cp_status(cp_id, target_status)
+        except Exception as e:
+            if central_messages is not None:
+                push_message(central_messages, f"[RELEASE] Error actualizando estado de {cp_id} a {target_status}: {e}")
+    if target_status != 'DESCONECTADO':
+        pending_monitor_disconnects.pop(cp_id, None)
 
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
@@ -258,9 +311,23 @@ def receive_frame(socket_ref, central_messages=None, timeout=None):
             # Conexión realmente cerrada
             return None, False
         
-        #Paso 4: Parsear la trama recibida
+        #Paso 4: Detectar ACK/NACK/EOT de un solo byte antes de parsear
+        if frame_bytes == ACK:
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] ACK recibido")
+            return "__ACK__", True
+        if frame_bytes == NACK:
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] NACK recibido")
+            return "__NACK__", True
+        if frame_bytes == EOT:
+            if central_messages is not None:
+                push_message(central_messages, "[PROTOCOLO] EOT recibido")
+            return "EOT", True
+
+        #Paso 5: Parsear la trama recibida
         data, is_valid = parse_frame(frame_bytes)
-        #Paso 5: Si hay lista de mensajes, agregar el mensaje
+        #Paso 6: Si hay lista de mensajes, agregar el mensaje
         if central_messages is not None and data is not None:
             push_message(central_messages, f"[PROTOCOLO] Recibido: {data} (Válido: {is_valid})")
         
@@ -440,8 +507,7 @@ def cleanup_disconnected_drivers():
                     # Liberar asignaciones de CPs si el driver estaba asignado
                     for cp_id, assigned_driver in list(cp_driver_assignments.items()):
                         if assigned_driver == driver_id:
-                            del cp_driver_assignments[cp_id]
-                            database.update_cp_status(cp_id, 'ACTIVADO')
+                            force_release_cp_session(cp_id, None, reason="Driver inactivo", target_status='ACTIVADO', notify_driver=False)
                             print(f"[CENTRAL] Driver {driver_id} desconectado. CP {cp_id} liberado.")
                 
                 if drivers_to_remove:
@@ -472,6 +538,16 @@ def reconcile_cp_states(central_messages):
 
                 current_status = cp.get('status') or 'DESCONECTADO'
                 driver_attached = cp.get('driver_id')
+                authorized_grace = None
+
+                with active_cp_lock:
+                    sess = current_sessions.get(cp_id)
+                    if sess and not driver_attached:
+                        driver_attached = sess.get('driver_id')
+                    if sess:
+                        authorized_grace = sess.get('authorized_since')
+                    session_exists = cp_id in current_sessions and sess is not None
+                pending_disconnect_at = pending_monitor_disconnects.get(cp_id)
 
                 # Determinar si el monitor sigue vivo (socket activo y latido reciente)
                 with active_cp_lock:
@@ -490,17 +566,28 @@ def reconcile_cp_states(central_messages):
                 engine_alive = True
                 if engine_state_flag == 'KO':
                     engine_alive = False
-                elif driver_attached or current_status == 'SUMINISTRANDO':
-                    # Durante suministro/driver asignado esperamos telemetría frecuente
-                    if last_engine is None or (now - last_engine) > ENGINE_TELEMETRY_TIMEOUT:
-                        engine_alive = False
+                elif session_exists or current_status in ['RESERVADO', 'SUMINISTRANDO']:
+                    grace_ok = False
+                    if authorized_grace is not None and (now - authorized_grace) <= (ENGINE_TELEMETRY_TIMEOUT * 2):
+                        grace_ok = True
+                    if last_engine is not None and (now - last_engine) <= ENGINE_TELEMETRY_TIMEOUT:
+                        grace_ok = True
+                    engine_alive = grace_ok
+                else:
+                    engine_alive = True
 
                 target_status = None
 
-                # 1) Si el monitor ha caído, el estado debe ser DESCONECTADO
+                # 1) Si el monitor ha caído, el estado debe ser DESCONECTADO (tras gracia)
                 if not monitor_alive:
                     if current_status != 'DESCONECTADO':
-                        target_status = 'DESCONECTADO'
+                        in_session = session_exists or current_status in ['RESERVADO', 'SUMINISTRANDO']
+                        if in_session and engine_alive:
+                            target_status = None  # mantener estado durante la carga si engine sigue informando
+                        elif pending_disconnect_at and (now - pending_disconnect_at) <= MONITOR_HEARTBEAT_TIMEOUT:
+                            target_status = None  # aún en gracia
+                        else:
+                            target_status = 'DESCONECTADO'
 
                 else:
                     # 2) Monitor OK. Respetar estados manuales (Fuera de servicio) hasta nueva orden
@@ -512,7 +599,7 @@ def reconcile_cp_states(central_messages):
                             target_status = 'AVERIADO'
                     # Estado reservado: mantener mientras haya driver asignado
                     elif current_status == 'RESERVADO':
-                        if not engine_alive:
+                        if not engine_alive and not session_exists:
                             target_status = 'AVERIADO'
                     else:
                         # Situaciones normales: decidir entre ACTIVADO y AVERIADO
@@ -531,6 +618,8 @@ def reconcile_cp_states(central_messages):
                         push_message(central_messages, f"[RECON] CP {cp_id}: {current_status} -> {target_status}")
                     except Exception as e:
                         push_message(central_messages, f"[RECON] Error actualizando {cp_id} a {target_status}: {e}")
+                if monitor_alive:
+                    pending_monitor_disconnects.pop(cp_id, None)
 
             time.sleep(RECONCILE_INTERVAL)
         except Exception as e:
@@ -797,23 +886,19 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 if action == 'DRIVER_QUIT':
                     with active_cp_lock:
                         connected_drivers.discard(user_id)
-                        # Liberar cualquier CP reservado por este driver
-                        to_release = []
+                    # Liberar cualquier sesión asociada al driver
+                    release_targets = []
+                    with active_cp_lock:
                         for cp_k, sess in list(current_sessions.items()):
-                            if sess.get('driver_id') == user_id and sess.get('status') == 'authorized':
-                                to_release.append(cp_k)
-                        for cp_k in to_release:
-                            del current_sessions[cp_k]
-                            try:
-                                if database.get_cp_status(cp_k) == 'RESERVADO':
-                                    database.update_cp_status(cp_k, 'ACTIVADO')
-                                    push_message(central_messages, f"RESERVA liberada: CP {cp_k} vuelve a ACTIVADO (driver {user_id} salió)")
-                            except Exception:
-                                pass
+                            if sess.get('driver_id') == user_id:
+                                release_targets.append(cp_k)
+                    for cp_k in release_targets:
+                        force_release_cp_session(cp_k, central_messages,
+                                                 reason="Driver desconectado",
+                                                 target_status='ACTIVADO',
+                                                 notify_driver=False)
                     # eliminar cualquier petición pendiente del driver
-                    for i, req in list(enumerate(driver_requests)):
-                        if req.get('user_id') == user_id:
-                            del driver_requests[i]
+                    driver_requests[:] = [req for req in driver_requests if req.get('user_id') != user_id]
                     continue
 
                 #Paso 2.1.1: Registrar/actualizar que el driver está conectado
@@ -860,7 +945,12 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     #Paso 2.3.2: Registrar driver como conectado y abrir sesión en el CP
                     with active_cp_lock:
                         connected_drivers.add(user_id)
-                        current_sessions[cp_id] = { 'driver_id': user_id, 'status': 'authorized' }
+                        current_sessions[cp_id] = { 'driver_id': user_id, 'status': 'authorized', 'authorized_since': time.time() }
+                    try:
+                        engine_last_seen[cp_id] = time.time()
+                        engine_health_status[cp_id] = 'OK'
+                    except Exception:
+                        pass
                     
                     #Paso 2.3.3: Enviar comando de autorización al Monitor del CP vía SOCKET usando protocolo
                     if cp_id in active_cp_sockets:
@@ -932,8 +1022,10 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     # Paso 2.4.1.3: Actualizar estado de sesión a 'charging' si coincide driver
                     with active_cp_lock:
                         sess = current_sessions.get(cp_id)
-                        if sess and sess.get('driver_id') == driver_id and sess.get('status') != 'charging':
+                        if sess and sess.get('driver_id') == driver_id:
                             current_sessions[cp_id]['status'] = 'charging'
+                            current_sessions[cp_id]['authorized_since'] = time.time()
+                    pending_monitor_disconnects.pop(cp_id, None)
 
                     # Paso 2.4.1.4: Reenviar una notificación de consumo al driver a través de su topic
                     try:
@@ -1077,9 +1169,7 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     
                     #Paso 2.4.4.4: Actualizar estado a AVERIADO y cerrar sesión si existiese
                     database.update_cp_status(cp_id, 'AVERIADO')
-                    with active_cp_lock:
-                        if cp_id in current_sessions:
-                            del current_sessions[cp_id]
+                    force_release_cp_session(cp_id, central_messages, reason="Engine reporta avería", target_status='AVERIADO')
 
         except Exception as e:
             central_messages.append(f"Error al procesar mensaje de Kafka: {e}")
@@ -1178,15 +1268,16 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
             msg = f" AVERÍA en CP {cp_id} - Estado actualizado a ROJO"
             central_messages.append(msg)
         
-        # Actualizar estado a AVERIADO
+        # Actualizar estado a AVERIADO y liberar sesión
         database.update_cp_status(cp_id, 'AVERIADO')
+        force_release_cp_session(cp_id, central_messages, reason="Monitor reporta avería", target_status='AVERIADO')
 
 
 
     #FASE 2.2: Recuperación de avería desde el Monitor
     elif command == 'RECOVER':
-        # 2.2.1 Actualizar estado a ACTIVADO
-        database.update_cp_status(cp_id, 'ACTIVADO')
+        # 2.2.1: Al recuperar, liberar cualquier sesión y dejar el CP en ACTIVADO limpio
+        force_release_cp_session(cp_id, central_messages, reason="Monitor recuperado", target_status='ACTIVADO')
         try:
             engine_health_status[cp_id] = 'OK'
             engine_last_seen[cp_id] = time.time()
@@ -1209,6 +1300,7 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                 if CENTRAL_VERBOSE:
                     print(f"[CENTRAL]  CP {cp_id} confirmó REANUDAR. Actualizando a VERDE.")
                 database.update_cp_status(cp_id, 'ACTIVADO')
+                force_release_cp_session(cp_id, central_messages, reason="REANUDAR confirmado", target_status='ACTIVADO', notify_driver=False)
                 central_messages.append(
                     f"CP {cp_id} confirmó REANUDAR. Estado actualizado a VERDE."
                 )
@@ -1227,6 +1319,7 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                 # IMPORTANTE: Actualizar estado ANTES de cualquier otra operación
                 # Esto asegura que el estado esté actualizado incluso si la conexión se cierra después
                 database.update_cp_status(cp_id, 'FUERA_DE_SERVICIO')
+                force_release_cp_session(cp_id, central_messages, reason="PARAR confirmado", target_status='FUERA_DE_SERVICIO')
                 push_message(central_messages, f"CP {cp_id} confirmó PARAR. Estado actualizado a FUERA_DE_SERVICIO (NARANJA - Out of Order).")
                 # Verificar que el estado se actualizó correctamente
                 verify_status = database.get_cp_status(cp_id)
@@ -1404,7 +1497,9 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             cp_id = parts[1]
             location = parts[2]
             try:
-                monitor_last_seen[cp_id] = time.time()
+                now_ts = time.time()
+                monitor_last_seen[cp_id] = now_ts
+                engine_last_seen[cp_id] = now_ts
                 engine_health_status.setdefault(cp_id, 'OK')
             except Exception:
                 pass
@@ -1439,6 +1534,17 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                     if CENTRAL_VERBOSE:
                         print(f"[CENTRAL] CP {cp_id} se reconectó manteniendo estado '{current_status}' (no reseteado a ACTIVADO)")
             
+            if not first_time_in_db and not first_time_this_session:
+                with active_cp_lock:
+                    has_session = cp_id in current_sessions or cp_id in cp_driver_assignments
+                if has_session:
+                    force_release_cp_session(
+                        cp_id,
+                        central_messages,
+                        reason="Reconexión de monitor",
+                        target_status=new_status
+                    )
+
             # Mensajería más clara según si es alta inicial o reconexión
             if first_time_in_db:
                 push_message(central_messages, f"CP '{cp_id}' registrado (primera vez en BD) desde {address}. Estado: {new_status} (price={price})")
@@ -1467,6 +1573,7 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             # Aplicar el estado calculado DESPUÉS de registrar y loguear (para que el panel muestre primero el handshake/REGISTER)
             if new_status != current_status:
                 database.update_cp_status(cp_id, new_status)
+            pending_monitor_disconnects.pop(cp_id, None)
 
             #Fase2.2.3: Guardamos la referencia del socket para envíos síncronos (autorización/órdenes)
             with active_cp_lock:
@@ -1500,6 +1607,16 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                         pass
                     # No hay tráfico, seguimos esperando sin penalizar
                     continue
+                if data_string == "__ACK__":
+                    if 'empty_reads' in locals():
+                        empty_reads = 0
+                    continue
+                if data_string == "__NACK__":
+                    push_message(central_messages, f"[PROTOCOLO] NACK recibido desde {cp_id}")
+                    if 'empty_reads' in locals():
+                        empty_reads = 0
+                    continue
+                
                 if not data_string:
                     if 'empty_reads' not in locals():
                         empty_reads = 0
@@ -1553,13 +1670,36 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             except Exception:
                 within_grace = False
 
-            # Política corregida: El estado DESCONECTADO depende exclusivamente del Monitor.
-            # Si el Monitor cae, el CP pasa a DESCONECTADO independientemente del estado previo (incluido AVERIADO/FDS).
-            database.update_cp_status(cp_id, 'DESCONECTADO')
-            if current_status == 'SUMINISTRANDO':
-                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
+            # Política: aplicar gracia antes de degradar si hay sesión o se autorizó recientemente
+            session_active = False
+            authorized_since = None
+            with active_cp_lock:
+                sess = current_sessions.get(cp_id)
+                if sess:
+                    session_active = True
+                    authorized_since = sess.get('authorized_since')
+            if session_active:
+                try:
+                    force_release_cp_session(
+                        cp_id,
+                        central_messages,
+                        reason="Monitor desconectado",
+                        target_status=None
+                    )
+                except Exception:
+                    pass
+                session_active = False
+                session_exists = False
+                driver_attached = None
+            if session_active or current_status in ['RESERVADO', 'SUMINISTRANDO']:
+                pending_monitor_disconnects[cp_id] = time.time()
+                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado (gracia antes de marcar DESCONECTADO).")
             else:
-                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
+                database.update_cp_status(cp_id, 'DESCONECTADO')
+                if current_status == 'SUMINISTRANDO':
+                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
+                else:
+                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
 
             with active_cp_lock:
                 if cp_id in active_cp_sockets:
