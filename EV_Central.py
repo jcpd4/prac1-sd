@@ -879,11 +879,19 @@ def broadcast_network_status(kafka_broker, producer):
 # Funcion de Kafka para enviar notificaciones a los drivers
 def send_notification_to_driver(producer, driver_id, notification):
     """Envía una notificación solo al driver específico si está conectado."""
+    # OBTENER EL TIPO DE MENSAJE
+    msg_type = notification.get('type')
+
     #Paso 1: Verificar si el driver está conectado
     with active_cp_lock:
-        if driver_id not in connected_drivers:
-            print(f"[CENTRAL] Driver {driver_id} no está conectado. No se envía notificación: {notification['type']}")
-            return False
+        # CORRECCIÓN: Si el mensaje es un TICKET o un ERROR,
+        # debemos enviarlo SIEMPRE, aunque el driver esté desconectado.
+        # Kafka se encargará de guardarlo.
+        if msg_type not in ['TICKET', 'SUPPLY_ERROR', 'SESSION_CANCELLED']:
+            if driver_id not in connected_drivers:
+                print(f"[CENTRAL] Driver {driver_id} no está conectado. No se envía notificación: {notification['type']}")
+                return False
+
     #Paso 2: Enviar la notificación al driver
     try:
         #Paso 2.1: Añadir el driver_id al mensaje para que el driver pueda filtrarlo

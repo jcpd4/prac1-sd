@@ -72,12 +72,22 @@ def process_central_notifications(kafka_broker, client_id, messages):
                 target_user = payload.get('user_id') or payload.get('driver_id')
                 if target_user and target_user != client_id:
                     continue
-            #Paso 2.3: Filtrar los mensajes de consumo y tickets
-            if msg_type in ['CONSUMO_UPDATE', 'TICKET']:
+            #Paso 2.3: Filtrar SÓLO los mensajes de consumo
+            if msg_type == 'CONSUMO_UPDATE':
+                # INICIO DE LA INDENTACIÓN (4 espacios)
                 cp_id_del_mensaje = payload.get('cp_id')
                 with charge_lock:
+                    # Si no hay carga activa, ignorar el consumo
                     if cp_id_del_mensaje not in active_charge_info:
                         continue
+                # FIN DE LA INDENTACIÓN
+            
+            elif msg_type in ['TICKET', 'SUPPLY_ERROR']:
+                # INICIO DE LA INDENTACIÓN (4 espacios)
+                # NO FILTRAR: Los tickets y errores siempre deben procesarse
+                # para que el driver se entere de lo que pasó mientras estaba desconectado.
+                pass 
+                # FIN DE LA INDENTACIÓN
             
             #Paso 2.4: Procesar los mensajes de autorización, consumo, ticket y supply error
             with charge_lock:
