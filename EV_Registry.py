@@ -80,6 +80,7 @@ def unregister_cp():
 
 # --- Arranque del Servidor ---
 if __name__ == '__main__':
-    print(f"--- EV_Registry (API REST) iniciado en puerto {REGISTRY_PORT} ---")
-    # debug=True permite que veas errores detallados si falla algo
-    app.run(host='0.0.0.0', port=REGISTRY_PORT, debug=True)
+    print(f"--- EV_Registry (API REST SEGURO) iniciado en puerto {REGISTRY_PORT} ---")
+    # AÑADIMOS: ssl_context='adhoc'
+    # Esto habilita HTTPS usando un certificado generado en memoria
+    app.run(host='0.0.0.0', port=REGISTRY_PORT, debug=True, ssl_context='adhoc')
