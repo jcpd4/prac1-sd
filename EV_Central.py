@@ -8,6 +8,8 @@ import os
 from kafka import KafkaConsumer, KafkaProducer
 import json
 import database # Módulo de base de datos (se asume implementado)
+#segunda entrega:
+import EV_Central_API # codigo mio(juanky) donde hago la parte de api_central
 
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
@@ -2068,6 +2070,28 @@ if __name__ == "__main__":
         server_thread = threading.Thread(target=start_socket_server, args=(HOST, SOCKET_PORT, central_messages, KAFKA_BROKER))
         server_thread.daemon = True
         server_thread.start()
+
+        # --- NUEVO RELEASE 2: API REST ---
+        # Paso 8.5: Iniciar API REST de Central (Módulo separado)
+        API_PORT = 5000 # Puerto estándar para Flask
+        
+        # 1. INYECCIÓN DE DEPENDENCIAS
+        # Pasamos nuestras variables locales al módulo API para que pueda usarlas
+        EV_Central_API.configure_api(
+            messages_list=central_messages,    # Para escribir logs
+            drivers_set=connected_drivers,     # Para leer drivers conectados
+            sockets_dict=active_cp_sockets,    # Para saber qué CPs tienen socket
+            command_func=send_cp_command       # Para poder enviar órdenes (PARAR/REANUDAR)
+        )
+        
+        # 2. Arrancar el servidor Flask en un hilo separado
+        api_thread = threading.Thread(
+            target=EV_Central_API.start_api_server, 
+            args=(HOST, API_PORT)
+        )
+        api_thread.daemon = True
+        api_thread.start()
+        # ---------------------------------
         
         # Paso 9: Iniciar el hilo de entrada de comandos del usuario
         # Lee comandos: P <CP_ID>, R <CP_ID>, PT (parar todos), RT (reanudar todos), Q (quit)
