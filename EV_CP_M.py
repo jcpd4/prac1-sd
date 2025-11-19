@@ -5,6 +5,10 @@ import threading # para poder ejecutar en paralelo
 import database
 from datetime import datetime
 import os
+import requests # Para hacer peticiones HTTPS
+import urllib3 # Para silenciar las alertas de certificado autofirmado
+# Desactivar advertencias de certificado inseguro (porque usamos adhoc)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Control de verbosidad del Monitor (reduce prints en consola)
 MONITOR_VERBOSE = False
@@ -25,6 +29,44 @@ def push_protocol_message(msg):
         monitor_state['protocol_messages'].append(f"{datetime.now().strftime('%H:%M:%S')} - {msg}")
         if len(monitor_state['protocol_messages']) > 5:
             monitor_state['protocol_messages'].pop(0)
+
+# --- Función de Registro HTTPS (Release 2) ---
+def register_in_registry_https(cp_id, location):
+    """
+    Se conecta al EV_Registry vía HTTPS para obtener el token de seguridad.
+    Retorna el token si tiene éxito, o None si falla.
+    """
+    # URL del Registry (Asumimos que está en el puerto 6000 de la IP local o configurada)
+    # En un despliegue real, esta IP debería ser un argumento o config.
+    registry_url = "https://127.0.0.1:6000/register"
+    
+    payload = {
+        "id": cp_id,
+        "location": location
+    }
+    
+    print(f"\n[Monitor] Iniciando registro seguro en {registry_url}...")
+    
+    try:
+        # Enviamos POST seguro. verify=False es necesario para certificados autofirmados
+        response = requests.post(registry_url, json=payload, verify=False, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            token = data.get('token')
+            print(f"[Monitor] ¡REGISTRO EXITOSO! Token recibido: {token}")
+            return token
+        else:
+            print(f"[Monitor] Error en registro: {response.status_code} - {response.text}")
+            return None
+            
+    except requests.exceptions.ConnectionError:
+        print(f"[Monitor] ERROR: No se puede conectar al Registry en {registry_url}.")
+        print("[Monitor] Asegúrate de que EV_Registry.py esté ejecutándose.")
+        return None
+    except Exception as e:
+        print(f"[Monitor] Error inesperado en registro: {e}")
+        return None
 
 
 def display_monitor_panel(cp_id):
@@ -1135,6 +1177,16 @@ if __name__ == "__main__":
     #Paso 3: Configurar ubicación del CP
     locations = {"MAD-01": "C/ Serrano 10", "VAL-03": "Plaza del Ayuntamiento 1", "BCN-05": "Las Ramblas 55"}
     LOCATION = locations.get(CP_ID, "Ubicacion Desconocida")
+
+    # --- NUEVO BLOQUE RELEASE 2: REGISTRO ---
+    # Intentamos obtener el token antes de lanzar los hilos
+    TOKEN_SEGURIDAD = register_in_registry_https(CP_ID, LOCATION)
+    
+    if TOKEN_SEGURIDAD:
+        print("[Monitor] Sistema autenticado. Iniciando conexión con Central...")
+    else:
+        print("[Monitor] ADVERTENCIA: No se obtuvo token. El sistema funcionará en modo Release 1 (inseguro).")
+    # ----------------------------------------
 
     #Paso 4: Iniciar conexión con la Central en hilo separado
     central_thread = threading.Thread(target=start_central_connection, args=(CENTRAL_IP, CENTRAL_PORT, CP_ID, LOCATION, ENGINE_IP, ENGINE_PORT), daemon=True)
