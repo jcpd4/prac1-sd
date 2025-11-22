@@ -43,7 +43,7 @@ engine_last_seen = {}   # { cp_id: timestamp }
 engine_health_status = {}  # { cp_id: 'OK'|'KO' }
 
 # Timeouts para considerar que un monitor o un engine están caídos
-MONITOR_HEARTBEAT_TIMEOUT = 2.5   # segundos sin mensajes del monitor ⇒ DESCONECTADO
+MONITOR_HEARTBEAT_TIMEOUT = 7   # segundos sin mensajes del monitor ⇒ DESCONECTADO
 ENGINE_TELEMETRY_TIMEOUT = 5      # segundos sin telemetría ⇒ AVERIADO
 RECONCILE_INTERVAL = 1.0          # segundos entre comprobaciones del reconciliador
 

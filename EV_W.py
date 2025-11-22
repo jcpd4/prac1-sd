@@ -21,7 +21,7 @@ CIUDADES_CPS = {
 }
 
 # Umbral de temperatura (Release 2 dice 0ºC, pero puedes subirlo a 20ºC para probar que funciona ya)
-TEMP_UMBRAL = 30.0 
+TEMP_UMBRAL = 0.0 
 
 def obtener_clima(ciudad):
     """Consulta la API de OpenWeather."""
