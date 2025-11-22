@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EVCharging - Panel de Control Web</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; padding: 20px; }
+        h1 { color: #333; text-align: center; }
+        
+        /* Estilos del Dashboard */
+        .dashboard { display: flex; gap: 20px; justify-content: center; flex-wrap: wrap; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); min-width: 300px; }
+        
+        /* Tabla CPs */
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { border-bottom: 1px solid #ddd; padding: 12px; text-align: left; }
+        th { background-color: #007bff; color: white; }
+        
+        /* Colores de Estado */
+        .status-badge { padding: 5px 10px; border-radius: 15px; font-weight: bold; color: white; font-size: 0.9em; }
+        .bg-activado { background-color: #28a745; } /* Verde */
+        .bg-suministrando { background-color: #007bff; } /* Azul */
+        .bg-averiado { background-color: #dc3545; } /* Rojo */
+        .bg-fuera { background-color: #fd7e14; } /* Naranja */
+        .bg-desconectado { background-color: #6c757d; } /* Gris */
+        .bg-reservado { background-color: #17a2b8; } /* Cyan */
+
+        /* Drivers */
+        .driver-item { padding: 10px; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; }
+        .driver-icon { margin-right: 10px; }
+    </style>
+</head>
+<body>
+
+    <h1>⚡ EVCharging Network Control Center</h1>
+    
+    <div class="dashboard">
+        <div class="card" style="flex: 2;">
+            <h2>Puntos de Recarga (CPs)</h2>
+            <table id="cp-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Ubicación</th>
+                        <th>Estado</th>
+                        <th>Consumo</th>
+                        <th>Driver</th>
+                    </tr>
+                </thead>
+                <tbody id="cp-body">
+                    <tr><td colspan="5">Cargando datos...</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card" style="flex: 1;">
+            <h2>Drivers Conectados</h2>
+            <div id="drivers-list">
+                <p>Esperando datos...</p>
+            </div>
+        </div>
+    </div>
+
+    <p style="text-align: center; color: #666; margin-top: 20px;">
+        API Status: <span id="api-status">Conectando...</span>
+    </p>
+
+    <script>
+        // URL de tu API Central (Ajustar si usas otra IP)
+        const API_URL = 'http://127.0.0.1:5000/api/estado';
+
+        async function fetchData() {
+            try {
+                const response = await fetch(API_URL);
+                if (!response.ok) throw new Error("Error en red");
+                const data = await response.json();
+                
+                updateCPs(data.cps);
+                updateDrivers(data.drivers_connected);
+                
+                document.getElementById('api-status').textContent = "🟢 Conectado (Actualizado: " + new Date().toLocaleTimeString() + ")";
+                document.getElementById('api-status').style.color = "green";
+            } catch (error) {
+                console.error("Error fetching data:", error);
+                document.getElementById('api-status').textContent = "🔴 Error de conexión con Central";
+                document.getElementById('api-status').style.color = "red";
+            }
+        }
+
+        function getStatusClass(status) {
+            switch(status) {
+                case 'ACTIVADO': return 'bg-activado';
+                case 'SUMINISTRANDO': return 'bg-suministrando';
+                case 'AVERIADO': return 'bg-averiado';
+                case 'FUERA_DE_SERVICIO': return 'bg-fuera';
+                case 'RESERVADO': return 'bg-reservado';
+                default: return 'bg-desconectado';
+            }
+        }
+
+        function updateCPs(cps) {
+            const tbody = document.getElementById('cp-body');
+            tbody.innerHTML = '';
+            
+            if (cps.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5">No hay CPs registrados</td></tr>';
+                return;
+            }
+
+            cps.forEach(cp => {
+                const tr = document.createElement('tr');
+                // Formato consumo
+                let consumo = '-';
+                if (cp.status === 'SUMINISTRANDO') {
+                    consumo = `${cp.kwh.toFixed(2)} kWh / ${cp.importe.toFixed(2)} €`;
+                }
+                
+                tr.innerHTML = `
+                    <td><strong>${cp.id}</strong></td>
+                    <td>${cp.location}</td>
+                    <td><span class="status-badge ${getStatusClass(cp.status)}">${cp.status}</span></td>
+                    <td>${consumo}</td>
+                    <td>${cp.driver_id || '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function updateDrivers(drivers) {
+            const list = document.getElementById('drivers-list');
+            list.innerHTML = '';
+            
+            if (drivers.length === 0) {
+                list.innerHTML = '<p style="color: #999;">Ningún conductor conectado</p>';
+                return;
+            }
+
+            drivers.forEach(driver => {
+                const div = document.createElement('div');
+                div.className = 'driver-item';
+                div.innerHTML = `
+                    <span>🚗 <strong>${driver}</strong></span>
+                    <span style="color: green;">● Online</span>
+                `;
+                list.appendChild(div);
+            });
+        }
+
+        // Actualizar cada 2 segundos
+        setInterval(fetchData, 2000);
+        fetchData(); // Primera llamada inmediata
+    </script>
+</body>
+</html>

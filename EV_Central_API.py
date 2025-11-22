@@ -1,12 +1,14 @@
 # Fichero: EV_Central_API.py
 from flask import Flask, request, jsonify
+from flask_cors import CORS  # <--- NUEVO
 import threading
 import time
 import logging
 import database  # Importamos database directamente porque es un módulo independiente
 
-app = Flask(__name__)
 
+app = Flask(__name__)
+CORS(app)  # <--- NUEVO: Permite que tu HTML hable con el API
 # --- VARIABLES COMPARTIDAS (REFERENCIAS) ---
 # Aquí guardaremos los "punteros" a las variables de EV_Central.py
 CONTEXT = {
