@@ -20,7 +20,7 @@ CIUDADES_CPS = {
     "Oslo": "TEST"        # Oslo suele estar frío, útil para probar alertas
 }
 
-# Umbral de temperatura (Release 2 dice 0ºC, pero puedes subirlo a 20ºC para probar que funciona ya)
+# Um b ral de temperatura (Release 2 dice 0ºC, pero puedes subirlo a 20ºC para probar que funciona ya)
 TEMP_UMBRAL = 0.0 
 
 def obtener_clima(ciudad):
