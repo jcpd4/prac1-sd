@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>EVCharging - Centro de Control</title>
+    <style>
+        body { font-family: 'Segoe UI', sans-serif; background-color: #f4f4f9; padding: 20px; }
+        h1 { text-align: center; color: #333; }
+        .container { max-width: 1400px; margin: 0 auto; display: grid; gap: 20px; grid-template-columns: 2fr 1.5fr; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        
+        /* Tabla */
+        table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
+        th { background-color: #007bff; color: white; padding: 10px; text-align: left;}
+        td { padding: 8px; border-bottom: 1px solid #eee; vertical-align: middle; }
+        
+        .badge { padding: 4px 8px; border-radius: 4px; color: white; font-weight: bold; font-size: 0.8em; }
+        .bg-ACTIVADO { background-color: #28a745; }
+        .bg-SUMINISTRANDO { background-color: #007bff; }
+        .bg-AVERIADO { background-color: #dc3545; }
+        .bg-FUERA_DE_SERVICIO { background-color: #fd7e14; }
+        .bg-DESCONECTADO { background-color: #6c757d; }
+        
+        /* Info Clima en tabla */
+        .temp-badge { font-size: 0.85em; color: #555; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-top: 4px; display: inline-block;}
+
+        /* Logs y Filtros */
+        .filter-bar { display: flex; gap: 5px; margin-bottom: 10px; flex-wrap: wrap; }
+        .filter-btn { padding: 5px 10px; border: 1px solid #ccc; background: #f8f9fa; cursor: pointer; border-radius: 4px; font-size: 0.8em; }
+        .filter-btn.active { background: #007bff; color: white; border-color: #007bff; }
+        
+        #log-console { 
+            background: #1e1e1e; color: #eee; height: 400px; overflow-y: auto; 
+            padding: 10px; font-family: 'Consolas', monospace; font-size: 0.85em; border-radius: 4px;
+        }
+        .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; word-wrap: break-word;}
+        .log-src { font-weight: bold; margin-right: 5px; }
+        .src-CENTRAL { color: #00ff00; }
+        .src-REGISTRY { color: #ff00ff; }
+        .src-EV_W { color: #00d0ff; }
+        
+        /* Config */
+        .config-box { display: flex; gap: 10px; align-items: center; background: #e9ecef; padding: 10px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>⚡ Centro de Control EVCharging</h1>
+
+    <div class="container">
+        <div style="display:flex; flex-direction:column; gap:20px;">
+            <div class="card">
+                <h2>Estado de CPs</h2>
+                <table id="tabla-cps">
+                    <thead><tr><th>ID</th><th>Ubicación / Clima</th><th>Estado</th><th>Info</th></tr></thead>
+                    <tbody><tr><td colspan="4">Cargando...</td></tr></tbody>
+                </table>
+            </div>
+            
+            <div class="card">
+                <h2>⚙️ Configuración Clima</h2>
+                <div class="config-box">
+                    <span>Umbral Alerta:</span>
+                    <input type="number" id="tempInput" value="0" style="width:60px"> <span>ºC</span>
+                    <button onclick="cambiarUmbral()" style="background:#28a745; color:white; border:none; padding:5px 10px; cursor:pointer;">Actualizar</button>
+                </div>
+                <p style="font-size: 0.8em; color: #666; margin-top:5px;">Si Temp. Real < Umbral -> Se enviará orden de PARAR.</p>
+            </div>
+        </div>
+
+        <div class="card">
+            <h2>📜 Registro de Eventos</h2>
+            <div class="filter-bar">
+                <button class="filter-btn active" onclick="setFilter('ALL')">TODOS</button>
+                <button class="filter-btn" onclick="setFilter('CENTRAL')">CENTRAL</button>
+                <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
+                <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
+            </div>
+            <div id="log-console">Conectando...</div>
+        </div>
+    </div>
+
+    <script>
+        const API = 'http://127.0.0.1:5000/api';
+        let currentFilter = 'ALL';
+        let allLogs = [];
+        let cityTemps = {}; // Guardaremos las temperaturas aquí
+
+        async function update() {
+            try {
+                // 1. Estado General y Temps
+                const res = await fetch(`${API}/estado`);
+                const data = await res.json();
+                
+                cityTemps = data.city_temps || {}; // Actualizar temps globales
+                renderTable(data.cps); // Repintar tabla
+                
+                if(document.activeElement.id !== 'tempInput') {
+                    document.getElementById('tempInput').placeholder = data.config.temp_umbral;
+                }
+
+                // 2. Logs
+                const resLog = await fetch(`${API}/logs`);
+                const dataLog = await resLog.json();
+                allLogs = dataLog.logs;
+                renderLogs();
+
+            } catch (e) { console.error(e); }
+        }
+
+        async function cambiarUmbral() {
+            const val = document.getElementById('tempInput').value;
+            await fetch(`${API}/config/umbral`, {
+                method: 'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({umbral: val})
+            });
+            alert("Umbral actualizado");
+        }
+
+        function setFilter(filter) {
+            currentFilter = filter;
+            document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+            event.target.classList.add('active');
+            renderLogs();
+        }
+
+        function renderLogs() {
+            const div = document.getElementById('log-console');
+            const filtered = currentFilter === 'ALL' ? allLogs : allLogs.filter(l => l.source === currentFilter);
+            
+            div.innerHTML = filtered.map(l => {
+                // Corrección [object Object]: Convertir a string si es necesario
+                let txt = (typeof l.msg === 'object') ? JSON.stringify(l.msg) : l.msg;
+                
+                // Colores por fuente
+                let src = l.source;
+                if(src === 'CENTRAL') {
+                    if(txt.includes('[CLIMA]')) src = 'EV_W';
+                    if(txt.includes('REGISTRO')) src = 'REGISTRY';
+                }
+                return `<div class="log-line"><span class="log-src src-${src}">[${src}]</span> ${txt}</div>`;
+            }).join('');
+            div.scrollTop = div.scrollHeight;
+        }
+
+        function renderTable(cps) {
+            document.querySelector('#tabla-cps tbody').innerHTML = cps.map(cp => {
+                // Buscar temperatura correspondiente a la ubicación del CP
+                let tempHtml = "";
+                for (const city in cityTemps) {
+                    if (cp.location.toLowerCase().includes(city.toLowerCase())) {
+                        tempHtml = `<br><span class="temp-badge">🌡️ ${cityTemps[city]}ºC</span>`;
+                        break; 
+                    }
+                }
+
+                return `
+                <tr>
+                    <td><b>${cp.id}</b></td>
+                    <td>
+                        ${cp.location}
+                        ${tempHtml} </td>
+                    <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
+                    <td>${cp.status==='SUMINISTRANDO' ? cp.kwh.toFixed(2)+'kWh' : '-'}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        setInterval(update, 1000);
+        update();
+    </script>
+</body>
+</html>

@@ -693,16 +693,18 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
             #Paso 3.2.5: Verificar latidos del Monitor (resiliencia R1)
             try:
                 if LAST_MONITOR_TS and (time.time() - LAST_MONITOR_TS) > 6:
-                    print("[ENGINE] Monitor no responde. Finalizando suministro de forma segura.")
+                    print("[ENGINE] Monitor no responde. Notificando a CENTRAL y finalizando suministro.")
                     with status_lock:
                         ENGINE_STATUS['is_charging'] = False
-                    # Enviar fin normal con los acumulados actuales
+                    aborted_due_to_fault = True
                     send_telemetry_message({
-                        "type": "SUPPLY_END",
+                        "type": "CONEXION_PERDIDA",
                         "cp_id": cp_id,
                         "user_id": driver_id,
                         "kwh": round(total_kwh, 3),
-                        "importe": round(total_importe, 2)
+                        "importe": round(total_importe, 2),
+                        "component": "MONITOR",
+                        "reason": "Monitor desconectado"
                     })
                     break
             except Exception:

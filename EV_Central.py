@@ -8,6 +8,8 @@ import os
 from kafka import KafkaConsumer, KafkaProducer
 import json
 import database # Módulo de base de datos (se asume implementado)
+#segunda entrega:
+import EV_Central_API # codigo mio(juanky) donde hago la parte de api_central
 
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
@@ -41,7 +43,7 @@ engine_last_seen = {}   # { cp_id: timestamp }
 engine_health_status = {}  # { cp_id: 'OK'|'KO' }
 
 # Timeouts para considerar que un monitor o un engine están caídos
-MONITOR_HEARTBEAT_TIMEOUT = 6     # segundos sin mensajes del monitor ⇒ DESCONECTADO
+MONITOR_HEARTBEAT_TIMEOUT = 7   # segundos sin mensajes del monitor ⇒ DESCONECTADO
 ENGINE_TELEMETRY_TIMEOUT = 5      # segundos sin telemetría ⇒ AVERIADO
 RECONCILE_INTERVAL = 1.0          # segundos entre comprobaciones del reconciliador
 
@@ -65,7 +67,9 @@ def push_message(msg_list, msg, maxlen=200):
         # eliminar los más antiguos
         del msg_list[0:len(msg_list)-maxlen]
 
-def force_release_cp_session(cp_id, central_messages=None, reason="", target_status=None, notify_driver=True, clear_metrics=True):
+def force_release_cp_session(cp_id, central_messages=None, reason="", target_status=None,
+                             notify_driver=True, clear_metrics=True, supply_error_reason=None,
+                             partial_kwh=None, partial_importe=None, driver_override=None):
     """
     Libera de forma explícita cualquier sesión y telemetría asociada a un CP.
     Se utiliza cuando un CP pierde su monitor/engine o cuando se fuerza un cambio de estado
@@ -83,21 +87,64 @@ def force_release_cp_session(cp_id, central_messages=None, reason="", target_sta
         if assigned_driver and not driver_id:
             driver_id = assigned_driver
 
+    if driver_override and not driver_id:
+        driver_id = driver_override
+
+    if supply_error_reason and driver_id:
+        try:
+            if partial_kwh is None or partial_importe is None:
+                cp_data = database.get_all_cps()
+                for cp in cp_data:
+                    if cp.get('id') == cp_id:
+                        if partial_kwh is None:
+                            partial_kwh = cp.get('kwh')
+                        if partial_importe is None:
+                            partial_importe = cp.get('importe')
+                        break
+        except Exception as e:
+            if central_messages is not None:
+                push_message(central_messages, f"[RELEASE] No se pudieron leer métricas parciales de {cp_id}: {e}")
+        if partial_kwh is None:
+            partial_kwh = 0.0
+        if partial_importe is None:
+            partial_importe = 0.0
+
     if driver_id and central_messages is not None:
-        push_message(central_messages, f"[RELEASE] CP {cp_id}: sesión con driver {driver_id} finalizada ({reason or 'liberación forzada'}).")
         if notify_driver and shared_producer_ref:
-            cancel_msg = {
-                "type": "SESSION_CANCELLED",
-                "cp_id": cp_id,
-                "user_id": driver_id,
-                "reason": reason or "Sesión interrumpida",
-                "previous_status": session_status
-            }
-            try:
-                send_notification_to_driver(shared_producer_ref, driver_id, cancel_msg)
-            except Exception as e:
+            if supply_error_reason:
                 if central_messages is not None:
-                    push_message(central_messages, f"[RELEASE] Error notificando cancelación a driver {driver_id}: {e}")
+                    push_message(
+                        central_messages,
+                        f"[RELEASE] SUPPLY_ERROR -> CP {cp_id} driver {driver_id} "
+                        f"({supply_error_reason}) parcial {partial_kwh if partial_kwh is not None else 0.0:.3f} kWh / "
+                        f"{partial_importe if partial_importe is not None else 0.0:.2f} €"
+                    )
+                error_msg = {
+                    "type": "SUPPLY_ERROR",
+                    "cp_id": cp_id,
+                    "user_id": driver_id,
+                    "reason": supply_error_reason,
+                    "kwh_partial": partial_kwh if partial_kwh is not None else 0.0,
+                    "importe_partial": partial_importe if partial_importe is not None else 0.0
+                }
+                try:
+                    send_notification_to_driver(shared_producer_ref, driver_id, error_msg)
+                except Exception as e:
+                    if central_messages is not None:
+                        push_message(central_messages, f"[RELEASE] Error notificando SUPPLY_ERROR a driver {driver_id}: {e}")
+            else:
+                cancel_msg = {
+                    "type": "SESSION_CANCELLED",
+                    "cp_id": cp_id,
+                    "user_id": driver_id,
+                    "reason": reason or "Sesión interrumpida",
+                    "previous_status": session_status
+                }
+                try:
+                    send_notification_to_driver(shared_producer_ref, driver_id, cancel_msg)
+                except Exception as e:
+                    if central_messages is not None:
+                        push_message(central_messages, f"[RELEASE] Error notificando cancelación a driver {driver_id}: {e}")
 
     if clear_metrics:
         try:
@@ -558,7 +605,7 @@ def reconcile_cp_states(central_messages):
                     if last_monitor is None:
                         monitor_alive = True
                     else:
-                        monitor_alive = (now - last_monitor) <= MONITOR_HEARTBEAT_TIMEOUT
+                        monitor_alive = (now - last_monitor) <= (MONITOR_HEARTBEAT_TIMEOUT + 2.5)
 
                 # Determinar si el engine sigue vivo (telemetría reciente)
                 last_engine = engine_last_seen.get(cp_id)
@@ -645,8 +692,6 @@ def get_status_color(status):
     END_COLOR = "\033[0m"
     return f"{colors.get(status, '')}{status}{END_COLOR}"
 
-# En EV_Central.py, REEMPLAZA tu función display_panel por esta:
-
 def display_panel(central_messages, driver_requests):
     """Muestra el estado de todos los CPs en una matriz y los mensajes del sistema."""
     
@@ -657,15 +702,18 @@ def display_panel(central_messages, driver_requests):
     while True:
         clear_screen()
         print("--- PANEL DE MONITORIZACIÓN DE EV CHARGING ---")
-        print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Ancho total de la matriz
         
         # 1. --- Sección Matriz de Puntos de Recarga (CPs) ---
         print(f"--- MATRIZ DE PUNTOS DE RECARGA (CPs) [Columnas={GRID_COLUMNS}] ---")
-        all_cps = database.get_all_cps() #
+        all_cps = database.get_all_cps()
         
         if not all_cps:
             print("No hay Puntos de Recarga registrados.")
+            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Borde inferior
         else:
+            # Imprimir el borde superior de la matriz
+            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS))
+
             # Iterar por los CPs en filas de GRID_COLUMNS
             for i in range(0, len(all_cps), GRID_COLUMNS):
                 row_cps = all_cps[i:i + GRID_COLUMNS]
@@ -684,34 +732,53 @@ def display_panel(central_messages, driver_requests):
                     
                     # Obtener representaciones visuales
                     emoji = get_status_emoji(status)
-                    colored_status = get_status_color(status) #
+                    colored_status = get_status_color(status) # (ej. \033[92mACTIVADO\033[0m)
                     
-                    # Formatear cada línea para la celda
-                    line_ids += f"| {cp_id:<{CELL_WIDTH}} "
-                    line_locations += f"| {location:<{CELL_WIDTH}} "
-                    # Requerimiento: "Color: [emoji] [Estado]"
-                    line_status += f"    | Color: {emoji} {colored_status:<{CELL_WIDTH-9}} " # -9 por "Color: 🟢 "
+                    # --- Lógica de alineación ---
 
-                    # Si está suministrando, preparar la línea de suministro
+                    # Línea de IDs
+                    line_ids += f"| {cp_id:<{CELL_WIDTH}} "
+
+                    # Línea de Ubicaciones
+                    line_locations += f"| {location:<{CELL_WIDTH}} "
+
+                    # Línea de Estado (CORREGIDA PARA CÓDIGOS DE COLOR)
+                    prefix_str = f"Color: {emoji} "
+                    status_visible_len = len(status)
+                    padding_len = CELL_WIDTH - (len(prefix_str) + status_visible_len)
+                    if padding_len < 0:
+                        padding_len = 0
+                    padding = " " * padding_len
+                    line_status += f"| {prefix_str}{colored_status}{padding}"
+                    
+                    # Línea de Suministro
                     if status == 'SUMINISTRANDO':
-                        kwh_value = cp.get('kwh', 0.0) or 0.0
-                        importe_value = cp.get('importe', 0.0) or 0.0
+                        kwh = cp.get('kwh', 0.0)
+                        importe = cp.get('importe', 0.0)
                         driver = cp.get('driver_id', 'N/A')
-                        supply_str = f"{driver} | {kwh_value:.1f}kWh | {importe_value:.1f}€"
-                        line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} " # Truncar info de suministro
+                        supply_str = f"{driver} | {kwh:.1f}kWh | {importe:.1f}€"
+                        line_supply += f"| {supply_str[:CELL_WIDTH]:<{CELL_WIDTH}} "
                     else:
                         line_supply += f"| {' ':<{CELL_WIDTH}} " # Celda vacía para alinear
 
                 # Imprimir las líneas de la fila
-                print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador de fila
                 print(line_ids + "|")
                 print(line_locations + "|")
                 print(line_status + "|")
-                # Solo imprimir la línea de suministro si tiene contenido
-                if line_supply.strip().replace("|", ""):
-                    print(line_supply + "|")
-            
-            print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS)) # Separador final de la matriz
+                
+                # CORRECCIÓN: Imprimir siempre la línea de suministro (incluso vacía)
+                print(line_supply + "|")
+                
+                # --- CORRECCIÓN: Lógica del borde inferior ---
+                is_last_row = (i + GRID_COLUMNS) >= len(all_cps)
+                
+                if is_last_row:
+                    # Para la última fila, calcular borde basado en celdas *en esta fila*
+                    num_cells_in_row = len(row_cps)
+                    print("=" * ((CELL_WIDTH + 3) * num_cells_in_row))
+                else:
+                    # Para una fila completa, imprimir un borde de ancho completo
+                    print("=" * ((CELL_WIDTH + 3) * GRID_COLUMNS))
         
         # --- Resto del panel (Drivers, Peticiones, Mensajes) ---
         # (Esta parte es la misma que ya tenías)
@@ -783,11 +850,9 @@ def display_panel(central_messages, driver_requests):
                 print("  No hay mensajes del protocolo.")
         
         print("="*80)
-        print("Comandos: [P]arar <CP_ID> | [R]eanudar <CP_ID> | [PT] Parar todos | [RT] Reanudar todos | [Q]uit")
+        print("Comandos: [P]arar <CP_ID> | [R]eanudar <CP_ID> | [PT] Parar todos | [RT] Reanuduar todos | [Q]uit")
         print(f"Última actualización: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         time.sleep(2) # El panel se refresca cada 2 segundos
-
-
 # --- Funciones de Kafka ---
 
 # Funcion de Kafka para enviar el estado de la red a todos los drivers
@@ -816,11 +881,19 @@ def broadcast_network_status(kafka_broker, producer):
 # Funcion de Kafka para enviar notificaciones a los drivers
 def send_notification_to_driver(producer, driver_id, notification):
     """Envía una notificación solo al driver específico si está conectado."""
+    # OBTENER EL TIPO DE MENSAJE
+    msg_type = notification.get('type')
+
     #Paso 1: Verificar si el driver está conectado
     with active_cp_lock:
-        if driver_id not in connected_drivers:
-            print(f"[CENTRAL] Driver {driver_id} no está conectado. No se envía notificación: {notification['type']}")
-            return False
+        # CORRECCIÓN: Si el mensaje es un TICKET o un ERROR,
+        # debemos enviarlo SIEMPRE, aunque el driver esté desconectado.
+        # Kafka se encargará de guardarlo.
+        if msg_type not in ['TICKET', 'SUPPLY_ERROR', 'SESSION_CANCELLED']:
+            if driver_id not in connected_drivers:
+                print(f"[CENTRAL] Driver {driver_id} no está conectado. No se envía notificación: {notification['type']}")
+                return False
+
     #Paso 2: Enviar la notificación al driver
     try:
         #Paso 2.1: Añadir el driver_id al mensaje para que el driver pueda filtrarlo
@@ -997,6 +1070,8 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 msg_type = payload.get('type', '').upper() # Tipo de mensaje (CONSUMO, SESSION_STARTED, SUPPLY_END, etc.)
                 cp_id = payload.get('cp_id') # ID del CP
 
+                payload_driver_id = payload.get('user_id') or payload.get('driver_id')
+
                 if cp_id:
                     try:
                         engine_last_seen[cp_id] = time.time()
@@ -1131,45 +1206,79 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                         pass
                     cp_data = database.get_all_cps()
                     cp_info = next((cp for cp in cp_data if cp['id'] == cp_id), None)
-                    
+
+                    is_monitor_loss = msg_type == 'CONEXION_PERDIDA' and payload.get('component', '').upper() == 'MONITOR'
+                    partial_kwh = float(payload.get('kwh', 0.0))
+                    partial_importe = float(payload.get('importe', 0.0))
+                    if cp_info:
+                        db_kwh = cp_info.get('kwh')
+                        db_importe = cp_info.get('importe')
+                        if db_kwh is not None:
+                            try:
+                                partial_kwh = float(db_kwh)
+                            except Exception:
+                                partial_kwh = db_kwh
+                        if db_importe is not None:
+                            try:
+                                partial_importe = float(db_importe)
+                            except Exception:
+                                partial_importe = db_importe
+
+                    supply_error_to_send = None
+
                     if cp_info and cp_info.get('status') == 'SUMINISTRANDO':
-                        driver_id = cp_info.get('driver_id')
-                        kwh = cp_info.get('kwh', 0.0)
-                        importe = cp_info.get('importe', 0.0)
-                        
-                        #Paso 2.4.4.2: Notificar al conductor la interrupción por avería
-                        error_msg = {
-                            "type": "SUPPLY_ERROR",
-                            "cp_id": cp_id,
-                            "user_id": driver_id,
-                            "reason": "Carga interrumpida: Avería detectada en el punto de recarga",
-                            "kwh_partial": kwh,
-                            "importe_partial": importe
-                        }
-                        send_notification_to_driver(producer, driver_id, error_msg)
-                        #Paso 2.4.4.2.1: Agregar mensaje de error a la lista de mensajes
-                        #Paso 2.4.4.2.2: Log detallado en Central
-                        msg = (f"AVERÍA DURANTE SUMINISTRO en CP {cp_id}\n"
-                              f"    → Estado: AVERIADO (ROJO)\n"
-                              f"    → Driver: {driver_id}\n"
-                              f"    → Consumo hasta avería: {kwh:.3f} kWh / {importe:.2f} €\n"
-                              f"    → Notificación enviada al conductor")
-                        #Paso 2.4.4.2.3: Agregar mensaje de error a la lista de mensajes
-                        central_messages.append(msg)
-                        print(f"[CENTRAL] {msg}")
-                        
-                        #Paso 2.4.4.2.4: Limpiar telemetría pero mantener estado AVERIADO
-                        database.clear_cp_telemetry_only(cp_id)
-                        
+                        driver_id = cp_info.get('driver_id') or payload_driver_id
+                        if driver_id:
+                            #Paso 2.4.4.2: Notificar al conductor la interrupción
+                            if is_monitor_loss:
+                                reason = "Carga interrumpida: Monitor desconectado"
+                            else:
+                                reason = "Carga interrumpida: Engine averiado"
+                            supply_error_to_send = reason
+                            descriptor = "DESCONECTADO" if is_monitor_loss else "AVERIADO"
+                            log_msg = (
+                                f"INTERRUPCIÓN DURANTE SUMINISTRO en CP {cp_id}\n"
+                                f"    → Estado: {descriptor}\n"
+                            )
+                            if driver_id:
+                                log_msg += f"    → Driver: {driver_id}\n"
+                            log_msg += (
+                                f"    → Consumo parcial: {partial_kwh:.3f} kWh / {partial_importe:.2f} €\n"
+                                f"    → Notificación {'enviada' if driver_id else 'no enviada (driver desconocido)'} ({reason})"
+                            )
+                            central_messages.append(log_msg)
+                            print(f"[CENTRAL] {log_msg}")
                     else:
-                        #Paso 2.4.4.3: CP no estaba suministrando
-                        msg = f"AVERÍA detectada en CP {cp_id} - Estado actualizado a ROJO"
+                        if is_monitor_loss:
+                            msg = f"Monitor de CP {cp_id} desconectado - Estado actualizado a DESCONECTADO"
+                        else:
+                            msg = f"AVERÍA detectada en CP {cp_id} - Estado actualizado a ROJO"
                         central_messages.append(msg)
                         print(f"[CENTRAL] {msg}")
-                    
-                    #Paso 2.4.4.4: Actualizar estado a AVERIADO y cerrar sesión si existiese
-                    database.update_cp_status(cp_id, 'AVERIADO')
-                    force_release_cp_session(cp_id, central_messages, reason="Engine reporta avería", target_status='AVERIADO')
+
+                    if is_monitor_loss:
+                        force_release_cp_session(
+                            cp_id,
+                            central_messages,
+                            reason="Monitor desconectado durante suministro" if cp_info else "Monitor desconectado",
+                            target_status='DESCONECTADO',
+                            supply_error_reason=supply_error_to_send,
+                            partial_kwh=partial_kwh,
+                            partial_importe=partial_importe,
+                            driver_override=payload_driver_id
+                        )
+                    else:
+                        database.update_cp_status(cp_id, 'AVERIADO')
+                        force_release_cp_session(
+                            cp_id,
+                            central_messages,
+                            reason="Engine reporta avería",
+                            target_status='AVERIADO',
+                            supply_error_reason=supply_error_to_send,
+                            partial_kwh=partial_kwh,
+                            partial_importe=partial_importe,
+                            driver_override=payload_driver_id
+                        )
 
         except Exception as e:
             central_messages.append(f"Error al procesar mensaje de Kafka: {e}")
@@ -1240,7 +1349,7 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                         "type": "SUPPLY_ERROR",
                         "cp_id": cp_id,
                         "user_id": driver_id,
-                        "reason": "Carga interrumpida: Avería detectada en el punto de recarga",
+                        "reason": "Carga interrumpida: Engine averiado",
                         "kwh_partial": kwh,
                         "importe_partial": importe
                     }
@@ -1500,7 +1609,7 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 now_ts = time.time()
                 monitor_last_seen[cp_id] = now_ts
                 engine_last_seen[cp_id] = now_ts
-                engine_health_status.setdefault(cp_id, 'OK')
+                engine_health_status[cp_id] = 'OK'
             except Exception:
                 pass
             # Si se envía precio opcional: REGISTER#CP_ID#LOCATION#PRICE
@@ -1683,11 +1792,13 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                     force_release_cp_session(
                         cp_id,
                         central_messages,
-                        reason="Monitor desconectado",
-                        target_status=None
+                        reason="Monitor desconectado (socket cerrado)",
+                        target_status='DESCONECTADO',
+                        supply_error_reason="Carga interrumpida: Monitor desconectado"
                     )
                 except Exception:
                     pass
+                current_status = 'DESCONECTADO'
                 session_active = False
                 session_exists = False
                 driver_attached = None
@@ -1959,6 +2070,28 @@ if __name__ == "__main__":
         server_thread = threading.Thread(target=start_socket_server, args=(HOST, SOCKET_PORT, central_messages, KAFKA_BROKER))
         server_thread.daemon = True
         server_thread.start()
+
+        # --- NUEVO RELEASE 2: API REST ---
+        # Paso 8.5: Iniciar API REST de Central (Módulo separado)
+        API_PORT = 5000 # Puerto estándar para Flask
+        
+        # 1. INYECCIÓN DE DEPENDENCIAS
+        # Pasamos nuestras variables locales al módulo API para que pueda usarlas
+        EV_Central_API.configure_api(
+            messages_list=central_messages,    # Para escribir logs
+            drivers_set=connected_drivers,     # Para leer drivers conectados
+            sockets_dict=active_cp_sockets,    # Para saber qué CPs tienen socket
+            command_func=send_cp_command       # Para poder enviar órdenes (PARAR/REANUDAR)
+        )
+        
+        # 2. Arrancar el servidor Flask en un hilo separado
+        api_thread = threading.Thread(
+            target=EV_Central_API.start_api_server, 
+            args=(HOST, API_PORT)
+        )
+        api_thread.daemon = True
+        api_thread.start()
+        # ---------------------------------
         
         # Paso 9: Iniciar el hilo de entrada de comandos del usuario
         # Lee comandos: P <CP_ID>, R <CP_ID>, PT (parar todos), RT (reanudar todos), Q (quit)

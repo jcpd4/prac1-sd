@@ -20,6 +20,7 @@ network_status_lock = threading.Lock() # Lock para acceder a la variable network
 #  Almacenamiento del estado de la recarga (1)
 active_charge_info = {} # Usaremos un diccionario para guardar la información de la recarga activa (ej: {"MAD-01": {"kwh": 10.0, "importe": 10.0}})
 charge_lock = threading.Lock() # Lock para acceder a la variable active_charge_info
+last_supply_errors = {}  # Recordar último parcial mostrado por CP para evitar duplicados
 
 
 # --- Funciones ---
@@ -66,16 +67,27 @@ def process_central_notifications(kafka_broker, client_id, messages):
             #Paso 2.1: Obtener el tipo de mensaje
             msg_type = payload.get('type')
             
-            #Paso 2.2: Filtrar los mensajes de autorización
-            if msg_type in ['AUTH_OK', 'AUTH_DENIED']:
-                if payload.get('user_id') != client_id:
+            #Paso 2.2: Filtrar por destinatario cuando aplica
+            if msg_type in ['AUTH_OK', 'AUTH_DENIED', 'SESSION_CANCELLED', 'SUPPLY_ERROR']:
+                target_user = payload.get('user_id') or payload.get('driver_id')
+                if target_user and target_user != client_id:
                     continue
-            #Paso 2.3: Filtrar los mensajes de consumo
-            elif msg_type in ['CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR', 'SESSION_CANCELLED']:
+            #Paso 2.3: Filtrar SÓLO los mensajes de consumo
+            if msg_type == 'CONSUMO_UPDATE':
+                # INICIO DE LA INDENTACIÓN (4 espacios)
                 cp_id_del_mensaje = payload.get('cp_id')
                 with charge_lock:
+                    # Si no hay carga activa, ignorar el consumo
                     if cp_id_del_mensaje not in active_charge_info:
                         continue
+                # FIN DE LA INDENTACIÓN
+            
+            elif msg_type in ['TICKET', 'SUPPLY_ERROR']:
+                # INICIO DE LA INDENTACIÓN (4 espacios)
+                # NO FILTRAR: Los tickets y errores siempre deben procesarse
+                # para que el driver se entere de lo que pasó mientras estaba desconectado.
+                pass 
+                # FIN DE LA INDENTACIÓN
             
             #Paso 2.4: Procesar los mensajes de autorización, consumo, ticket y supply error
             with charge_lock:
@@ -103,19 +115,30 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     reason = payload.get('reason', 'Carga interrumpida')
                     kwh_p = payload.get('kwh_partial', 0)
                     imp_p = payload.get('importe_partial', 0)
-                    messages.append(f" [ERROR SUMINISTRO ENGINE] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {payload['cp_id']}")
-                    #Paso 2.4.4.1: Limpiar la recarga activa, ya que se ha interrumpido
-                    if payload['cp_id'] in active_charge_info:
-                        del active_charge_info[payload['cp_id']]
-                elif msg_type == 'SESSION_CANCELLED':
-                    reason = payload.get('reason', 'Sesión interrumpida')
-                    messages.append(f" [CANCELADA] La sesión en CP {payload['cp_id']} se cerró: {reason}.")
-                    if payload['cp_id'] in active_charge_info:
-                        del active_charge_info[payload['cp_id']]
+                    cp_id = payload.get('cp_id', 'N/A')
 
-                #Paso 2.4.5: Procesar los mensajes desconocidos
-                elif msg_type and msg_type not in ['AUTH_OK', 'AUTH_DENIED', 'CONSUMO_UPDATE', 'TICKET', 'SUPPLY_ERROR']:
-                     messages.append(f"[MENSAJE CENTRAL] {payload.get('message', 'Mensaje desconocido')}")
+                    # Si ya se mostró un error para este CP y los valores son idénticos, no repetirlo
+                    if last_supply_errors.get(cp_id) == (kwh_p, imp_p):
+                        continue
+
+                    # Eliminar mensaje anterior de error para este CP (si existe)
+                    try:
+                        for idx in range(len(messages) - 1, -1, -1):
+                            if " [ERROR SUMINISTRO]" in messages[idx] and f"CP {cp_id}" in messages[idx]:
+                                del messages[idx]
+                                break
+                    except Exception:
+                        pass
+
+                    messages.append(f" [ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {cp_id}")
+                    last_supply_errors[cp_id] = (kwh_p, imp_p)
+                    #Paso 2.4.4.1: Limpiar la recarga activa, ya que se ha interrumpido
+                    if cp_id in active_charge_info:
+                        del active_charge_info[cp_id]
+
+                elif msg_type == 'SESSION_CANCELLED':
+                    # Ignoramos las cancelaciones (supone que ya llegó SUPPLY_ERROR con datos definitivos)
+                    continue
         except Exception as e:
             messages.append(f"[ERROR] Procesando notificación: {e}")
 

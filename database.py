@@ -74,6 +74,7 @@ def setup_database():
                     driver_id TEXT,
                     kwh REAL DEFAULT 0.0,
                     importe REAL DEFAULT 0.0,
+                    token TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -135,6 +136,38 @@ def register_cp(cp_id, location, price_per_kwh=0.25):
             conn.close()
     except Exception as e:
         print(f"[DB] ERROR al registrar CP {cp_id} en SQLite: {e}")
+
+# Funcion para actualizar el token de seguridad de un CP (Release 2)
+def update_cp_token(cp_id, token):
+    """Guarda el token de seguridad asignado a un CP."""
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("UPDATE charging_points SET token = ? WHERE id = ?", (token, cp_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al actualizar token de {cp_id}: {e}")
+
+
+# Funcion para dar de baja (eliminar) un CP (Release 2)
+def delete_cp(cp_id):
+    """Elimina un CP de la base de datos."""
+    if not USE_SQLITE: return False
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM charging_points WHERE id = ?", (cp_id,))
+            changes = cursor.rowcount # Vemos si se borró algo
+            conn.commit()
+            conn.close()
+            return changes > 0 # Devuelve True si borró, False si no existía
+    except Exception as e:
+        print(f"[DB] ERROR al eliminar CP {cp_id}: {e}")
+        return False
 
 
 
