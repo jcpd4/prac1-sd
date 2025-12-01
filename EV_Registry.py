@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify
 import database
 import uuid # Para generar tokens únicos
 import sys
-
+from database import log_audit_event # Seva: Importar función de auditoría
 # Configuración
 # El Registry usará un puerto diferente al de la Central (8000) para no chocar.
 # Usaremos el 6000.
@@ -73,6 +73,15 @@ def unregister_cp():
     print(f"[Registry] Petición de baja recibida para: {cp_id}")
     
     if database.delete_cp(cp_id):
+        # Seva: AUDITORÍA: BAJA DE CP EXITOSA ***
+        # La IP de origen es la que llama a este endpoint (presumiblemente el CP Monitor)
+        log_audit_event(
+            source_ip=request.remote_addr, 
+            action="CP_BAJA_EXITOSA",
+            description="CP eliminado del sistema por solicitud del Registry.",
+            cp_id=cp_id
+        )
+        # *************************************
         print(f"[Registry] CP {cp_id} eliminado.")
         return jsonify({"message": f"CP {cp_id} dado de baja correctamente"}), 200
     else:

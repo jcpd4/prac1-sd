@@ -1,0 +1,5 @@
+# Archivos de la práctica EVCharging que deben ser ignorados
+ev_charging.db
+__pycache__/
+*.pyc
+.DS_Store

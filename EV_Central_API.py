@@ -5,7 +5,7 @@ import threading
 import time
 import logging
 import database
-
+from database import log_audit_event # Seva: Importar función de auditoría
 app = Flask(__name__)
 CORS(app)
 
@@ -57,12 +57,28 @@ def set_temp_umbral():
     data = request.json
     nuevo_umbral = data.get('umbral')
     if nuevo_umbral is not None:
+        try:
+            nuevo_umbral_float = float(nuevo_umbral)
+        except ValueError:
+            return jsonify({"error": "El umbral debe ser un número válido"}), 400
+        
         CONTEXT["config"]["temp_umbral"] = float(nuevo_umbral)
         msg = f"Umbral de temperatura cambiado a {nuevo_umbral}ºC desde Web"
         print(f"[CONFIG] {msg}")
+
         # Lo guardamos como log interno
         if CONTEXT["central_messages"] is not None:
             CONTEXT["central_messages"].append(f"[CONFIG] {msg}")
+
+        # Seva: AUDITORÍA: CAMBIO DE CONFIGURACIÓN ***
+        # Usamos request.remote_addr para capturar la IP que hizo la llamada API
+        log_audit_event(
+            source_ip=request.remote_addr,
+            action="API_CAMBIO_UMBRAL",
+            description=f"Umbral de temperatura climática modificado a {nuevo_umbral_float}ºC.",
+            cp_id=None
+        )
+        # *****************************************
         return jsonify({"status": "OK", "nuevo_umbral": nuevo_umbral}), 200
     return jsonify({"error": "Falta parámetro umbral"}), 400
 
@@ -136,6 +152,14 @@ def receive_weather_alert():
             if city.lower() in cp['location'].lower():
                 cp_id = cp['id']
                 if cp_id in CONTEXT["active_cp_sockets"]:
+                    # Seva: AUDITORÍA: ORDEN CLIMÁTICA ***
+                    log_audit_event(
+                        source_ip="EV_W_SERVICE", # El origen de la orden es el servicio climático (EV_W)
+                        action=f"CLIMA_ORDEN_{action.upper()}",
+                        description=f"Orden forzada de {action.upper()} por alerta climática en {city}.",
+                        cp_id=cp_id
+                    )
+                    # *****************************************
                     send_cmd(cp_id, action, CONTEXT["central_messages"])
                     count += 1
     

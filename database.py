@@ -103,6 +103,18 @@ def setup_database():
                     FOREIGN KEY (cp_id) REFERENCES charging_points (id)
                 )
             ''')
+            #Seva: Creamos una tabla para logs de Auditoría 
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    source_ip TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    description TEXT,
+                    cp_id TEXT,
+                    FOREIGN KEY (cp_id) REFERENCES charging_points (id)
+                )
+            ''')
             
             conn.commit()
             conn.close()
@@ -469,3 +481,57 @@ def restore_database(backup_file):
     except Exception as e:
         logger.error(f"[DB] Error restaurando backup: {e}")
         return False
+
+
+
+# Seva: Funcion para registrar un evento de auditoría (Release 2)
+def log_audit_event(source_ip, action, description, cp_id=None):
+    """Inserta un registro en la tabla audit_log."""
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            
+            # Formato de fecha para asegurar compatibilidad
+            current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            cursor.execute(
+                """INSERT INTO audit_log 
+                   (timestamp, source_ip, action, description, cp_id) 
+                   VALUES (?, ?, ?, ?, ?)""",
+                (current_time, source_ip, action, description, cp_id)
+            )
+            
+            conn.commit()
+            conn.close()
+            logger.info(f"[AUDIT] {source_ip} - {action} - CP:{cp_id}")
+    except Exception as e:
+        print(f"[DB] ERROR al registrar evento de auditoría: {e}")
+
+# Funcion para obtener todos los logs de auditoría (Verificación de que funciona)
+def get_audit_logs(limit=200):
+    """Obtiene el historial de logs de auditoría."""
+    if not USE_SQLITE: return []
+    logs = []
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            # Usar Row Factory para obtener resultados como diccionarios
+            conn.row_factory = sqlite3.Row 
+            cursor = conn.cursor()
+            
+            cursor.execute(
+                "SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?", 
+                (limit,)
+            )
+            rows = cursor.fetchall()
+            logs = [dict(row) for row in rows]
+            conn.close()
+    except sqlite3.OperationalError as e:
+        # Esto sucede si la tabla audit_log no existe aún (ej. primera ejecución)
+        print(f"[DB] WARNING: Error al consultar audit_log: {e}")
+        return []
+    except Exception as e:
+        print(f"[DB] ERROR al obtener logs de auditoría: {e}")
+    return logs

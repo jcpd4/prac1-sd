@@ -7,9 +7,10 @@ import os
 # Asegúrate de tener instalado: pip install kafka-python
 from kafka import KafkaConsumer, KafkaProducer
 import json
-import database # Módulo de base de datos (se asume implementado)
+import database 
 #segunda entrega:
 import EV_Central_API # codigo mio(juanky) donde hago la parte de api_central
+from database import log_audit_event # Seva: funcion para loguear eventos de auditoria
 
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
@@ -1043,6 +1044,14 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     #Paso 2.3.4: Enviar notificación de autorización al driver
                     notify = {"type": "AUTH_OK", "cp_id": cp_id, "user_id": user_id, "message": "Autorizado"}
                     #Paso 2.3.4.1: Enviar notificación de autorización al driver
+                    # Seva: AUDITORÍA: DRIVER AUTORIZACIÓN OK ***
+                    log_audit_event(
+                        source_ip=f"Kafka (Driver:{user_id})",
+                        action="DRIVER_AUTORIZACION_OK",
+                        description=f"Recarga autorizada. CP reservado y esperando inicio de suministro.",
+                        cp_id=cp_id
+                    )
+                    # ****************************************************************
                     send_notification_to_driver(producer, user_id, notify)
                     #Paso 2.3.4.2: Agregar mensaje de autorización a la lista de mensajes
                     central_messages.append(f"AUTORIZADO: Driver {user_id} -> CP {cp_id}")
@@ -1054,6 +1063,14 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     print(f"[CENTRAL] Enviando DENEGACIÓN al driver...")
                     notify = {"type": "AUTH_DENIED", "cp_id": cp_id, "user_id": user_id, "reason": cp_status}
                     #Paso 2.3.5.1: Enviar notificación de denegación al driver
+                    # Seva: AUDITORÍA: DRIVER AUTORIZACIÓN FALLIDA ***
+                    log_audit_event(
+                        source_ip=f"Kafka (Driver:{user_id})",
+                        action="DRIVER_AUTORIZACION_FALLIDA",
+                        description=f"Solicitud rechazada. Razón: CP en estado {cp_status}.",
+                        cp_id=cp_id
+                    )
+                    # ********************************************************************
                     send_notification_to_driver(producer, user_id, notify)
                     #Paso 2.3.5.2: Agregar mensaje de denegación a la lista de mensajes
                     central_messages.append(f"DENEGADO: Driver {user_id} -> CP {cp_id} (estado={cp_status})")
@@ -1183,7 +1200,14 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                             }
                             #Paso 2.4.3.2.1.1: Enviar el ticket al driver
                             send_notification_to_driver(producer, driver_id, ticket_msg)
-    
+                            # Seva: AUDITORÍA: FIN DE SUMINISTRO (TICKET) ***
+                            log_audit_event(
+                                source_ip=f"Kafka (Engine:{cp_id})",
+                                action="SUMINISTRO_FINALIZADO",
+                                description=f"Recarga completada. Ticket: {kwh:.3f} kWh, {importe:.2f} €",
+                                cp_id=cp_id
+                            )
+                            # ***************************************************************
                         except Exception as e:
                             central_messages.append(f"ERROR: no se pudo notificar ticket a driver {driver_id}: {e}")
                             print(f"[CENTRAL] EXCEPTION al enviar ticket: {e}")
@@ -1251,11 +1275,23 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                     else:
                         if is_monitor_loss:
                             msg = f"Monitor de CP {cp_id} desconectado - Estado actualizado a DESCONECTADO"
+                            audit_action = "INCIDENCIA_DESCONEXION_MONITOR"
+                            audit_reason = "Monitor desconectado"
                         else:
                             msg = f"AVERÍA detectada en CP {cp_id} - Estado actualizado a ROJO"
+                            audit_action = "INCIDENCIA_AVERIA_ENGINE"
+                            audit_reason = "Engine reporta avería"
                         central_messages.append(msg)
                         print(f"[CENTRAL] {msg}")
 
+                    # Seva: AUDITORÍA: INTERRUPCIÓN DE CARGA / AVERÍA ***
+                    log_audit_event(
+                        source_ip=f"Kafka (Engine/Monitor:{cp_id})",
+                        action=audit_action,
+                        description=f"Incidencia crítica. Razón: {audit_reason}. Consumo parcial: {partial_kwh:.3f} kWh.",
+                        cp_id=cp_id
+                    )
+                    # ****************************************************
                     if is_monitor_loss:
                         force_release_cp_session(
                             cp_id,
@@ -1380,11 +1416,29 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
         # Actualizar estado a AVERIADO y liberar sesión
         database.update_cp_status(cp_id, 'AVERIADO')
         force_release_cp_session(cp_id, central_messages, reason="Monitor reporta avería", target_status='AVERIADO')
-
+        # Seva: AUDITORÍA: REPORTE DE AVERÍA
+        source_ip = address[0] # IP del Monitor que reporta
+        log_audit_event(
+            source_ip=source_ip,
+            action="CP_AVERIA_REPORTADA",
+            description="Incidencia: Monitor reporta avería del Engine (KO). Carga interrumpida y CP en AVERIADO.",
+            cp_id=cp_id
+        )
+        # ****************
 
 
     #FASE 2.2: Recuperación de avería desde el Monitor
     elif command == 'RECOVER':
+        # Seva: AUDITORÍA: REPORTE DE RECUPERACIÓN (RECOVER) ***
+        source_ip = address[0] # IP del Monitor que reporta
+        log_audit_event(
+            source_ip=source_ip,
+            action="CP_RECUPERACION_REPORTADA",
+            description="CP reporta recuperación de Engine. Estado actualizado a ACTIVADO y sesión liberada.",
+            cp_id=cp_id
+        )
+        # ******************************************
+
         # 2.2.1: Al recuperar, liberar cualquier sesión y dejar el CP en ACTIVADO limpio
         force_release_cp_session(cp_id, central_messages, reason="Monitor recuperado", target_status='ACTIVADO')
         try:
@@ -1413,6 +1467,14 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                 central_messages.append(
                     f"CP {cp_id} confirmó REANUDAR. Estado actualizado a VERDE."
                 )
+                # Seva: AUDITORÍA: COMANDO REANUDAR CONFIRMADO ***
+                log_audit_event(
+                    source_ip=address[0],
+                    action="COMANDO_CONFIRMADO",
+                    description=f"CP confirmó REANUDAR. Estado final: ACTIVADO.",
+                    cp_id=cp_id
+                )
+                # ***********************************************
                 # Confirmar y limpiar pendiente si existía
                 if pending_cp_commands.pop(cp_id, None):
                     push_message(central_messages, f"Comando REANUDAR confirmado por {cp_id}")
@@ -1439,6 +1501,14 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                 # Confirmar y limpiar pendiente si existía
                 if pending_cp_commands.pop(cp_id, None):
                     push_message(central_messages, f"Comando PARAR confirmado por {cp_id}")
+                # Seva: AUDITORÍA: COMANDO PARAR CONFIRMADO ***
+                log_audit_event(
+                    source_ip=address[0],
+                    action="COMANDO_CONFIRMADO",
+                    description=f"CP confirmó PARAR. Estado final: FUERA_DE_SERVICIO.",
+                    cp_id=cp_id
+                )
+                # *********************************************
 
     elif command == 'NACK':
         if CENTRAL_VERBOSE:
@@ -1452,6 +1522,15 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                 if prev_status:
                     database.update_cp_status(cp_id, prev_status)
                     push_message(central_messages, f"Revertido estado de {cp_id} a {prev_status} por NACK")
+                    # Seva: AUDITORÍA: COMANDO RECHAZADO ***
+                    source_ip = address[0] 
+                    log_audit_event(
+                        source_ip=source_ip,
+                        action="COMANDO_RECHAZADO",
+                        description=f"CP rechazó el comando {pending.get('command')}. Estado revertido a {prev_status}.",
+                        cp_id=cp_id
+                    )
+                    # *************************************
         except Exception as e:
             print(f"[CENTRAL] WARNING: No se pudo revertir estado tras NACK para {cp_id}: {e}")
 
@@ -1472,11 +1551,27 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                     # Usar protocolo para enviar respuesta
                     send_frame(client_socket, assigned_driver, central_messages)
                     send_ack(client_socket)  # Confirmar recepción
+                    # Seva: AUDITORÍA: CHECK_DRIVER EXITOSO ***
+                    log_audit_event(
+                        source_ip=address[0],
+                        action="CONSULTA_DRIVER_OK",
+                        description=f"Monitor/Engine confirmó driver {assigned_driver} asignado y conectado.",
+                        cp_id=requested_cp_id
+                    )
+                    # ****************************************
                     print(f"[CENTRAL] Sesión válida para CP {requested_cp_id} con Driver {assigned_driver} (status={sess.get('status')})")
                 else:
                     # Usar protocolo para enviar respuesta negativa
                     send_frame(client_socket, "NO_DRIVER", central_messages)
                     send_ack(client_socket)
+                    # Seva: AUDITORÍA: CHECK_DRIVER FALLIDO ***
+                    log_audit_event(
+                        source_ip=address[0],
+                        action="CONSULTA_DRIVER_FALLIDA",
+                        description=f"Monitor/Engine consultó, sin driver activo.",
+                        cp_id=requested_cp_id
+                    )
+                    # ****************************************
                     if assigned_driver:
                         print(f"[CENTRAL] Sesión encontrada pero driver no conectado para CP {requested_cp_id}")
                     else:
@@ -1503,11 +1598,27 @@ def process_socket_data2(data_string, cp_id, address, client_socket, central_mes
                     # 2.5.6 Enviar el driver asignado al CP usando protocolo
                     send_frame(client_socket, assigned_driver, central_messages)
                     send_ack(client_socket)  # Confirmar recepción
+                    # Seva: AUDITORÍA: CHECK_SESSION EXITOSO ***
+                    log_audit_event(
+                        source_ip=address[0],
+                        action="CONSULTA_SESSION_OK",
+                        description=f"Monitor/Engine confirmó sesión autorizada para driver {assigned_driver}.",
+                        cp_id=requested_cp_id
+                    )
+                    # *****************************************
                     print(f"[CENTRAL] Sesión autorizada confirmada para CP {requested_cp_id} con Driver {assigned_driver} (status={sess.get('status')})")
                 else:
                     # Usar protocolo para enviar respuesta negativa
                     send_frame(client_socket, "NO_SESSION", central_messages)
                     send_ack(client_socket)
+                    # Seva: AUDITORÍA: CHECK_SESSION FALLIDA ***
+                    log_audit_event(
+                        source_ip=address[0],
+                        action="CONSULTA_SESSION_FALLIDA",
+                        description=f"Monitor/Engine consultó, sin sesión autorizada.",
+                        cp_id=requested_cp_id
+                    )
+                    # *****************************************
                     print(f"[CENTRAL] No hay sesión autorizada para CP {requested_cp_id}")
         else:
             # Usar protocolo para enviar respuesta negativa
@@ -1658,6 +1769,15 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             if first_time_in_db:
                 push_message(central_messages, f"CP '{cp_id}' registrado (primera vez en BD) desde {address}. Estado: {new_status} (price={price})")
                 push_message(central_messages, f"[PROTOCOLO] REGISTRO_INICIAL CP {cp_id} (estado {new_status})")
+                
+                # Seva: AUDITORÍA: REGISTRO INICIAL
+                source_ip = address[0] # Se usa la IP del socket que se conecta
+                log_audit_event(
+                    source_ip=source_ip,
+                    action="CP_REGISTRO_INICIAL",
+                    description=f"CP registrado por primera vez en BD. Ubic: {location}. Estado: {new_status}",
+                    cp_id=cp_id
+                )
                 # Informar al Monitor explícitamente del resultado del registro
                 try:
                     send_frame(client_socket, f"REGISTER_RESULT#FIRST", central_messages)
@@ -1666,6 +1786,15 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             elif first_time_this_session:
                 push_message(central_messages, f"[CONN] Primera conexión de sesión de CP '{cp_id}' desde {address}. Estado: {new_status}")
                 push_message(central_messages, f"[PROTOCOLO] PRIMERA_CONEXION_SESION CP {cp_id} (estado {new_status})")
+                # Seva: AUDITORÍA: PRIMERA CONEXIÓN DE SESIÓN
+                source_ip = address[0]
+                log_audit_event(
+                    source_ip=source_ip,
+                    action="CP_PRIMERA_CONEXION_SESION",
+                    description=f"Primera conexión de la sesión. Estado final: {new_status}",
+                    cp_id=cp_id
+                )
+                # **********************
                 # Informar al Monitor explícitamente del resultado del registro
                 try:
                     send_frame(client_socket, f"REGISTER_RESULT#FIRST", central_messages)
@@ -1674,6 +1803,15 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             else:
                 push_message(central_messages, f"[CONN] Reconexión de CP '{cp_id}' desde {address}. Estado: {new_status}")
                 push_message(central_messages, f"[PROTOCOLO] RECONEXION CP {cp_id} (estado {new_status})")
+                # Seva: AUDITORÍA: RECONEXIÓN
+                source_ip = address[0]
+                log_audit_event(
+                    source_ip=source_ip,
+                    action="CP_RECONEXION",
+                    description=f"CP se reconectó a la Central. Estado final: {new_status}",
+                    cp_id=cp_id
+                )
+                # ***************
                 # Informar al Monitor de que la CENTRAL lo considera una reconexión
                 try:
                     send_frame(client_socket, f"REGISTER_RESULT#RECONNECT", central_messages)
@@ -1686,11 +1824,6 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
 
             #Fase2.2.3: Guardamos la referencia del socket para envíos síncronos (autorización/órdenes)
             with active_cp_lock:
-                #¿Por qué guardar el socket?
-                # Central necesita comunicarse con CP más tarde
-                # Ejemplo: Operador escribe "P MAD-01" → Parar MAD-01
-                # 
-                # active_cp_sockets['MAD-01'].sendall(b"PARAR#CENTRAL")
                 active_cp_sockets[cp_id] = client_socket 
                 connected_once_this_session.add(cp_id)
             
@@ -1698,13 +1831,6 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
             
             #FASE 4: Bucle de Escucha de mensajes del CP usando protocolo
             while True:
-                #**¿Qué puede recibir mientras está conectado?**
-                # `FAULT#MAD-01` → Reporte de avería
-                # `RECOVER#MAD-01` → CP recuperado
-                # `ACK#COMANDO` → Confirmación de comando
-                # `NACK#COMANDO` → Rechazo de comando
-                # `EOT` → Fin de transmisión
-                
                 #Paso 4.1: Recibir trama usando protocolo (con timeout para no bloquear)
                 data_string, is_valid = receive_frame(client_socket, central_messages, timeout=5)
                 
@@ -1935,6 +2061,14 @@ def process_user_input(central_messages):
                     if CENTRAL_VERBOSE:
                         print(f"\n[CENTRAL] Iniciando comando PARAR para CP {cp_id}...")
                     central_messages.append(f" Iniciando comando PARAR para CP {cp_id}...")
+                    # Seva: AUDITORÍA: ORDEN MANUAL PARAR ***
+                    log_audit_event(
+                        source_ip="CENTRAL_OPERATOR",
+                        action="OPERADOR_ORDEN_PARAR",
+                        description=f"Operador (Consola) ordenó PARAR el CP. Esperando ACK.",
+                        cp_id=cp_id
+                    )
+                    # **************************************
                     send_cp_command(cp_id, 'PARAR', central_messages)
                 else:
                     print("\n[CENTRAL]  Error: Uso correcto es: P <CP_ID> o PARAR <CP_ID>")
@@ -1946,6 +2080,14 @@ def process_user_input(central_messages):
                     if CENTRAL_VERBOSE:
                         print(f"\n[CENTRAL]  Iniciando comando REANUDAR para CP {cp_id}...")
                     central_messages.append(f" Iniciando comando REANUDAR para CP {cp_id}...")
+                    # Seva: AUDITORÍA: ORDEN MANUAL REANUDAR ***
+                    log_audit_event(
+                        source_ip="CENTRAL_OPERATOR",
+                        action="OPERADOR_ORDEN_REANUDAR",
+                        description=f"Operador (Consola) ordenó REANUDAR el CP. Esperando ACK.",
+                        cp_id=cp_id
+                    )
+                    # *****************************************
                     send_cp_command(cp_id, 'REANUDAR', central_messages)
                 else:
                     print("\n[CENTRAL]  Error: Uso correcto es: R <CP_ID> o REANUDAR <CP_ID>")
@@ -1966,6 +2108,14 @@ def process_user_input(central_messages):
                                 continue
                         except Exception:
                             pass
+                        # Seva: AUDITORÍA: ORDEN MANUAL PARAR TODOS ***
+                        log_audit_event(
+                            source_ip="CENTRAL_OPERATOR",
+                            action="OPERADOR_ORDEN_PARAR_MASIVA",
+                            description=f"Operador (Consola) ordenó PARAR el CP como parte de un comando masivo (PT). Esperando ACK.",
+                            cp_id=cp_id
+                        )
+                        # **********************************************
                         send_cp_command(cp_id, 'PARAR', central_messages)
             
             elif command in ['RA', 'RT', 'REANUDAR_TODOS']:
@@ -1982,6 +2132,14 @@ def process_user_input(central_messages):
                                 continue
                         except Exception:
                             pass
+                        # Seva: AUDITORÍA: ORDEN MANUAL REANUDAR TODOS ***
+                        log_audit_event(
+                            source_ip="CENTRAL_OPERATOR",
+                            action="OPERADOR_ORDEN_REANUDAR_MASIVA",
+                            description=f"Operador (Consola) ordenó REANUDAR el CP como parte de un comando masivo (RT). Esperando ACK.",
+                            cp_id=cp_id
+                        )
+                        # **************************************************
                         send_cp_command(cp_id, 'REANUDAR', central_messages)
             
             # Comando desconocido
