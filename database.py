@@ -65,6 +65,7 @@ def setup_database():
             cursor = conn.cursor()
             
             # Crear tablas si no existen
+            # Seva: nuevo campo symmetric_key para la clave de cifrado simétrico
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS charging_points (
                     id TEXT PRIMARY KEY,
@@ -75,6 +76,7 @@ def setup_database():
                     kwh REAL DEFAULT 0.0,
                     importe REAL DEFAULT 0.0,
                     token TEXT,
+                    symmetric_key TEXT, 
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -149,7 +151,7 @@ def register_cp(cp_id, location, price_per_kwh=0.25):
     except Exception as e:
         print(f"[DB] ERROR al registrar CP {cp_id} en SQLite: {e}")
 
-# Funcion para actualizar el token de seguridad de un CP (Release 2)
+# Juanky:  Funcion para actualizar el token de seguridad de un CP (Release 2)
 def update_cp_token(cp_id, token):
     """Guarda el token de seguridad asignado a un CP."""
     if not USE_SQLITE: return
@@ -163,8 +165,42 @@ def update_cp_token(cp_id, token):
     except Exception as e:
         print(f"[DB] ERROR al actualizar token de {cp_id}: {e}")
 
+# Seva: Funcion para actualizar la clave simétrica de un CP (Release 2)
+def update_cp_symmetric_key(cp_id, symmetric_key):
+    """Guarda la clave simétrica asignada a un CP."""
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            # Usamos symmetric_key (campo nuevo añadido a setup_database)
+            cursor.execute("UPDATE charging_points SET symmetric_key = ? WHERE id = ?", (symmetric_key, cp_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al actualizar clave simétrica de {cp_id}: {e}")
 
-# Funcion para dar de baja (eliminar) un CP (Release 2)
+# Seva: Funcion para que el CP guarde su clave simétrica y token (para persistencia local del Monitor)
+def save_cp_key_locally(cp_id, symmetric_key, token):
+    """Guarda la clave simétrica y el token de autenticación para uso local del CP."""
+    if not USE_SQLITE: return
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            # Usamos INSERT OR REPLACE para actualizar las claves sin perder el CP
+            cursor.execute(
+                """INSERT OR REPLACE INTO charging_points 
+                   (id, symmetric_key, token, status, location, price) 
+                   VALUES (?, ?, ?, 'ACTIVADO', 'Local', 0.25)""", 
+                (cp_id, symmetric_key, token)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR al guardar claves localmente para {cp_id}: {e}")
+
+# Juanky: Funcion para dar de baja (eliminar) un CP (Release 2)
 def delete_cp(cp_id):
     """Elimina un CP de la base de datos."""
     if not USE_SQLITE: return False
@@ -180,6 +216,28 @@ def delete_cp(cp_id):
     except Exception as e:
         print(f"[DB] ERROR al eliminar CP {cp_id}: {e}")
         return False
+
+# Seva: Funcion para revocar las claves de un CP (Release 2)
+def revoke_cp_keys(cp_id):
+    """Establece el token de seguridad y la clave simétrica a NULL y pone el CP FUERA_DE_SERVICIO."""
+    if not USE_SQLITE: return False
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            # Pone ambas claves a NULL y el estado a FUERA_DE_SERVICIO
+            cursor.execute(
+                "UPDATE charging_points SET token = NULL, symmetric_key = NULL, status = 'FUERA_DE_SERVICIO' WHERE id = ?", 
+                (cp_id,)
+            )
+            changes = cursor.rowcount 
+            conn.commit()
+            conn.close()
+            return changes > 0 
+    except Exception as e:
+        print(f"[DB] ERROR al revocar claves de {cp_id}: {e}")
+        return False
+
 
 
 

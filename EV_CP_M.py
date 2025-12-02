@@ -29,12 +29,20 @@ def push_protocol_message(msg):
         monitor_state['protocol_messages'].append(f"{datetime.now().strftime('%H:%M:%S')} - {msg}")
         if len(monitor_state['protocol_messages']) > 5:
             monitor_state['protocol_messages'].pop(0)
+# Seva: funcion para enviar logs a la Central para el Fronted
+def enviar_log_monitor(central_ip, msg):
+    try:
+        url = f"http://{central_ip}:5000/api/log"
+        requests.post(url, json={"source": "MONITOR", "msg": msg}, timeout=1)
+    except:
+        pass
+
 
 # --- Función de Registro HTTPS (Release 2) ---
 def register_in_registry_https(cp_id, location):
     """
-    Se conecta al EV_Registry vía HTTPS para obtener el token de seguridad.
-    Retorna el token si tiene éxito, o None si falla.
+    Se conecta al EV_Registry vía HTTPS para obtener el token de seguridad y la clave simétrica.
+    Retorna (token, symmetric_key) o (None, None) si falla.
     """
     # URL del Registry (Asumimos que está en el puerto 6000 de la IP local o configurada)
     # En un despliegue real, esta IP debería ser un argumento o config.
@@ -54,20 +62,50 @@ def register_in_registry_https(cp_id, location):
         if response.status_code == 200:
             data = response.json()
             token = data.get('token')
+            symmetric_key = data.get('symmetric_key') # Seva: Obtener la clave simétrica del Registry
             print(f"[Monitor] ¡REGISTRO EXITOSO! Token recibido: {token}")
-            return token
+            return token, symmetric_key
         else:
             print(f"[Monitor] Error en registro: {response.status_code} - {response.text}")
-            return None
+            return None, None
             
     except requests.exceptions.ConnectionError:
         print(f"[Monitor] ERROR: No se puede conectar al Registry en {registry_url}.")
         print("[Monitor] Asegúrate de que EV_Registry.py esté ejecutándose.")
-        return None
+        return None, None
     except Exception as e:
         print(f"[Monitor] Error inesperado en registro: {e}")
-        return None
+        return None, None
 
+
+# Seva: --- Función de Baja HTTPS (Release 2) ---
+def unregister_from_registry_https(cp_id, token):
+    """Solicita la baja del CP al Registry."""
+
+    registry_url = "https://127.0.0.1:6000/unregister"
+    
+    payload = {
+        "id": cp_id,
+        "token": token
+    }
+    
+    print(f"\n[Monitor] Solicitando BAJA en {registry_url}...")
+    
+    try:
+        response = requests.post(registry_url, json=payload, verify=False, timeout=5)
+        
+        if response.status_code == 200:
+            print(f"[Monitor] BAJA EXITOSA: {response.json().get('message')}")
+            # Opcional: Borrar claves locales de la BD
+            # database.revoke_cp_keys(cp_id) # Si quisieras borrarlo localmente también
+            return True
+        else:
+            print(f"[Monitor] Error en baja: {response.status_code} - {response.text}")
+            return False
+            
+    except Exception as e:
+        print(f"[Monitor] Error conectando con Registry para baja: {e}")
+        return False
 
 def display_monitor_panel(cp_id):
     """Muestra el panel de monitorización del CP Monitor."""
@@ -148,6 +186,9 @@ monitor_state = {
     'health_messages': [],  # Últimos mensajes de health check
     'protocol_messages': [],  # Últimos mensajes del protocolo
 }
+
+# Seva: Bandera para detener la actualización de la interfaz
+STOP_UI = False
 
 # Lock para proteger envíos/lecturas por el socket compartido con la Central
 central_socket_lock = threading.Lock()
@@ -1179,13 +1220,19 @@ if __name__ == "__main__":
     LOCATION = locations.get(CP_ID, "Ubicacion Desconocida")
 
     # --- NUEVO BLOQUE RELEASE 2: REGISTRO ---
-    # Intentamos obtener el token antes de lanzar los hilos
-    TOKEN_SEGURIDAD = register_in_registry_https(CP_ID, LOCATION)
+    #Intentamos obtener el token y la clave antes de lanzar los hilos
+    TOKEN_SEGURIDAD, CLAVE_SIMETRICA = register_in_registry_https(CP_ID, LOCATION)
     
-    if TOKEN_SEGURIDAD:
+    if TOKEN_SEGURIDAD and CLAVE_SIMETRICA:
         print("[Monitor] Sistema autenticado. Iniciando conexión con Central...")
+        enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] AUTENTICADO.\n   >> Token recibido: {TOKEN_SEGURIDAD}\n   >> Clave recibida: {CLAVE_SIMETRICA}")
+        # Seva: Guardamos la clave simétrica en el estado del monitor para su uso en cifrado
+        with monitor_ui_lock:
+             monitor_state['symmetric_key'] = CLAVE_SIMETRICA
     else:
-        print("[Monitor] ADVERTENCIA: No se obtuvo token. El sistema funcionará en modo Release 1 (inseguro).")
+        print("[Monitor] ADVERTENCIA: No se obtuvo token/clave. El sistema funcionará en modo Release 1 (inseguro).")
+        TOKEN_SEGURIDAD = None
+        CLAVE_SIMETRICA = None
     # ----------------------------------------
 
     #Paso 4: Iniciar conexión con la Central en hilo separado
@@ -1199,7 +1246,7 @@ if __name__ == "__main__":
     #Paso 6: Hilo para actualizar panel visual periódicamente
     def update_panel_periodically():
         """Actualiza el panel visual cada PANEL_UPDATE_INTERVAL segundos."""
-        while True:
+        while not STOP_UI:
             try:
                 display_monitor_panel(CP_ID)
                 time.sleep(PANEL_UPDATE_INTERVAL)
@@ -1222,6 +1269,24 @@ if __name__ == "__main__":
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
+        STOP_UI = True
+        time.sleep(0.5) # Esperar un momento para que el hilo del panel termine su ciclo actual
+        clear_screen()  # Limpiar pantalla para mostrar solo el menú de cierre
+
+        print("\n[Monitor] Deteniendo hilos...")
+        
+        # Seva: OPCIÓN DE DAR DE BAJA AL SALIR ---
+        if 'TOKEN_SEGURIDAD' in locals() and TOKEN_SEGURIDAD:
+            print("-" * 50)
+            print("      OPCIONES DE CIERRE      ")
+            print("-" * 50)
+            try:
+                resp = input("¿Deseas dar de BAJA este CP del Registry antes de apgar el monitor? (s/N): ").strip().lower()
+                if resp == 's':
+                    unregister_from_registry_https(CP_ID, TOKEN_SEGURIDAD)
+            except EOFError:
+                pass
+        # ---------------------------------------------
         if MONITOR_VERBOSE:
             print("\n[Monitor] Deteniendo Monitor...")
         sys.exit(0)

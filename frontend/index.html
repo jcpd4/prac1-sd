@@ -23,6 +23,8 @@
         
         /* Info Clima en tabla */
         .temp-badge { font-size: 0.85em; color: #555; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-top: 4px; display: inline-block;}
+        /* Info Seguridad en tabla */
+        .sec-badge { font-size: 0.75em; color: #155724; background: #d4edda; padding: 2px 6px; border-radius: 4px; display: block; margin-top: 2px;}
 
         /* Logs y Filtros */
         .filter-bar { display: flex; gap: 5px; margin-bottom: 10px; flex-wrap: wrap; }
@@ -35,16 +37,18 @@
         }
         .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; word-wrap: break-word;}
         .log-src { font-weight: bold; margin-right: 5px; }
+        
         .src-CENTRAL { color: #00ff00; }
         .src-REGISTRY { color: #ff00ff; }
         .src-EV_W { color: #00d0ff; }
+        .src-MONITOR { color: #ffff00; }
         
         /* Config */
         .config-box { display: flex; gap: 10px; align-items: center; background: #e9ecef; padding: 10px; border-radius: 5px; }
     </style>
 </head>
 <body>
-    <h1>⚡ Centro de Control EVCharging</h1>
+    <h1>Centro de Control EVCharging</h1>
 
     <div class="container">
         <div style="display:flex; flex-direction:column; gap:20px;">
@@ -57,7 +61,7 @@
             </div>
             
             <div class="card">
-                <h2>⚙️ Configuración Clima</h2>
+                <h2>Configuración Clima</h2>
                 <div class="config-box">
                     <span>Umbral Alerta:</span>
                     <input type="number" id="tempInput" value="0" style="width:60px"> <span>ºC</span>
@@ -68,12 +72,13 @@
         </div>
 
         <div class="card">
-            <h2>📜 Registro de Eventos</h2>
+            <h2>Registro de Eventos</h2>
             <div class="filter-bar">
                 <button class="filter-btn active" onclick="setFilter('ALL')">TODOS</button>
                 <button class="filter-btn" onclick="setFilter('CENTRAL')">CENTRAL</button>
                 <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
                 <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
+                <button class="filter-btn" onclick="setFilter('MONITOR')">MONITOR</button>
             </div>
             <div id="log-console">Conectando...</div>
         </div>
@@ -152,7 +157,14 @@
                         break; 
                     }
                 }
-
+                
+                // Seguridad (Mostrar si tiene token/clave)
+                // Nota: La API debe enviar 'has_keys' o similar si queremos mostrarlo aquí
+                // Por ahora usamos el estado simple
+                let secHtml = "";
+                if(cp.token) {
+                     secHtml = `<span class="sec-badge">🔒 Seguro</span>`;
+                }
                 return `
                 <tr>
                     <td><b>${cp.id}</b></td>

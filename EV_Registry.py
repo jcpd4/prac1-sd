@@ -1,10 +1,12 @@
 # Fichero: EV_Registry.py
 # Módulo de Registro (Release 2) - API REST
 from flask import Flask, request, jsonify
+import requests
 import database
 import uuid # Para generar tokens únicos
 import sys
 from database import log_audit_event # Seva: Importar función de auditoría
+from cryptography.fernet import Fernet # Seva: Importar Fernet para manejo de claves simétricas
 # Configuración
 # El Registry usará un puerto diferente al de la Central (8000) para no chocar.
 # Usaremos el 6000.
@@ -14,6 +16,19 @@ app = Flask(__name__)
 
 # Inicializamos la DB al arrancar para asegurar que existen las tablas
 database.setup_database()
+
+# Seva: URL para enviar logs a la Central (Asumimos localhost:5000)
+CENTRAL_LOG_URL = "http://127.0.0.1:5000/api/log"
+
+def enviar_log_central(msg):
+    """Envía un log a la Central para visualización en el Front."""
+    try:
+        requests.post(CENTRAL_LOG_URL, json={"source": "REGISTRY", "msg": msg}, timeout=1)
+    except:
+        pass # Si falla (ej. Central apagada), no bloquear el Registry
+#---------------------------------------------------------------------
+
+
 
 # --- ENDPOINT 1: Registro de CP (POST /register) ---
 @app.route('/register', methods=['POST'])
@@ -35,21 +50,23 @@ def register_cp():
 
     try:
         # 2. Generar credencial segura (Token)
-        # En un sistema real esto sería un certificado o una key compleja.
-        # Para la práctica, un UUID v4 es suficiente y seguro.
         token = str(uuid.uuid4())
+        # Seva: Generar Clave Simétrica ÚNICA para el CP
+        symmetric_key = Fernet.generate_key().decode()
         
         # 3. Guardar en Base de Datos (Compartida con Central)
         # Usamos las funciones de database.py
         database.register_cp(cp_id, location) # Crea el registro
         database.update_cp_token(cp_id, token) # Guarda el token
+        database.update_cp_symmetric_key(cp_id, symmetric_key) # Seva: Guardar la nueva clave simétrica en la BD
         
-        print(f"[Registry] CP {cp_id} registrado con éxito. Token generado.")
-        
-        # 4. Devolver el token al CP
+        print(f"[Registry] CP {cp_id} registrado con éxito. Token y Clave Simétrica generados.")
+        enviar_log_central(f"CP {cp_id} REGISTRADO.\n   >> Token: {token}\n   >> Clave: {symmetric_key}")
+        # 4. Devolver el token y la clave simétrica al CP
         return jsonify({
             "message": "CP registrado correctamente",
-            "token": token
+            "token": token,
+            "symmetric_key": symmetric_key 
         }), 200
         
     except Exception as e:
@@ -83,6 +100,7 @@ def unregister_cp():
         )
         # *************************************
         print(f"[Registry] CP {cp_id} eliminado.")
+        enviar_log_central(f"CP {cp_id} dado de baja correctamente.")
         return jsonify({"message": f"CP {cp_id} dado de baja correctamente"}), 200
     else:
         return jsonify({"error": "CP no encontrado o no se pudo eliminar"}), 404
