@@ -42,6 +42,7 @@
         .src-REGISTRY { color: #ff00ff; }
         .src-EV_W { color: #00d0ff; }
         .src-MONITOR { color: #ffff00; }
+        .src-ENGINE { color: #1455eb; }
         
         /* Config */
         .config-box { display: flex; gap: 10px; align-items: center; background: #e9ecef; padding: 10px; border-radius: 5px; }
@@ -79,6 +80,7 @@
                 <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
                 <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
                 <button class="filter-btn" onclick="setFilter('MONITOR')">MONITOR</button>
+                <button class="filter-btn" onclick="setFilter('ENGINE')">ENGINE</button>
             </div>
             <div id="log-console">Conectando...</div>
         </div>
@@ -157,7 +159,7 @@
                         break; 
                     }
                 }
-                
+
                 // Seguridad (Mostrar si tiene token/clave)
                 // Nota: La API debe enviar 'has_keys' o similar si queremos mostrarlo aquí
                 // Por ahora usamos el estado simple

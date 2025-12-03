@@ -277,6 +277,24 @@ def get_cp_status(cp_id):
         print(f"[DB] ERROR al obtener estado de {cp_id} en SQLite: {e}")
     return status
 
+# Seva: Funcion para obtener la clave simétrica de un CP
+def get_cp_symmetric_key(cp_id):
+    """Recupera la clave simétrica de un CP desde la BD."""
+    if not USE_SQLITE: return None
+    key = None
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT symmetric_key FROM charging_points WHERE id = ?", (cp_id,))
+            result = cursor.fetchone()
+            if result:
+                key = result[0]
+            conn.close()
+    except Exception as e:
+        print(f"[DB] ERROR obteniendo clave de {cp_id}: {e}")
+    return key
+
 # Funcion para obtener todos los CPs de la BD SQLite (1)
 def get_all_cps():
     """Obtiene todos los CPs de la BD SQLite y los devuelve como una lista de diccionarios."""

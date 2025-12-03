@@ -5,9 +5,10 @@ import time
 import os
 import json
 import database
+import requests
 from kafka import KafkaProducer # Usado para enviar telemetría a Central (asíncrono)
 from kafka.errors import NoBrokersAvailable
-
+from cryptography.fernet import Fernet # Seva: Importar Fernet para manejo de claves simétricas
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
 # Constantes del protocolo
@@ -291,6 +292,7 @@ def send_nack(socket_ref):
 
 # --- Variables de Estado del Engine ---
 ENGINE_STATUS = {"health": "OK", "is_charging": False, "driver_id": None}
+SYMMETRIC_KEY = None # Seva: Variable para guardar la clave en memoria
 KAFKA_PRODUCER = None 
 TELEMETRY_BUFFER = []  # Buffer de resiliencia cuando el broker no está disponible
 LAST_MONITOR_TS = 0.0   # Marca de tiempo del último latido/orden del Monitor
@@ -304,6 +306,15 @@ status_lock = threading.Lock()
 # Topic que espera la CENTRAL
 KAFKA_TOPIC_TELEMETRY = "cp_telemetry"
 
+# Seva: Función para reportar mensajes del Engine a la Central
+def enviar_log_central(mensaje):
+    """Envía cualquier log (info o error) a la API de la Central."""
+    try:
+        url = "http://127.0.0.1:5000/api/log"
+        # El source es ENGINE para que el front sepa colorearlo
+        requests.post(url, json={"source": "ENGINE", "msg": mensaje}, timeout=0.5)
+    except Exception:
+        pass
 
 # Funcion Productor Kafka para mandar la telemetria ---
 def init_kafka_producer(broker):
@@ -366,44 +377,60 @@ def init_kafka_producer(broker):
             #Paso 1.7: Lanzar hilo de reintento para reconectar en background
             threading.Thread(target=lambda: time.sleep(1) or init_kafka_producer(broker), daemon=True).start()
 
-#Funcion para enviar la telemetria a la central
+# Seva: Funcion para enviar la telemetria a la central (modificada para cifrado)
 def send_telemetry_message(payload):
-    """Envía payload JSON al topic cp_telemetry. No lanza si producer no existe."""
-    global KAFKA_PRODUCER
+    """Envía payload cifrado a Kafka. Si no hay clave, BLOQUEA el envío."""
+    global KAFKA_PRODUCER, SYMMETRIC_KEY
     
-    #Paso 1: Validar tipos de mensajes que pueden enviarse sin carga activa
+    # 1. Validaciones de estado 
     msg_type = payload.get('type', '').upper()
-    if msg_type in ['AVERIADO', 'CONEXION_PERDIDA', 'FAULT', 'SESSION_STARTED', 'SUPPLY_END']:
-        #Paso 1.1: Estos mensajes pueden enviarse sin estar cargando
-        pass
-    else:
-        #Paso 1.2: Para mensajes de consumo, validar que hay driver activo
+    if msg_type not in ['AVERIADO', 'CONEXION_PERDIDA', 'FAULT', 'SESSION_STARTED', 'SUPPLY_END']:
         with status_lock:
             if not ENGINE_STATUS.get('is_charging') or not ENGINE_STATUS.get('driver_id'):
-                #Paso 1.2.1: Bloquear telemetría si no hay conductor activo
-                print(f"[ENGINE] AVISO: Telemetría de consumo bloqueada - no hay conductor activo autorizado.")
                 return
     
-    
-    #Paso 2: Verificar que el productor esté inicializado
+    # 2. Validación de Kafka 
     if KAFKA_PRODUCER is None:
         TELEMETRY_BUFFER.append(payload)
-        print(f"[ENGINE] AVISO: Broker no disponible. Telemetría en buffer ({len(TELEMETRY_BUFFER)} pendientes).")
+        print(f"[ENGINE] AVISO: Broker no disponible. Telemetría en buffer.")
+        # Opcional: reportar_error_central(f"[{CP_ID}] Kafka no disponible")
         return
+
+    # CIFRADO ESTRICTO CON REPORTE AL FRONT ---
+    
+    # Caso 1: No hay clave configurada
+    if not SYMMETRIC_KEY:
+        msg_error = f"[{CP_ID}] ERROR CRÍTICO: Sin Clave Simétrica. Telemetría bloqueada."
+        print(f"[ENGINE] {msg_error}")
+        
+        # Reportar al Front-end
+        enviar_log_central(msg_error)
+        return 
+
     try:
-        # Enviar pendientes primero
-        if TELEMETRY_BUFFER:
-            for p in list(TELEMETRY_BUFFER):
-                try:
-                    KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=p)
-                    TELEMETRY_BUFFER.remove(p)
-                except Exception:
-                    break
-        KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=payload)
+        f = Fernet(SYMMETRIC_KEY)
+        # 1. Convertir a JSON string
+        json_str = json.dumps(payload)
+        # 2. Cifrar
+        token = f.encrypt(json_str.encode('utf-8'))
+        
+        # 3. Empaquetar
+        final_payload = {
+            "cp_id": CP_ID, 
+            "ciphertext": token.decode('utf-8'),
+            "encrypted": True
+        }
+        
+        # Enviar
+        KAFKA_PRODUCER.send(KAFKA_TOPIC_TELEMETRY, value=final_payload)
         KAFKA_PRODUCER.flush()
+        
     except Exception as e:
-        print(f"[ENGINE] Error enviando telemetry: {e}. Guardando en buffer.")
-        TELEMETRY_BUFFER.append(payload)
+        msg_error = f"[{CP_ID}] ERROR CIFRADO: {e}. Mensaje descartado."
+        print(f"[ENGINE] {msg_error}")
+        
+        # Reportar al Front-end
+        enviar_log_central(msg_error)
 
 # --- Funciones de Utilidad ---
 def clear_screen():
@@ -581,6 +608,18 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                     # Esperar ACK del Monitor
                     ack_response = monitor_socket.recv(1)
             
+            # Seva: Comando para recibir la clave simétrica desde el Monitor
+            elif data_string.startswith("SET_KEY"):
+                parts = data_string.split('#')
+                if len(parts) >= 2:
+                    global SYMMETRIC_KEY
+                    SYMMETRIC_KEY = parts[1]
+                    add_protocol_message(f"← Clave Simétrica recibida y configurada.")
+                    enviar_log_central(f"[{CP_ID}] Clave Simétrica recibida del Monitor. Cifrado ACTIVADO.")
+                    send_frame(monitor_socket, "ACK#SET_KEY", silent=is_health_check)
+                else:
+                    send_frame(monitor_socket, "NACK#SET_KEY")
+
             #Paso 4.5: Comando desconocido
             else:
                 #Paso 4.5.1: Responder con error para comandos no reconocidos usando protocolo
@@ -816,6 +855,7 @@ def process_user_input():
                     else:
                         #Paso 2.3.5: Iniciar suministro
                         print(f"[ENGINE] Iniciando suministro para driver {driver_id}...")
+                        enviar_log_central(f"[{CP_ID}] Inicio manual de carga (INIT). Driver: {driver_id}")
                         with status_lock:
                             ENGINE_STATUS['is_charging'] = True
                             ENGINE_STATUS['driver_id'] = driver_id
@@ -843,6 +883,7 @@ def process_user_input():
                         print(f"[ENGINE] Finalizando suministro...")
                         ENGINE_STATUS['is_charging'] = False
                         print(f"[ENGINE] *** SUMINISTRO FINALIZADO ***. Notificando a Central...")
+                        enviar_log_central(f"[{CP_ID}] Fin manual de carga (END).")
                     else:
                         #Paso 2.4.2: No hay suministro activo
                         print(f"[ENGINE] No hay suministro activo para finalizar.")
@@ -897,7 +938,9 @@ if __name__ == "__main__":
         display_thread.start()
 
         # Paso 5.3: Iniciar el hilo principal para la entrada de comandos del usuario
-        print("Engine iniciado. Listo para comandos. Presiona Ctrl+C para detener.")
+        start_msg = f"Engine {CP_ID} INICIADO. Esperando Monitor en puerto {ENGINE_PORT}..."
+        print(start_msg)
+        enviar_log_central(start_msg)
         process_user_input()
            
            #Si alguien pone letras donde debería ir un número

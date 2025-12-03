@@ -1229,6 +1229,38 @@ if __name__ == "__main__":
         # Seva: Guardamos la clave simétrica en el estado del monitor para su uso en cifrado
         with monitor_ui_lock:
              monitor_state['symmetric_key'] = CLAVE_SIMETRICA
+        
+        # --- Seva : ENVIAR CLAVE AL ENGINE LOCAL ---
+        try:
+            print("[Monitor] Enviando clave simétrica al Engine...")
+            # Esperamos un poco para asegurar que el Engine haya arrancado su servidor de sockets
+            time.sleep(2) 
+            
+            # Creamos un socket temporal solo para configurar la clave
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((ENGINE_IP, ENGINE_PORT))
+            
+            # 1. Handshake inicial
+            if handshake_client(sock, silent=True):
+                # 2. Enviar la clave usando el protocolo
+                # Comando: SET_KEY#<CLAVE>
+                if send_frame(sock, f"SET_KEY#{CLAVE_SIMETRICA}"):
+                    # 3. Esperar confirmación (ACK#SET_KEY)
+                    resp, _ = receive_frame(sock, timeout=2, silent=True)
+                    if resp and "ACK" in resp:
+                        print("[Monitor] Clave configurada en el Engine correctamente.")
+                        enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] Clave inyectada en Engine con éxito.")
+                    else:
+                        print(f"[Monitor] Engine no confirmó recepción de clave: {resp}")
+            
+            sock.close()
+            
+        except Exception as e:
+            err_msg = f"Error enviando clave al Engine: {e}"
+            print(f"[Monitor] {err_msg}")
+            print("Asegúrate de que el Engine (EV_CP_E.py) esté corriendo antes que el Monitor.")
+            enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] FALLO al inyectar clave en Engine.")
+        # --------------------------------------------------
     else:
         print("[Monitor] ADVERTENCIA: No se obtuvo token/clave. El sistema funcionará en modo Release 1 (inseguro).")
         TOKEN_SEGURIDAD = None

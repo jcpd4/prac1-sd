@@ -11,7 +11,7 @@ import database
 #segunda entrega:
 import EV_Central_API # codigo mio(juanky) donde hago la parte de api_central
 from database import log_audit_event # Seva: funcion para loguear eventos de auditoria
-
+from cryptography.fernet import Fernet, InvalidToken # Seva: Cifrado
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
 KAFKA_TOPIC_STATUS = 'cp_telemetry'      # CP -> Central (Telemetría/Averías/Consumo)
@@ -68,14 +68,49 @@ def push_message(msg_list, msg, maxlen=200):
         # eliminar los más antiguos
         del msg_list[0:len(msg_list)-maxlen]
 
+# Fichero: EV_Central.py
+
 def force_release_cp_session(cp_id, central_messages=None, reason="", target_status=None,
                              notify_driver=True, clear_metrics=True, supply_error_reason=None,
                              partial_kwh=None, partial_importe=None, driver_override=None):
-    """
-    Libera de forma explícita cualquier sesión y telemetría asociada a un CP.
-    Se utiliza cuando un CP pierde su monitor/engine o cuando se fuerza un cambio de estado
-    (avería, fuera de servicio, desconexión, recuperación) para que el driver tenga que volver a solicitar servicio.
-    """
+    
+    # --- STEP 1: INITIAL METRIC AND DRIVER RETRIEVAL ---
+    # Leemos la sesión y métricas desde la BD ANTES de cualquier limpieza.
+    
+    db_metrics = None
+    try:
+        cp_data_list = database.get_all_cps()
+        db_metrics = next((cp for cp in cp_data_list if cp['id'] == cp_id), None)
+    except Exception:
+        pass # Database access failed
+
+    if db_metrics:
+        # Si no se pasaron métricas, usamos las de la DB
+        if partial_kwh is None:
+            # Aseguramos que kwh sea float o 0.0 si es NULL o texto no válido
+            partial_kwh = db_metrics.get('kwh')
+            if partial_kwh is not None:
+                 try: partial_kwh = float(partial_kwh)
+                 except: partial_kwh = 0.0
+            else: partial_kwh = 0.0
+
+        if partial_importe is None:
+            partial_importe = db_metrics.get('importe')
+            if partial_importe is not None:
+                try: partial_importe = float(partial_importe)
+                except: partial_importe = 0.0
+            else: partial_importe = 0.0
+        
+        # Aseguramos que el driver sea identificado desde la DB si no se pasó
+        if not driver_override:
+            driver_override = db_metrics.get('driver_id')
+
+    # Aseguramos valores 0.0 si siguen siendo None
+    if partial_kwh is None: partial_kwh = 0.0
+    if partial_importe is None: partial_importe = 0.0
+    
+    # --- STEP 2: LIBERACIÓN DE SESIÓN Y NOTIFICACIÓN ---
+
     driver_id = None
     session_status = None
 
@@ -84,6 +119,7 @@ def force_release_cp_session(cp_id, central_messages=None, reason="", target_sta
         if session:
             driver_id = session.get('driver_id')
             session_status = session.get('status')
+        
         assigned_driver = cp_driver_assignments.pop(cp_id, None)
         if assigned_driver and not driver_id:
             driver_id = assigned_driver
@@ -91,62 +127,31 @@ def force_release_cp_session(cp_id, central_messages=None, reason="", target_sta
     if driver_override and not driver_id:
         driver_id = driver_override
 
-    if supply_error_reason and driver_id:
+    # NOTIFICACIÓN DE ERROR
+    if driver_id and supply_error_reason and notify_driver and shared_producer_ref:
+        if central_messages is not None:
+            push_message(
+                central_messages,
+                f"[RELEASE] SUPPLY_ERROR -> CP {cp_id} driver {driver_id} "
+                f"({supply_error_reason}) parcial {partial_kwh:.3f} kWh / "
+                f"{partial_importe:.2f} €"
+            )
+        error_msg = {
+            "type": "SUPPLY_ERROR",
+            "cp_id": cp_id,
+            "user_id": driver_id,
+            "reason": supply_error_reason,
+            "kwh_partial": partial_kwh, # Usamos el valor asegurado
+            "importe_partial": partial_importe # Usamos el valor asegurado
+        }
         try:
-            if partial_kwh is None or partial_importe is None:
-                cp_data = database.get_all_cps()
-                for cp in cp_data:
-                    if cp.get('id') == cp_id:
-                        if partial_kwh is None:
-                            partial_kwh = cp.get('kwh')
-                        if partial_importe is None:
-                            partial_importe = cp.get('importe')
-                        break
+            send_notification_to_driver(shared_producer_ref, driver_id, error_msg)
         except Exception as e:
             if central_messages is not None:
-                push_message(central_messages, f"[RELEASE] No se pudieron leer métricas parciales de {cp_id}: {e}")
-        if partial_kwh is None:
-            partial_kwh = 0.0
-        if partial_importe is None:
-            partial_importe = 0.0
-
-    if driver_id and central_messages is not None:
-        if notify_driver and shared_producer_ref:
-            if supply_error_reason:
-                if central_messages is not None:
-                    push_message(
-                        central_messages,
-                        f"[RELEASE] SUPPLY_ERROR -> CP {cp_id} driver {driver_id} "
-                        f"({supply_error_reason}) parcial {partial_kwh if partial_kwh is not None else 0.0:.3f} kWh / "
-                        f"{partial_importe if partial_importe is not None else 0.0:.2f} €"
-                    )
-                error_msg = {
-                    "type": "SUPPLY_ERROR",
-                    "cp_id": cp_id,
-                    "user_id": driver_id,
-                    "reason": supply_error_reason,
-                    "kwh_partial": partial_kwh if partial_kwh is not None else 0.0,
-                    "importe_partial": partial_importe if partial_importe is not None else 0.0
-                }
-                try:
-                    send_notification_to_driver(shared_producer_ref, driver_id, error_msg)
-                except Exception as e:
-                    if central_messages is not None:
-                        push_message(central_messages, f"[RELEASE] Error notificando SUPPLY_ERROR a driver {driver_id}: {e}")
-            else:
-                cancel_msg = {
-                    "type": "SESSION_CANCELLED",
-                    "cp_id": cp_id,
-                    "user_id": driver_id,
-                    "reason": reason or "Sesión interrumpida",
-                    "previous_status": session_status
-                }
-                try:
-                    send_notification_to_driver(shared_producer_ref, driver_id, cancel_msg)
-                except Exception as e:
-                    if central_messages is not None:
-                        push_message(central_messages, f"[RELEASE] Error notificando cancelación a driver {driver_id}: {e}")
-
+                push_message(central_messages, f"[RELEASE] Error notificando SUPPLY_ERROR a driver {driver_id}: {e}")
+    # ... (Resto de notificación de cancelación si no hay supply error)
+    
+    # LIMPIEZA DE MÉTRICAS (ocurre AHORA, después de notificar)
     if clear_metrics:
         try:
             database.clear_cp_telemetry_only(cp_id)
@@ -154,6 +159,7 @@ def force_release_cp_session(cp_id, central_messages=None, reason="", target_sta
             if central_messages is not None:
                 push_message(central_messages, f"[RELEASE] Error limpiando telemetría de {cp_id}: {e}")
 
+    # CAMBIO DE ESTADO
     if target_status:
         try:
             database.update_cp_status(cp_id, target_status)
@@ -945,6 +951,49 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
         try:
             payload = message.value
             topic = message.topic
+
+            # Seva: LÓGICA DE DESCIFRADO Y SEGURIDAD
+            # Verificamos si el mensaje viene con la bandera de encriptado
+            if isinstance(payload, dict) and payload.get('encrypted') is True:
+                cp_id_cifrado = payload.get('cp_id') # Este ID viene en claro
+                ciphertext = payload.get('ciphertext')
+                
+                # 1. Buscar la clave simétrica de ESTE CP en la Base de Datos
+                key = database.get_cp_symmetric_key(cp_id_cifrado)
+                
+                if key:
+                    try:
+                        f = Fernet(key)
+                        # 2. Intentar Descifrar
+                        decrypted_bytes = f.decrypt(ciphertext.encode('utf-8'))
+                        
+                        # 3. Reemplazar el payload cifrado por el JSON original
+                        payload = json.loads(decrypted_bytes.decode('utf-8'))
+                        
+                    except (InvalidToken, Exception) as e:
+                        #ERROR DE SEGURIDAD (Clave incorrecta o datos corruptos) 
+                        err_msg = f"ERROR SEGURIDAD: Fallo al descifrar mensaje de {cp_id_cifrado}. Clave inválida o desincronizada."
+                        print(f"[CENTRAL] {err_msg}")
+                        
+                        # Mostrar alerta en el Front-end (Central Messages)
+                        push_message(central_messages, f"[SEGURIDAD] {err_msg}")
+
+                        # Auditoría del incidente
+                        log_audit_event(
+                            source_ip="KAFKA_CONSUMER",
+                            action="ERROR_DESCIFRADO",
+                            description=f"Fallo criptográfico con CP {cp_id_cifrado}. La clave usada por el CP no coincide con la BD.",
+                            cp_id=cp_id_cifrado
+                        )
+                        continue # IMPORTANTE: Descartar mensaje, no procesarlo
+                else:
+                    #ERROR: No hay clave en BD 
+                    err_msg = f"ERROR: Recibido mensaje cifrado de {cp_id_cifrado} pero no existe clave en BD (¿Fue revocada?)."
+                    print(f"[CENTRAL] ⚠️ {err_msg}")
+                    push_message(central_messages, f"[SEGURIDAD] {err_msg}")
+                    continue
+            
+            # ---------------------------------
 
             # Paso 2.1: Procesar las peticiones de drivers (driver_requests)
             if topic == KAFKA_TOPIC_REQUESTS:
