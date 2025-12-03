@@ -21,68 +21,74 @@
         .bg-FUERA_DE_SERVICIO { background-color: #fd7e14; }
         .bg-DESCONECTADO { background-color: #6c757d; }
         
-        /* Info Clima en tabla */
-        .temp-badge { font-size: 0.85em; color: #555; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-top: 4px; display: inline-block;}
-        /* Info Seguridad en tabla */
-        .sec-badge { font-size: 0.75em; color: #155724; background: #d4edda; padding: 2px 6px; border-radius: 4px; display: block; margin-top: 2px;}
-
-        /* Logs y Filtros */
-        .filter-bar { display: flex; gap: 5px; margin-bottom: 10px; flex-wrap: wrap; }
-        .filter-btn { padding: 5px 10px; border: 1px solid #ccc; background: #f8f9fa; cursor: pointer; border-radius: 4px; font-size: 0.8em; }
-        .filter-btn.active { background: #007bff; color: white; border-color: #007bff; }
+        /* Info Clima */
+        .temp-badge { font-size: 0.85em; color: #333; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-left: 5px;}
         
+        /* Botones Acción */
+        .btn-revoke { background-color: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
+        .btn-revoke:hover { background-color: #c82333; }
+        .btn-disabled { background-color: #ccc; cursor: not-allowed; }
+
+        /* Logs */
         #log-console { 
-            background: #1e1e1e; color: #eee; height: 400px; overflow-y: auto; 
+            background: #1e1e1e; color: #eee; height: 500px; overflow-y: auto; 
             padding: 10px; font-family: 'Consolas', monospace; font-size: 0.85em; border-radius: 4px;
         }
-        .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; word-wrap: break-word;}
-        .log-src { font-weight: bold; margin-right: 5px; }
-        
+        .log-line { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; }
         .src-CENTRAL { color: #00ff00; }
         .src-REGISTRY { color: #ff00ff; }
         .src-EV_W { color: #00d0ff; }
         .src-MONITOR { color: #ffff00; }
         .src-ENGINE { color: #1455eb; }
-        
-        /* Config */
-        .config-box { display: flex; gap: 10px; align-items: center; background: #e9ecef; padding: 10px; border-radius: 5px; }
+        .src-SECURITY { color: #ff4444; font-weight: bold; } /* Nuevo color para seguridad */
+
+        /* Filtros */
+        .filter-bar { margin-bottom: 10px; display: flex; gap: 5px; flex-wrap: wrap;}
+        .filter-btn { padding: 5px; cursor: pointer; border: 1px solid #ddd; border-radius: 3px; }
+        .filter-btn.active { background-color: #007bff; color: white; }
     </style>
 </head>
 <body>
-    <h1>Centro de Control EVCharging</h1>
+    <h1> EVCharging - Panel de Control</h1>
 
     <div class="container">
         <div style="display:flex; flex-direction:column; gap:20px;">
             <div class="card">
-                <h2>Estado de CPs</h2>
+                <h2>📡 Estado de Puntos de Recarga (CPs)</h2>
                 <table id="tabla-cps">
-                    <thead><tr><th>ID</th><th>Ubicación / Clima</th><th>Estado</th><th>Info</th></tr></thead>
-                    <tbody><tr><td colspan="4">Cargando...</td></tr></tbody>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Ubicación / Clima</th>
+                            <th>Estado</th>
+                            <th>Info Suministro</th>
+                            <th>Acciones de Seguridad</th> </tr>
+                    </thead>
+                    <tbody><tr><td colspan="5">Esperando datos...</td></tr></tbody>
                 </table>
             </div>
             
             <div class="card">
-                <h2>Configuración Clima</h2>
-                <div class="config-box">
-                    <span>Umbral Alerta:</span>
-                    <input type="number" id="tempInput" value="0" style="width:60px"> <span>ºC</span>
-                    <button onclick="cambiarUmbral()" style="background:#28a745; color:white; border:none; padding:5px 10px; cursor:pointer;">Actualizar</button>
+                <h2>🌡️ Configuración Climática (EV_W)</h2>
+                <div style="display:flex; align-items:center; gap:10px;">
+                    <label>Umbral de Temperatura (Alerta Frío):</label>
+                    <input type="number" id="tempInput" value="0" style="width:60px; padding:5px;"> <span>ºC</span>
+                    <button onclick="cambiarUmbral()" style="background:#28a745; color:white; border:none; padding:6px 12px; cursor:pointer; border-radius:4px;">Actualizar Umbral</button>
                 </div>
-                <p style="font-size: 0.8em; color: #666; margin-top:5px;">Si Temp. Real < Umbral -> Se enviará orden de PARAR.</p>
             </div>
         </div>
 
         <div class="card">
-            <h2>Registro de Eventos</h2>
+            <h2> Eventos en Tiempo Real</h2>
             <div class="filter-bar">
                 <button class="filter-btn active" onclick="setFilter('ALL')">TODOS</button>
+                <button class="filter-btn" onclick="setFilter('SECURITY')"> SEGURIDAD</button> <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
                 <button class="filter-btn" onclick="setFilter('CENTRAL')">CENTRAL</button>
-                <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
                 <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
                 <button class="filter-btn" onclick="setFilter('MONITOR')">MONITOR</button>
                 <button class="filter-btn" onclick="setFilter('ENGINE')">ENGINE</button>
             </div>
-            <div id="log-console">Conectando...</div>
+            <div id="log-console">Conectando con API Central...</div>
         </div>
     </div>
 
@@ -90,38 +96,67 @@
         const API = 'http://127.0.0.1:5000/api';
         let currentFilter = 'ALL';
         let allLogs = [];
-        let cityTemps = {}; // Guardaremos las temperaturas aquí
+        let cityTemps = {}; 
 
         async function update() {
             try {
-                // 1. Estado General y Temps
+                // 1. Obtener Estado
                 const res = await fetch(`${API}/estado`);
                 const data = await res.json();
                 
-                cityTemps = data.city_temps || {}; // Actualizar temps globales
-                renderTable(data.cps); // Repintar tabla
+                cityTemps = data.city_temps || {}; 
                 
+                // Actualizar placeholder del input si no tiene foco
                 if(document.activeElement.id !== 'tempInput') {
-                    document.getElementById('tempInput').placeholder = data.config.temp_umbral;
+                    document.getElementById('tempInput').value = data.config.temp_umbral;
                 }
 
-                // 2. Logs
+                renderTable(data.cps);
+
+                // 2. Obtener Logs
                 const resLog = await fetch(`${API}/logs`);
                 const dataLog = await resLog.json();
                 allLogs = dataLog.logs;
                 renderLogs();
 
-            } catch (e) { console.error(e); }
+            } catch (e) { 
+                console.error("Error conectando con API:", e); 
+            }
         }
 
+        // --- ACCIONES ---
+        
         async function cambiarUmbral() {
             const val = document.getElementById('tempInput').value;
             await fetch(`${API}/config/umbral`, {
                 method: 'POST', headers:{'Content-Type':'application/json'},
                 body: JSON.stringify({umbral: val})
             });
-            alert("Umbral actualizado");
+            alert("Umbral actualizado. EV_W detendrá CPs si baja de esa temperatura.");
         }
+
+        async function revocarClaves(cpId) {
+            if(!confirm(`¿ESTÁS SEGURO?\n\nEsto simulará una brecha de seguridad en ${cpId}.\n\n1. Se borrarán sus claves en BD.\n2. La Central rechazará su conexión.\n3. El CP debería intentar re-autenticarse automáticamente.`)) return;
+
+            try {
+                const res = await fetch(`${API}/admin/revoke-key`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({cp_id: cpId})
+                });
+                const data = await res.json();
+                if(res.ok) {
+                    alert(`✅ ${data.message}`);
+                    update(); // Refrescar tabla inmediato
+                } else {
+                    alert(`❌ Error: ${data.error}`);
+                }
+            } catch(e) {
+                alert("Error de conexión con Central API");
+            }
+        }
+
+        // --- RENDERIZADO ---
 
         function setFilter(filter) {
             currentFilter = filter;
@@ -132,54 +167,77 @@
 
         function renderLogs() {
             const div = document.getElementById('log-console');
-            const filtered = currentFilter === 'ALL' ? allLogs : allLogs.filter(l => l.source === currentFilter);
+            
+            // Filtrado
+            const filtered = allLogs.filter(l => {
+                if(currentFilter === 'ALL') return true;
+                if(currentFilter === 'SECURITY') return l.msg.includes('SEGURIDAD') || l.msg.includes('Token') || l.msg.includes('Clave');
+                return l.source === currentFilter;
+            });
             
             div.innerHTML = filtered.map(l => {
-                // Corrección [object Object]: Convertir a string si es necesario
-                let txt = (typeof l.msg === 'object') ? JSON.stringify(l.msg) : l.msg;
-                
-                // Colores por fuente
+                let msg = (typeof l.msg === 'object') ? JSON.stringify(l.msg) : l.msg;
                 let src = l.source;
-                if(src === 'CENTRAL') {
-                    if(txt.includes('[CLIMA]')) src = 'EV_W';
-                    if(txt.includes('REGISTRO')) src = 'REGISTRY';
+                
+                // Detectar mensajes de seguridad para colorearlos especial
+                if(msg.includes('SEGURIDAD') || msg.includes('REVOCADAS') || msg.includes('Clave')) {
+                    src = 'SECURITY';
+                } else if(src === 'CENTRAL') {
+                    if(msg.includes('[CLIMA]')) src = 'EV_W';
+                    if(msg.includes('REGISTRO')) src = 'REGISTRY';
                 }
-                return `<div class="log-line"><span class="log-src src-${src}">[${src}]</span> ${txt}</div>`;
+
+                return `<div class="log-line">
+                            <span style="color:#888; font-size:0.8em;">[${new Date(l.timestamp * 1000).toLocaleTimeString()}]</span>
+                            <span class="log-src src-${src}">[${src}]</span> 
+                            ${msg}
+                        </div>`;
             }).join('');
-            div.scrollTop = div.scrollHeight;
+            
+            // Auto-scroll solo si estamos abajo
+            // div.scrollTop = div.scrollHeight; 
         }
 
         function renderTable(cps) {
-            document.querySelector('#tabla-cps tbody').innerHTML = cps.map(cp => {
-                // Buscar temperatura correspondiente a la ubicación del CP
+            const tbody = document.querySelector('#tabla-cps tbody');
+            if(!cps || cps.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay CPs registrados en la Base de Datos.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = cps.map(cp => {
+                // Clima
                 let tempHtml = "";
                 for (const city in cityTemps) {
-                    if (cp.location.toLowerCase().includes(city.toLowerCase())) {
-                        tempHtml = `<br><span class="temp-badge">🌡️ ${cityTemps[city]}ºC</span>`;
+                    if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
+                        tempHtml = `<span class="temp-badge">🌡️ ${cityTemps[city]}ºC</span>`;
                         break; 
                     }
                 }
 
-                // Seguridad (Mostrar si tiene token/clave)
-                // Nota: La API debe enviar 'has_keys' o similar si queremos mostrarlo aquí
-                // Por ahora usamos el estado simple
-                let secHtml = "";
-                if(cp.token) {
-                     secHtml = `<span class="sec-badge">🔒 Seguro</span>`;
+                // Estado de claves (Simulado: si status no es 'FUERA_DE_SERVICIO' asumimos que tiene claves)
+                let hasKeys = (cp.status !== 'FUERA_DE_SERVICIO' && cp.status !== 'DESCONECTADO');
+                
+                // Botón Revocar
+                let btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')">REVOCAR CLAVES</button>`;
+                
+                // Si ya está revocado/fuera de servicio, deshabilitamos el botón visualmente
+                if(cp.status === 'FUERA_DE_SERVICIO') {
+                    btnRevoke = `<span style="color:orange; font-weight:bold;"></span>`;
                 }
+
                 return `
                 <tr>
                     <td><b>${cp.id}</b></td>
-                    <td>
-                        ${cp.location}
-                        ${tempHtml} </td>
+                    <td>${cp.location} ${tempHtml}</td>
                     <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
-                    <td>${cp.status==='SUMINISTRANDO' ? cp.kwh.toFixed(2)+'kWh' : '-'}</td>
+                    <td>${cp.status==='SUMINISTRANDO' ? ` ${cp.kwh?.toFixed(2)} kWh` : '<span style="color:#ccc;">-</span>'}</td>
+                    <td>${btnRevoke}</td>
                 </tr>`;
             }).join('');
         }
 
-        setInterval(update, 1000);
+        setInterval(update, 2000); // Refresco cada 2s
         update();
     </script>
 </body>

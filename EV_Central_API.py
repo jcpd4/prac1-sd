@@ -15,6 +15,7 @@ CONTEXT = {
     "connected_drivers": set(),
     "active_cp_sockets": {},
     "send_command_func": None,
+    "city_temps": {}, # Seva: Almacén de temperaturas actuales
     "config": {
         "temp_umbral": 0.0      # Configuración modificable
     }
@@ -23,7 +24,6 @@ CONTEXT = {
 # Lista para guardar logs que vienen de otros módulos (Registry, Weather, etc.)
 # Formato: {'timestamp': float, 'source': 'REGISTRY', 'msg': 'Texto...'}
 EXTERNAL_LOGS = []
-
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
@@ -46,52 +46,61 @@ def get_system_status():
             "cps": all_cps,
             "drivers_connected": drivers_list,
             "timestamp": time.time(),
-            "config": CONTEXT["config"] 
+            "config": CONTEXT["config"], 
+            "city_temps": CONTEXT["city_temps"] # Seva: Enviamos temps al Front para las etiquetas
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/config/umbral', methods=['POST'])
 def set_temp_umbral():
-    """Cambia el umbral de temperatura desde la Web."""
     data = request.json
     nuevo_umbral = data.get('umbral')
     if nuevo_umbral is not None:
         try:
             nuevo_umbral_float = float(nuevo_umbral)
+            CONTEXT["config"]["temp_umbral"] = nuevo_umbral_float
+            
+            # Auditoría solo para cambios de configuración 
+            msg = f"Umbral de temperatura cambiado a {nuevo_umbral}ºC desde Web"
+            if CONTEXT["central_messages"] is not None:
+                CONTEXT["central_messages"].append(f"[CONFIG] {msg}")
+            
+            log_audit_event(
+                source_ip=request.remote_addr,
+                action="API_CAMBIO_UMBRAL",
+                description=f"Umbral modificado a {nuevo_umbral_float}ºC.",
+                cp_id=None
+            )
+            return jsonify({"status": "OK"}), 200
         except ValueError:
-            return jsonify({"error": "El umbral debe ser un número válido"}), 400
-        
-        CONTEXT["config"]["temp_umbral"] = float(nuevo_umbral)
-        msg = f"Umbral de temperatura cambiado a {nuevo_umbral}ºC desde Web"
-        print(f"[CONFIG] {msg}")
-
-        # Lo guardamos como log interno
-        if CONTEXT["central_messages"] is not None:
-            CONTEXT["central_messages"].append(f"[CONFIG] {msg}")
-
-        # Seva: AUDITORÍA: CAMBIO DE CONFIGURACIÓN ***
-        # Usamos request.remote_addr para capturar la IP que hizo la llamada API
-        log_audit_event(
-            source_ip=request.remote_addr,
-            action="API_CAMBIO_UMBRAL",
-            description=f"Umbral de temperatura climática modificado a {nuevo_umbral_float}ºC.",
-            cp_id=None
-        )
-        # *****************************************
-        return jsonify({"status": "OK", "nuevo_umbral": nuevo_umbral}), 200
-    return jsonify({"error": "Falta parámetro umbral"}), 400
+            pass
+    return jsonify({"error": "Error en datos"}), 400
 
 # --- ENDPOINTS DE LOGGING Y ALERTAS ---
 
 @app.route('/api/log', methods=['POST'])
 def receive_external_log():
-    """Permite a Registry, Weather y Driver enviar sus logs aquí."""
+    """Recibe logs. Si es temperatura, solo actualiza estado. Si es alerta, guarda log."""
     data = request.json
     source = data.get('source', 'UNKNOWN')
     msg = data.get('msg', '')
     
-    # Guardamos el log externo
+    if source == 'EV_W' and "Temperatura en" in msg:
+        try:
+            # Formato esperado: "Temperatura en Madrid: 15.5ºC"
+            parts = msg.split(':')
+            if len(parts) >= 2:
+                city_part = parts[0].replace("Temperatura en ", "").strip() # "Madrid"
+                temp_part = parts[1].replace("ºC", "").strip() # "15.5"
+                # Guardamos en memoria para el endpoint /api/estado
+                CONTEXT["city_temps"][city_part] = temp_part
+        except:
+            pass
+        # IMPORTANTE: Return aquí para NO añadir a EXTERNAL_LOGS
+        return jsonify({"status": "Updated State"}), 200
+    
+    # Si NO es temperatura (es una alerta, error, conexión, etc.), lo guardamos
     log_entry = {
         'timestamp': time.time(),
         'source': source,
@@ -99,12 +108,12 @@ def receive_external_log():
     }
     EXTERNAL_LOGS.append(log_entry)
     
-    # Mantenemos solo los últimos 200 logs externos
+    # Limpieza de buffer
     if len(EXTERNAL_LOGS) > 200:
         EXTERNAL_LOGS.pop(0)
         
-    print(f"[{source}] {msg}") # Imprimir en consola de Central también
-    return jsonify({"status": "OK"}), 200
+    print(f"[{source}] {msg}") 
+    return jsonify({"status": "Logged"}), 200
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
@@ -164,6 +173,56 @@ def receive_weather_alert():
                     count += 1
     
     return jsonify({"message": f"Accion {action} aplicada"}), 200
+
+
+# Seva: --- ENDPOINTS DE SEGURIDAD (Revocar la llave)---
+@app.route('/api/admin/revoke-key', methods=['POST'])
+def revoke_cp_key():
+    """
+    Simula una brecha de seguridad revocando las claves de un CP.
+    Requisito de Seguridad: Capacidad de revocación y auditoría.
+    """
+    data = request.json
+    cp_id = data.get('cp_id')
+    
+    if not cp_id:
+        return jsonify({"error": "Falta el parámetro cp_id"}), 400
+
+    # 1. Llamar a la base de datos para borrar las claves
+    if database.revoke_cp_keys(cp_id):
+        msg = f"SEGURIDAD: Claves del CP {cp_id} REVOCADAS manualmente."
+        print(f"[API] {msg}")
+        
+        # 2. Guardar log interno para mostrar en consola de Central
+        if CONTEXT["central_messages"] is not None:
+            CONTEXT["central_messages"].append(f"[SEGURIDAD] {msg}")
+        
+        # 3. Generar evento de AUDITORÍA
+        # Usamos request.remote_addr para registrar quién ordenó la revocación
+        log_audit_event(
+            source_ip=request.remote_addr,
+            action="REVOCACION_MANUAL",
+            description=f"Claves eliminadas por administrador. CP marcado como FUERA_DE_SERVICIO.",
+            cp_id=cp_id
+        )
+        
+        # 4. Intentar forzar cierre de socket si está conectado
+        # Esto hace que el CP se de cuenta inmediatamente de que algo pasa
+        try:
+            if cp_id in CONTEXT["active_cp_sockets"]:
+                sock = CONTEXT["active_cp_sockets"][cp_id]
+                try:
+                    sock.close() # Forzar desconexión
+                except: pass
+                del CONTEXT["active_cp_sockets"][cp_id]
+                print(f"[API] Socket del CP {cp_id} cerrado forzosamente tras revocación.")
+        except Exception as e:
+            print(f"[API] Error cerrando socket: {e}")
+
+        return jsonify({"status": "OK", "message": msg}), 200
+    
+    return jsonify({"error": "CP no encontrado o error en BD"}), 404
+
 
 def start_api_server(host, port):
     print(f"[API Central] Escuchando peticiones HTTP en {host}:{port}")

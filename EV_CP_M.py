@@ -427,10 +427,7 @@ def receive_frame(socket_ref, timeout=None, silent=False):
         return data, is_valid
         
     except socket.timeout:
-        #Paso 5: Manejar timeout (siempre mostrar errores)
-        if MONITOR_VERBOSE:
-            print(f"[PROTOCOLO] Timeout esperando trama (timeout={timeout}s)")
-        return None, False
+        return "__TIMEOUT__", False
     except Exception as e:
         #Paso 6: Manejar otros errores (siempre mostrar errores)
         if MONITOR_VERBOSE:
@@ -910,285 +907,186 @@ def handle_engine_communication(engine_host, engine_port, cp_id, central_ip, cen
 
 
 #HILO 4: Funciones de Conexion y Reporte a la Central
+# Seva: Cambaiado para incluir resiliencia y seguridad
 def start_central_connection(central_host, central_port, cp_id, location, engine_host, engine_port):
-    """Maneja la conexion principal con la Central (registro y gestion de comandos).
-    Si la conexión se pierde (por fallo de red o porque el monitor lo marca como None),
-    se intenta reconectar automáticamente tras unos segundos."""
-    
-    #Paso 1: Inicializar variables de control
-    #Se crea una lista mutable que guarda el socket con la Central.
-    #Asi puede ser compartido con el hilo del vigilante(el que comprueba la vida del engine).
-    #Usar lista permite que ambos hilos trabajen sobre la misma referencia al socket.
+    """
+    Maneja la conexión principal con la Central.
+    LOGICA DE RESILIENCIA Y SEGURIDAD (RELEASE 2):
+    - Ciclo de auto-recuperación ante revocación.
+    - Notificación de eventos de seguridad al log visual de Central.
+    """
     central_socket_ref = [None] 
-    parado = [False]  # bandera para indicar que el CP ha sido parado
+    parado = [False]
     
-    #Paso 2: Bucle infinito de reconexion
+    # Bucle infinito de conexión/reconexion
     while True:
         try:
-            #Paso 2.1: Crear socket y conectar con la Central
-            # socket() - "Creo un socket" → Intentar conexión con la Central
+            # Bandera para saber si venimos de una renovación de seguridad
+            security_recovery_mode = False
+
+            # PASO 1: AUTORREPARACIÓN DE CREDENCIALES
+            if MONITOR_VERBOSE:
+                print(f"[Monitor] Iniciando protocolo de conexión segura...")
+            
+            # Llamamos al Registry (HTTPS)
+            new_token, new_key = register_in_registry_https(cp_id, location)
+            
+            if new_token and new_key:
+                # PASO 2: INYECCIÓN DE CLAVE EN ENGINE
+                with monitor_ui_lock:
+                    old_key = monitor_state.get('symmetric_key')
+                    
+                    # DETECCIÓN DE CAMBIO DE CLAVES (AUDITORÍA VISUAL)
+                    if old_key != new_key:
+                        security_recovery_mode = True
+                        print(f"[Monitor] ⚠️ Nuevas credenciales. Sincronizando Engine...")
+                        enviar_log_monitor(central_host, f"[{cp_id}] Nuevas claves recibidas. Actualizando Engine.")
+
+                        try:
+                            # Conexión efímera al Engine para inyectar la clave
+                            sock_eng = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                            sock_eng.settimeout(2)
+                            sock_eng.connect((engine_host, engine_port))
+                            
+                            if handshake_client(sock_eng, silent=True):
+                                if send_frame(sock_eng, f"SET_KEY#{new_key}"):
+                                    # Esperar ACK
+                                    resp, _ = receive_frame(sock_eng, timeout=2, silent=True)
+                                    if resp and "ACK" in resp:
+                                        msg_ok = f"[{cp_id}] ✅ Engine resincronizado con nueva clave."
+                                        print(f"[Monitor] {msg_ok}")
+                                        enviar_log_monitor(central_host, msg_ok)
+                            sock_eng.close()
+                        except Exception as e:
+                            print(f"[Monitor] ❌ Error crítico sincronizando Engine: {e}")
+                        
+                        # Actualizar memoria local
+                        monitor_state['symmetric_key'] = new_key
+            else:
+                print("[Monitor] Error: Registry no disponible. Reintentando en 5s...")
+                time.sleep(5)
+                continue 
+
+            # PASO 3: CONEXIÓN CON CENTRAL
             central_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             if MONITOR_VERBOSE:
-                print(f"Intentando conectar CP '{cp_id}' a Central {central_host}:{central_port}...")
-            #Paso 2.1.1: connect() - "Me conecto a 127.0.0.1:8000", es decir, a la Central
+                print(f"Conectando a Central {central_host}:{central_port}...")
+            
             central_socket.connect((central_host, central_port))
             
-            #Paso 2.1.2: Realizar handshake inicial (ENQ/ACK)
-            if MONITOR_VERBOSE:
-                print("[Monitor] Realizando handshake con Central...")
-            push_protocol_message("Conectado a Central. Realizando handshake...")
             if not handshake_client(central_socket):
-                if MONITOR_VERBOSE:
-                    print("[Monitor] ERROR: Handshake fallido con Central. Cerrando conexión.")
-                push_protocol_message("ERROR: Handshake fallido con Central")
+                print("[Monitor] Handshake rechazado. Reintentando...")
                 central_socket.close()
-                with monitor_ui_lock:
-                    monitor_state['central_status'] = "Desconectado"
-                time.sleep(5)  # Esperar antes de reintentar
+                time.sleep(5)
                 continue
             
-            push_protocol_message("Handshake exitoso con Central")
-            with monitor_ui_lock:
-                monitor_state['central_status'] = "Conectado"
-                monitor_state['connection_info']['central'] = f"{central_host}:{central_port}"
+            # Registro
+            default_price = 0.25
+            register_msg = f"REGISTER#{cp_id}#{location}#{default_price}"
             
-            #Paso 2.1.3: Guardar referencia a la conexión para compartir con otros hilos
-            # Guardamos la referencia a la conexion en la lista para que el otro hilo (monitor vigilante) la pueda usar.
-            central_socket_ref[0] = central_socket 
-            if MONITOR_VERBOSE:
-                print("¡Conectado al servidor central! Enviando registro.")
-            
-
-            #Paso 2.2: Enviar mensaje de registro a la Central usando protocolo
-            # sendall() - "Envío un mensaje de registro al servidor Central"
-            default_price = 0.25  # €/kWh por defecto
-            register_message = f"REGISTER#{cp_id}#{location}#{default_price}"
-            push_protocol_message(f"Enviando REGISTER#{cp_id} a Central")
-            with central_socket_lock:
-                if send_frame(central_socket, register_message):
-                    if MONITOR_VERBOSE:
-                        print(f"[Monitor] Enviado REGISTER (with price={default_price}): {register_message}")
-                    # Esperar ACK de confirmación de Central y consumirlo
-                    try:
-                        central_socket.settimeout(1.0)
-                        ack_response = central_socket.recv(1)
-                    except Exception:
-                        ack_response = None
-                    finally:
-                        central_socket.settimeout(5)
-                    if ack_response == ACK:
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] Central confirmó recepción de REGISTER")
-                        push_protocol_message("Central confirmó recepción de REGISTER")
-                        # Intentar recibir un frame informativo REGISTER_RESULT#FIRST|RECONNECT (opcional)
-                        try:
-                            received_mode = None
-                            for _ in range(2):  # dos intentos por si llega un poco más tarde
-                                resp_string, is_valid = receive_frame(central_socket, timeout=2.0, silent=True)
-                                if not is_valid or not resp_string:
-                                    continue
-                                if resp_string.startswith("REGISTER_RESULT"):
-                                    received_mode = resp_string.split('#')[1] if '#' in resp_string else ""
-                                    # Enviar ACK de confirmación del frame informativo
-                                    try:
-                                        send_ack(central_socket, silent=True)
-                                    except Exception:
-                                        pass
-                                    break
-                            if received_mode == 'FIRST':
-                                push_protocol_message("Registro inicial confirmado por Central")
-                            elif received_mode == 'RECONNECT':
-                                push_protocol_message("Reconexión confirmada por Central")
-                        except Exception:
-                            pass
-                    else:
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] WARNING: Central no confirmó recepción de REGISTER")
-            #Paso 2.2.1: Configurar timeout para recibir datos
-            # Aseguramos modo blocking normal (sin timeout de conexión)
-            # IMPORTANTE: Timeout de 5 segundos permite recibir comandos de la Central sin bloquear indefinidamente
-            central_socket.settimeout(5) # Timeout para recv (espera max 5s por datos)
-            #Paso 2.2.2: Esperar para que Central procese el registro
-            time.sleep(3) # Esperar un momento para que CENTRAL procese el registro antes de iniciar monitoreo
-            
-
-
-            #Paso 2.3: Iniciar el hilo de Monitorizacion Local si aun no esta activo
-            #Si no existe ya un hilo llamado EngineMonitor, lo creamos.
-                                                      #devuelve una lista de todos los hilos activos en este momento  
-            if not any(t.name == "EngineMonitor" for t in threading.enumerate()):
-                #Paso 2.3.1: Verificar que el Engine esté listo antes de iniciar monitoreo
+            if send_frame(central_socket, register_msg):
                 try:
-                    test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    test_socket.settimeout(2)
-                    test_socket.connect((engine_host, engine_port))
-                    test_socket.close()
-                    if MONITOR_VERBOSE:
-                        print("[Monitor] Engine verificado como listo. Iniciando monitoreo.")
-                except Exception as e:
-                    if MONITOR_VERBOSE:
-                        print(f"[Monitor] Engine no está listo aún: {e}. Esperando...")
-                    time.sleep(5)  # Esperar más tiempo si el Engine no está listo
-                
-                #Paso 2.3.2: Crear hilo de monitorización del Engine
-                #Creamos un nuevo hilo que corre monitor_engine_health(...).
-                monitor_thread = threading.Thread(
-                    target=monitor_engine_health, 
-                    args=(engine_host, engine_port, cp_id, central_socket_ref),
-                    name="EngineMonitor"
-                )
-                #Paso 2.3.2.1: Marcar hilo como daemon
-                #Marcamos el hilo como daemon: se cierra cuando el programa principal termina.
-                monitor_thread.daemon = True
-                #Paso 2.3.2.2: Iniciar hilo de monitorización
-                monitor_thread.start()
-                if MONITOR_VERBOSE:
-                    print("[Monitor] Hilo de monitorización del Engine iniciado.")
-                
-                #Paso 2.3.3: Crear hilo de comunicación con Engine
-                # Iniciar servidor de comunicación con Engine
-                comm_thread = threading.Thread(
-                    target=handle_engine_communication,
-                    args=(engine_host, engine_port, cp_id, central_host, central_port),
-                    name="EngineCommunication"
-                )
-                #Paso 2.3.3.1: Marcar hilo como daemon
-                comm_thread.daemon = True
-                #Paso 2.3.3.2: Iniciar hilo de comunicación
-                comm_thread.start()
-                if MONITOR_VERBOSE:
-                    print("[Monitor] Servidor de comunicación con Engine iniciado.")
-                
+                    central_socket.settimeout(2.0)
+                    ack = central_socket.recv(1)
+                    if ack == ACK:
+                        # CONEXIÓN EXITOSA
+                        with monitor_ui_lock:
+                            monitor_state['central_status'] = "Conectado"
+                            monitor_state['connection_info']['central'] = f"{central_host}:{central_port}"
+                        
+                        central_socket_ref[0] = central_socket
+                        print(f"[Monitor] 🟢 CONEXIÓN ESTABLECIDA con Central.")
+                        
+                        # Si venimos de un cambio de claves (Revocación), forzamos ACTIVAR.
+                        # Si es un reinicio normal (Mantenimiento), respetamos el estado de la Central.
+                        if security_recovery_mode:
+                            print("[Monitor] Enviando señal de RECUPERACIÓN DE SEGURIDAD...")
+                            # Enviamos RECOVER para sacar al CP del estado FUERA_DE_SERVICIO
+                            send_frame(central_socket, f"RECOVER#{cp_id}")
+                            security_recovery_mode = False
 
-            #Paso 2.4: Bucle de escucha de comandos de la Central (Parar/Reanudar)
+                        # Iniciar hilos auxiliares si no existen
+                        if not any(t.name == "EngineMonitor" for t in threading.enumerate()):
+                             monitor_thread = threading.Thread(
+                                target=monitor_engine_health, 
+                                args=(engine_host, engine_port, cp_id, central_socket_ref),
+                                name="EngineMonitor"
+                            )
+                             monitor_thread.daemon = True
+                             monitor_thread.start()
+                             
+                             comm_thread = threading.Thread(
+                                target=handle_engine_communication,
+                                args=(engine_host, engine_port, cp_id, central_host, central_port),
+                                name="EngineCommunication"
+                            )
+                             comm_thread.daemon = True
+                             comm_thread.start()
+
+                except Exception:
+                    pass
+            
+            central_socket.settimeout(5) 
+
+            # 4. BUCLE DE ESCUCHA (CORREGIDO)
             empty_reads = 0
             while True:
-                #Paso 2.4.1: Verificar si la conexión sigue activa
-                # Si el monitor ha puesto central_socket_ref[0] = None → reconexión necesaria
-                if central_socket_ref[0] is None:
-                    if MONITOR_VERBOSE:
-                        print("[Monitor] La conexión con la Central fue marcada como caída. Reconectando...")
-                    break  # Salimos al while True externo para reintentar conexión
+                if central_socket_ref[0] is None: break 
                 
-            #Paso 2.4.2: Esperar datos de la Central usando protocolo
                 try:
-                    #Paso 2.4.2.1: La central puede enviar comandos en cualquier momento, hay que estar escuchando
-                    # Recibir trama usando protocolo
-                    # IMPORTANTE: usamos timeout explícito para no bloquear indefinidamente y evitar
-                    # falsos cierres por lecturas vacías intermitentes. Si no llega nada, seguimos.
-                    # Si la Central envía un comando PARAR/REANUDAR, lo recibiremos aquí
-                    data_string, is_valid = receive_frame(central_socket, timeout=5)
-
-                    #Paso 2.4.2.2: Gestionar timeouts explícitos sin afectar la conexión
-                    if data_string == "__TIMEOUT__":
-                        empty_reads = 0
+                    # Usamos timeout de 2s para ser ágiles
+                    data_str, is_valid = receive_frame(central_socket, timeout=2.0)
+                    
+                    # CORRECCIÓN PRINCIPAL: Si es timeout, no es error, solo silencio.
+                    if data_str == "__TIMEOUT__": 
+                        continue 
+                    
+                    # Si es None o vacío, la Central cerró la conexión (REVOCACIÓN o CAÍDA)
+                    if not data_str:
+                        empty_reads += 1
+                        if empty_reads > 2:
+                            msg_loss = f"[{cp_id}] 🔴 Conexión perdida con Central (Posible Revocación)."
+                            print(f"[Monitor] {msg_loss}")
+                            enviar_log_monitor(central_host, msg_loss)
+                            
+                            print(f"[Monitor] ⏳ Esperando 4s antes de iniciar recuperación de seguridad...")
+                            enviar_log_monitor(central_host, f"[{cp_id}] Esperando 4s para re-autenticación...")
+                            time.sleep(4) 
+                           
+                            break 
                         continue
-
-                    #Paso 2.4.2.3: Si no se recibieron datos, continuar esperando (posible cierre remoto transitorio)
-                    if not data_string:
-                        # No asumimos cierre por una lectura vacía/timeout aislado; continuamos
-                        empty_reads = 0
-                        continue
                     
-                    #Paso 2.4.2.4: Verificar validez de la trama
-                    if not is_valid:
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] Trama inválida recibida de Central. Ignorando y esperando siguiente trama...")
-                        continue  # Evitar enviar NACK crudo para no cerrar la conexión
-                    
-                    #Paso 2.4.2.5: Enviar ACK confirmando recepción válida
-                    send_ack(central_socket)
-                    empty_reads = 0
-                    
-                    #Paso 2.4.3: Procesar el comando recibido (ya viene parseado como string)
-                    #El split('#')[0] separa el codigo del comando: PARAR#CP01 → "PARAR"     REANUDAR#CP01 → "REANUDAR" 
-                    command = data_string.strip().split('#')[0]
-                    if MONITOR_VERBOSE:
-                        print(f"[Monitor] Comando recibido desde Central: '{command}'")
-                    # Registrar comando en mensajes del protocolo
-                    push_protocol_message(f"← Recibido desde Central: {data_string}")
+                    if is_valid:
+                        send_ack(central_socket)
+                        empty_reads = 0 # Reseteamos contador de errores
+                        
+                        # Procesar comandos
+                        cmd = data_str.strip().split('#')[0]
+                        if cmd == 'PARAR':
+                            send_command_to_engine(engine_host, engine_port, "PARAR", central_socket)
+                            parado[0] = True
+                        elif cmd == 'REANUDAR':
+                            send_command_to_engine(engine_host, engine_port, "REANUDAR", central_socket)
+                            parado[0] = False
+                        elif cmd == 'AUTORIZAR_SUMINISTRO':
+                            send_command_to_engine(engine_host, engine_port, data_str, central_socket)
 
-                    #Paso 2.4.4: Verificar estado del CP
-                    # Si el CP está parado, solo permitimos REANUDAR
-                    if parado[0] and command != 'REANUDAR':
-                        if MONITOR_VERBOSE:
-                            print(f"[Monitor] Ignorando comando '{command}' mientras CP está parado.")
-                        continue
+                except socket.error:
+                    print("[Monitor] Error de socket. Reiniciando...")
+                    break 
 
-                    #Paso 2.4.5: Procesar comandos específicos
-                    #Paso 2.4.5.1: Comando PARAR
-                    if command == 'PARAR':
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] COMANDO CENTRAL: 'PARAR' recibido → enviando a Engine...")
-                        push_protocol_message("→ Enviando PARAR a Engine")
-                        #Paso 2.4.5.1.1: Conectar al Engine para ejecutar el comando
-                        send_command_to_engine(engine_host, engine_port, "PARAR", central_socket)
-                        #Paso 2.4.5.1.2: Después de PARAR, marcamos que no se debe reconectar
-                        parado[0] = True
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] CP marcado como parado. Esperando REANUDAR...")
-                    
-                    #Paso 2.4.5.2: Comando REANUDAR
-                    elif command == 'REANUDAR':
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] COMANDO CENTRAL: 'REANUDAR' recibido → enviando a Engine...")
-                        push_protocol_message("→ Enviando REANUDAR a Engine")
-                        #Paso 2.4.5.2.1: Conectar al Engine para ejecutar el comando
-                        send_command_to_engine(engine_host, engine_port, "REANUDAR", central_socket)
-                        #Paso 2.4.5.2.2: Marcar CP como reanudado
-                        parado[0] = False
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] CP reanudado. Reanudando operaciones.")
-                        #Paso 2.4.5.2.3: Si el Engine está en KO, intentar RECOVER automáticamente
-                        try:
-                            with monitor_ui_lock:
-                                current_engine_status = monitor_state.get('engine_status')
-                            if current_engine_status and current_engine_status != 'OK':
-                                push_protocol_message("Engine en KO → intentando RECOVER")
-                                send_command_to_engine(engine_host, engine_port, "RECOVER", central_socket)
-                        except Exception:
-                            pass
-
-                    #Paso 2.4.5.3: Comando AUTORIZAR_SUMINISTRO
-                    elif command == 'AUTORIZAR_SUMINISTRO':
-                        if MONITOR_VERBOSE:
-                            print(f"[Monitor] COMANDO CENTRAL: 'AUTORIZAR_SUMINISTRO' recibido → enviando a Engine...")
-                        #Paso 2.4.5.3.1: Conectar al Engine para ejecutar el comando (usar data_string en lugar de data)
-                        send_command_to_engine(engine_host, engine_port, data_string, central_socket)
-                        if MONITOR_VERBOSE:
-                            print("[Monitor] Comando de autorización de suministro enviado al Engine.")
-
-                    #Paso 2.4.5.4: Comando desconocido
-                    else:
-                        print(f"Comando desconocido recibido: {command}")
-                    
-                except socket.timeout:
-                    continue
-                except socket.error as e:
-                    if MONITOR_VERBOSE:
-                        print(f"[Monitor] Error de comunicación con la Central: {e}")
-                    break  # Reconexión
-
-        #Paso 2.5: Manejar errores de conexión
-        #Si falla la conexion, esperamos 10 segundos y lo intentamos de nuevo.        
-        except (ConnectionRefusedError, socket.error, ConnectionResetError) as e:
-            if MONITOR_VERBOSE:
-                print(f"[Monitor] Error de conexion con Central: {e}. \nReintentando en 10s...")
-            time.sleep(10)
         except Exception as e:
-            if MONITOR_VERBOSE:
-                print(f"Error inesperado en el socket de la Central: {e}")
-            break
-        #Paso 2.6: Limpiar recursos
-        #Asegura cerrar el socket si algo sale mal
+            print(f"[Monitor] Fallo en ciclo: {e}. Reintentando en 5s...")
+            time.sleep(5)
+        
         finally:
             if central_socket_ref[0]:
-                try:
-                    central_socket_ref[0].close()
-                except Exception:
-                        pass
-                central_socket_ref[0] = None # Limpiamos la referencia antes de reintentar
-            time.sleep(5)  # Esperar un poco antes de reintentar
+                try: central_socket_ref[0].close()
+                except: pass
+                central_socket_ref[0] = None
+                with monitor_ui_lock:
+                    monitor_state['central_status'] = "Desconectado"
+            time.sleep(5)
 
 # --- Punto de Entrada Principal ---
 if __name__ == "__main__":

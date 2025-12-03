@@ -1,0 +1,10 @@
+{
+    "api_key": "3b4ca6faaaed312c8ae9244e7a652a69",
+    "cities": {
+        "Madrid": "MAD",
+        "Barcelona": "BCN",
+        "Valencia": "VAL",
+        "Sevilla": "SEV",
+        "Oslo": "TEST"
+    }
+}

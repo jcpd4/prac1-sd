@@ -634,7 +634,9 @@ def reconcile_cp_states(central_messages):
 
                 # 1) Si el monitor ha caído, el estado debe ser DESCONECTADO (tras gracia)
                 if not monitor_alive:
-                    if current_status != 'DESCONECTADO':
+                    if current_status == 'FUERA_DE_SERVICIO': 
+                        target_status = None
+                    elif current_status != 'DESCONECTADO':
                         in_session = session_exists or current_status in ['RESERVADO', 'SUMINISTRANDO']
                         if in_session and engine_alive:
                             target_status = None  # mantener estado durante la carga si engine sigue informando
@@ -1936,66 +1938,81 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
     except Exception as e:
         central_messages.append(f"Error con el CP {cp_id} ({address}): {e}")
     finally:
-        # FASE 4: Desconexión
+        # FASE 4: Desconexión y Limpieza
         if cp_id:
-            # IMPORTANTE: Verificar el estado ANTES de cualquier mensaje
-            # Esto evita condiciones de carrera donde el estado cambia después de una desconexión
-            current_status = database.get_cp_status(cp_id)
-            if cp_id in pending_cp_commands:
-                push_message(central_messages, f"[CONN] Conexión cerrada mientras había comando pendiente para {cp_id}. Estado mantenido.")
-                with active_cp_lock:
-                    if cp_id in active_cp_sockets:
-                        del active_cp_sockets[cp_id]
-                client_socket.close()
-                return
-            try:
-                ts = recent_recover_events.get(cp_id)
-                within_grace = ts is not None and (time.time() - ts) <= 5
-            except Exception:
-                within_grace = False
-
-            # Política: aplicar gracia antes de degradar si hay sesión o se autorizó recientemente
-            session_active = False
-            authorized_since = None
-            with active_cp_lock:
-                sess = current_sessions.get(cp_id)
-                if sess:
-                    session_active = True
-                    authorized_since = sess.get('authorized_since')
-            if session_active:
-                try:
-                    force_release_cp_session(
-                        cp_id,
-                        central_messages,
-                        reason="Monitor desconectado (socket cerrado)",
-                        target_status='DESCONECTADO',
-                        supply_error_reason="Carga interrumpida: Monitor desconectado"
-                    )
-                except Exception:
-                    pass
-                current_status = 'DESCONECTADO'
-                session_active = False
-                session_exists = False
-                driver_attached = None
-            if session_active or current_status in ['RESERVADO', 'SUMINISTRANDO']:
-                pending_monitor_disconnects[cp_id] = time.time()
-                push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado (gracia antes de marcar DESCONECTADO).")
-            else:
-                database.update_cp_status(cp_id, 'DESCONECTADO')
-                if current_status == 'SUMINISTRANDO':
-                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado durante SUMINISTRO → DESCONECTADO (Engine finalizará).")
-                else:
-                    push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado → DESCONECTADO.")
-
+            # 1. Siempre eliminamos el socket de la lista activa primero
             with active_cp_lock:
                 if cp_id in active_cp_sockets:
                     del active_cp_sockets[cp_id]
+
+            try:
+                # 2. Consultamos el estado REAL en la Base de Datos
+                current_db_status = database.get_cp_status(cp_id)
+
+                # --- CORRECCIÓN DE SEGURIDAD ---
+                # Si el estado es FUERA_DE_SERVICIO, significa que la API lo revocó o se paró manualmente.
+                if current_db_status == 'FUERA_DE_SERVICIO':
+                    push_message(central_messages, f"[CONN] Socket cerrado para {cp_id}, pero se mantiene estado FUERA_DE_SERVICIO (Seguridad).")
+                
+                # --- LÓGICA DE DESCONEXIÓN NORMAL ---
+                else:
+                    # 1. Comandos pendientes
+                    if cp_id in pending_cp_commands:
+                        push_message(central_messages, f"[CONN] Conexión cerrada con comando pendiente para {cp_id}.")
+                    
+                    # 2. Verificar Gracia por recuperación reciente
+                    within_grace = False
+                    try:
+                        ts = recent_recover_events.get(cp_id)
+                        within_grace = ts is not None and (time.time() - ts) <= 5
+                    except: pass
+
+                    # 3. Gestión de Sesión Activa
+                    session_active = False
+                    with active_cp_lock:
+                        sess = current_sessions.get(cp_id)
+                        if sess: session_active = True
+                    
+                    if session_active:
+                        try:
+                            # Intentamos liberar sesión si es caída de socket sucio
+                            force_release_cp_session(
+                                cp_id,
+                                central_messages,
+                                reason="Monitor desconectado (socket cerrado)",
+                                target_status='DESCONECTADO',
+                                supply_error_reason="Carga interrumpida: Monitor desconectado"
+                            )
+                        except Exception: pass
+                        # Tras force_release, actualizamos variables locales para la lógica siguiente
+                        current_db_status = 'DESCONECTADO' 
+                        session_active = False
+
+                    # 4. Decisión Final
+                    if session_active or current_db_status in ['RESERVADO', 'SUMINISTRANDO']:
+                        # Si estaba haciendo algo importante, damos un tiempo de gracia
+                        pending_monitor_disconnects[cp_id] = time.time()
+                        push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado (gracia antes de marcar DESCONECTADO).")
+                    elif not within_grace:
+                        # Si no hay gracia y no estaba FUERA_DE_SERVICIO, marcamos como DESCONECTADO 
+                        database.update_cp_status(cp_id, 'DESCONECTADO')
+                        if current_db_status == 'SUMINISTRANDO':
+                             push_message(central_messages, f"[CONN] Monitor desconectado durante SUMINISTRO → DESCONECTADO.")
+                        else:
+                             push_message(central_messages, f"[CONN] Monitor de {cp_id} desconectado.")
+
+            except Exception as e:
+                print(f"[CENTRAL] Error gestionando desconexión de {cp_id}: {e}")
+
+            # 3. Limpieza de variables de salud (Siempre)
             try:
                 monitor_last_seen.pop(cp_id, None)
                 engine_health_status.pop(cp_id, None)
-            except Exception:
-                pass
-        client_socket.close()
+            except Exception: pass
+            
+        try:
+            client_socket.close()
+        except Exception: pass
 
 # Funcion Socket para iniciar el servidor de sockets
 def start_socket_server(host, port, central_messages, kafka_broker):
