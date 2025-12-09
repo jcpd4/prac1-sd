@@ -206,7 +206,7 @@
             }
 
             tbody.innerHTML = cps.map(cp => {
-                // Clima
+                // Clima (Tu lógica actual)
                 let tempHtml = "";
                 for (const city in cityTemps) {
                     if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
@@ -215,24 +215,32 @@
                     }
                 }
 
-                // Estado de claves (Simulado: si status no es 'FUERA_DE_SERVICIO' asumimos que tiene claves)
-                let hasKeys = (cp.status !== 'FUERA_DE_SERVICIO' && cp.status !== 'DESCONECTADO');
+                // NUEVO: Lógica del botón de Revocación
+                // Si el CP está "FUERA_DE_SERVICIO", asumimos que ya ha sido revocado o parado,
+                // así que desactivamos el botón visualmente para que no se pulse dos veces.
+                let isRevoked = (cp.status === 'FUERA_DE_SERVICIO' || cp.status === 'DESCONECTADO');
                 
-                // Botón Revocar
-                let btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')">REVOCAR CLAVES</button>`;
-                
-                // Si ya está revocado/fuera de servicio, deshabilitamos el botón visualmente
-                if(cp.status === 'FUERA_DE_SERVICIO') {
-                    btnRevoke = `<span style="color:orange; font-weight:bold;"></span>`;
+                let btnRevoke;
+                if (isRevoked) {
+                    // Botón gris desactivado
+                    btnRevoke = `<button class="btn-revoke btn-disabled" disabled>REVOCADO</button>`;
+                } else {
+                    // Botón rojo activo
+                    btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')">☢️ REVOCAR CLAVES</button>`;
                 }
+
+                // Información de suministro
+                let infoSum = (cp.status === 'SUMINISTRANDO' && cp.kwh) 
+                              ? `⚡ ${cp.kwh.toFixed(2)} kWh` 
+                              : '<span style="color:#ccc;">-</span>';
 
                 return `
                 <tr>
                     <td><b>${cp.id}</b></td>
                     <td>${cp.location} ${tempHtml}</td>
                     <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
-                    <td>${cp.status==='SUMINISTRANDO' ? ` ${cp.kwh?.toFixed(2)} kWh` : '<span style="color:#ccc;">-</span>'}</td>
-                    <td>${btnRevoke}</td>
+                    <td>${infoSum}</td>
+                    <td style="text-align:center;">${btnRevoke}</td>
                 </tr>`;
             }).join('');
         }
