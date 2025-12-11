@@ -908,7 +908,7 @@ def handle_engine_communication(engine_host, engine_port, cp_id, central_ip, cen
 
 #HILO 4: Funciones de Conexion y Reporte a la Central
 # Seva: Cambaiado para incluir resiliencia y seguridad
-def start_central_connection(central_host, central_port, cp_id, location, engine_host, engine_port):
+def start_central_connection(central_host, central_port, cp_id, location, engine_host, engine_port, initial_token=None, initial_key=None):
     """
     Maneja la conexión principal con la Central.
     LOGICA DE RESILIENCIA Y SEGURIDAD (RELEASE 2):
@@ -928,8 +928,14 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
             if MONITOR_VERBOSE:
                 print(f"[Monitor] Iniciando protocolo de conexión segura...")
             
-            # Llamamos al Registry (HTTPS)
-            new_token, new_key = register_in_registry_https(cp_id, location)
+            if initial_token and initial_key:
+                new_token, new_key = initial_token, initial_key
+                # Las consumimos para que si hay una reconexión futura, sí pida nuevas
+                initial_token = None 
+                initial_key = None
+            else:
+                # Si no (o es una reconexión posterior), llamamos al Registry
+                new_token, new_key = register_in_registry_https(cp_id, location)
             
             if new_token and new_key:
                 # PASO 2: INYECCIÓN DE CLAVE EN ENGINE
@@ -1114,7 +1120,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     #Paso 3: Configurar ubicación del CP
-    locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1", "BCN-05": "Las Ramblas 55"}
+    locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1, Valencia", "BCN-02": "Las Ramblas 55, Barcelona"}
     LOCATION = locations.get(CP_ID, "Ubicacion Desconocida")
 
     # --- NUEVO BLOQUE RELEASE 2: REGISTRO ---
@@ -1166,7 +1172,7 @@ if __name__ == "__main__":
     # ----------------------------------------
 
     #Paso 4: Iniciar conexión con la Central en hilo separado
-    central_thread = threading.Thread(target=start_central_connection, args=(CENTRAL_IP, CENTRAL_PORT, CP_ID, LOCATION, ENGINE_IP, ENGINE_PORT), daemon=True)
+    central_thread = threading.Thread(target=start_central_connection, args=(CENTRAL_IP, CENTRAL_PORT, CP_ID, LOCATION, ENGINE_IP, ENGINE_PORT, TOKEN_SEGURIDAD, CLAVE_SIMETRICA), daemon=True)
     central_thread.start()
     
     #Paso 5: Iniciar monitorización del Engine en hilo separado

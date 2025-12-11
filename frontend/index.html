@@ -20,6 +20,7 @@
         .bg-AVERIADO { background-color: #dc3545; }
         .bg-FUERA_DE_SERVICIO { background-color: #fd7e14; }
         .bg-DESCONECTADO { background-color: #6c757d; }
+        .bg-RESERVADO { background-color: #159894; }
         
         /* Info Clima */
         .temp-badge { font-size: 0.85em; color: #333; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-left: 5px;}
@@ -28,6 +29,17 @@
         .btn-revoke { background-color: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
         .btn-revoke:hover { background-color: #c82333; }
         .btn-disabled { background-color: #ccc; cursor: not-allowed; }
+        /* Botones de Control Operativo */
+        .btn-control { border: none; padding: 5px 8px; border-radius: 4px; cursor: pointer; color: white; font-weight: bold; margin-right: 3px; }
+        .btn-stop { background-color: #ffc107; color: #333; } /* Amarillo/Naranja */
+        .btn-stop:hover { background-color: #e0a800; }
+        
+        .btn-resume { background-color: #17a2b8; } /* Cyan */
+        .btn-resume:hover { background-color: #138496; }
+
+        /* Botones Globales (Más grandes) */
+        .global-controls { display: flex; gap: 10px; margin-bottom: 15px; padding: 10px; background: #fff3cd; border-radius: 5px; border: 1px solid #ffeeba; align-items: center;}
+        .btn-global { padding: 8px 15px; font-size: 0.9em; text-transform: uppercase; }
 
         /* Logs */
         #log-console { 
@@ -40,7 +52,6 @@
         .src-EV_W { color: #00d0ff; }
         .src-MONITOR { color: #ffff00; }
         .src-ENGINE { color: #1455eb; }
-        .src-SECURITY { color: #ff4444; font-weight: bold; } /* Nuevo color para seguridad */
 
         /* Filtros */
         .filter-bar { margin-bottom: 10px; display: flex; gap: 5px; flex-wrap: wrap;}
@@ -54,7 +65,14 @@
     <div class="container">
         <div style="display:flex; flex-direction:column; gap:20px;">
             <div class="card">
-                <h2>📡 Estado de Puntos de Recarga (CPs)</h2>
+                <h2> Estado de Puntos de Recarga (CPs)</h2>
+
+                <div class="global-controls">
+                    <span style="font-weight:bold; color:#856404;"> CONTROL DE EMERGENCIA:</span>
+                    <button class="btn-control btn-stop btn-global" onclick="comandoGlobal('PARAR')">⏸ PARAR TODOS</button>
+                    <button class="btn-control btn-resume btn-global" onclick="comandoGlobal('REANUDAR')">▶ REANUDAR TODOS</button>
+                </div>
+
                 <table id="tabla-cps">
                     <thead>
                         <tr>
@@ -69,7 +87,7 @@
             </div>
             
             <div class="card">
-                <h2>🌡️ Configuración Climática (EV_W)</h2>
+                <h2> Configuración Climática (EV_W)</h2>
                 <div style="display:flex; align-items:center; gap:10px;">
                     <label>Umbral de Temperatura (Alerta Frío):</label>
                     <input type="number" id="tempInput" value="0" style="width:60px; padding:5px;"> <span>ºC</span>
@@ -82,7 +100,7 @@
             <h2> Eventos en Tiempo Real</h2>
             <div class="filter-bar">
                 <button class="filter-btn active" onclick="setFilter('ALL')">TODOS</button>
-                <button class="filter-btn" onclick="setFilter('SECURITY')"> SEGURIDAD</button> <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
+                <button class="filter-btn" onclick="setFilter('REGISTRY')">REGISTRY</button>
                 <button class="filter-btn" onclick="setFilter('CENTRAL')">CENTRAL</button>
                 <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
                 <button class="filter-btn" onclick="setFilter('MONITOR')">MONITOR</button>
@@ -125,6 +143,93 @@
         }
 
         // --- ACCIONES ---
+        async function comandoCP(cpId, accion) {
+            try {
+                const res = await fetch(`${API}/comandos/cp`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({cp_id: cpId, action: accion})
+                });
+                const data = await res.json();
+                if(res.ok) {
+                    // Feedback visual rápido
+                    alert(`✅ Comando ${accion} enviado a ${cpId}`);
+                    update(); 
+                } else {
+                    alert(`❌ Error: ${data.error}`);
+                }
+            } catch(e) { console.error(e); }
+        }
+
+        async function comandoGlobal(accion) {
+            if(!confirm(`¿Seguro que quieres ${accion} TODOS los puntos de carga conectados?`)) return;
+            
+            try {
+                const res = await fetch(`${API}/comandos/todos`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({action: accion})
+                });
+                const data = await res.json();
+                alert(data.message);
+                update();
+            } catch(e) { console.error(e); }
+        }
+
+        // --- ACTUALIZACIÓN DE RENDER TABLE ---
+        
+        function renderTable(cps) {
+            const tbody = document.querySelector('#tabla-cps tbody');
+            if(!cps || cps.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay CPs registrados.</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = cps.map(cp => {
+                let tempHtml = "";
+                for (const city in cityTemps) {
+                    if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
+                        tempHtml = `<span class="temp-badge">🌡️ ${cityTemps[city]}ºC</span>`;
+                        break; 
+                    }
+                }
+
+                // Botones de acción individuales
+                // Solo mostramos Parar/Reanudar si NO está revocado (Fuera de servicio por seguridad)
+                let actionButtons = "";
+                if(cp.status !== 'FUERA_DE_SERVICIO') {
+                    actionButtons = `
+                        <button class="btn-control btn-stop" onclick="comandoCP('${cp.id}', 'PARAR')" title="Parar CP">⏸</button>
+                        <button class="btn-control btn-resume" onclick="comandoCP('${cp.id}', 'REANUDAR')" title="Reanudar CP">▶</button>
+                    `;
+                }
+
+                // Botón Revocar (existente)
+                let btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')" title="Simular ataque">☠️</button>`;
+                if(cp.status === 'FUERA_DE_SERVICIO') {
+                    btnRevoke = `<span style="color:orange; font-size:0.8em;">⚠ REVOCADO</span>`;
+                    // Si está revocado, quizás quieras permitir reanudar manualmente si recuperó claves pero se quedó pillado
+                    // Ocultamos los controles normales para forzar la recuperación automática, o los dejamos visibles.
+                    // En este diseño, si está revocado, oculto Parar/Reanudar para priorizar la seguridad.
+                }
+
+                return `
+                <tr>
+                    <td><b>${cp.id}</b></td>
+                    <td>${cp.location} ${tempHtml}</td>
+                    <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
+                    <td>${cp.status==='SUMINISTRANDO' ? `⚡ ${cp.kwh?.toFixed(2)} kWh` : '<span style="color:#ccc;">-</span>'}</td>
+                    <td>
+                        <div style="display:flex; align-items:center;">
+                            ${actionButtons}
+                            <span style="border-left:1px solid #ccc; margin:0 8px; height:20px;"></span>
+                            ${btnRevoke}
+                        </div>
+                    </td>
+                </tr>`;
+            }).join('');
+        }
+
         
         async function cambiarUmbral() {
             const val = document.getElementById('tempInput').value;
@@ -171,7 +276,6 @@
             // Filtrado
             const filtered = allLogs.filter(l => {
                 if(currentFilter === 'ALL') return true;
-                if(currentFilter === 'SECURITY') return l.msg.includes('SEGURIDAD') || l.msg.includes('Token') || l.msg.includes('Clave');
                 return l.source === currentFilter;
             });
             
@@ -179,14 +283,12 @@
                 let msg = (typeof l.msg === 'object') ? JSON.stringify(l.msg) : l.msg;
                 let src = l.source;
                 
-                // Detectar mensajes de seguridad para colorearlos especial
-                if(msg.includes('SEGURIDAD') || msg.includes('REVOCADAS') || msg.includes('Clave')) {
-                    src = 'SECURITY';
-                } else if(src === 'CENTRAL') {
+                if(src === 'CENTRAL') {
                     if(msg.includes('[CLIMA]')) src = 'EV_W';
-                    if(msg.includes('REGISTRO')) src = 'REGISTRY';
+                    if(msg.includes('REGISTRO') || msg.includes('REGISTRY')) src = 'REGISTRY';
                 }
 
+                // Generamos la línea con el color del módulo original (src-MONITOR, src-ENGINE, etc.)
                 return `<div class="log-line">
                             <span style="color:#888; font-size:0.8em;">[${new Date(l.timestamp * 1000).toLocaleTimeString()}]</span>
                             <span class="log-src src-${src}">[${src}]</span> 

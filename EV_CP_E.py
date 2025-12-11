@@ -306,6 +306,8 @@ status_lock = threading.Lock()
 # Topic que espera la CENTRAL
 KAFKA_TOPIC_TELEMETRY = "cp_telemetry"
 
+INPUT_MODE = False # Bandera para pausar el refresco de pantalla
+
 # Seva: Función para reportar mensajes del Engine a la Central
 def enviar_log_central(mensaje):
     """Envía cualquier log (info o error) a la API de la Central."""
@@ -315,6 +317,18 @@ def enviar_log_central(mensaje):
         requests.post(url, json={"source": "ENGINE", "msg": mensaje}, timeout=0.5)
     except Exception:
         pass
+
+# Seva: función auxiliar para obtener la IP local
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)) # Truco para obtener IP real de salida
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
+
 
 # Funcion Productor Kafka para mandar la telemetria ---
 def init_kafka_producer(broker):
@@ -381,7 +395,9 @@ def init_kafka_producer(broker):
 def send_telemetry_message(payload):
     """Envía payload cifrado a Kafka. Si no hay clave, BLOQUEA el envío."""
     global KAFKA_PRODUCER, SYMMETRIC_KEY
-    
+
+    payload['source_ip'] = get_local_ip()
+
     # 1. Validaciones de estado 
     msg_type = payload.get('type', '').upper()
     if msg_type not in ['AVERIADO', 'CONEXION_PERDIDA', 'FAULT', 'SESSION_STARTED', 'SUPPLY_END']:
@@ -446,6 +462,10 @@ protocol_lock = threading.Lock()
 
 def display_status():
     """Muestra el estado actual del Engine en pantalla con mensajes del protocolo sobre el menú."""
+    global INPUT_MODE
+    # Si el usuario está escribiendo algo importante, NO refrescamos
+    if INPUT_MODE: 
+        return
     clear_screen()
     
     # Sección superior: Mensajes del protocolo (últimos 5, similar al Monitor)
@@ -824,55 +844,74 @@ def process_user_input():
                 else:
                     add_protocol_message("Usuario: Estado ya estaba en OK")
                 # No llamar display_status aquí, se actualizará automáticamente
-                
+
+            #Seva: he modificado el boton INIT para poder inciar la carga sin un driver asignado    
             #Paso 2.3: Comando INIT - Iniciar Suministro
             elif command == 'I' or command == 'INIT':
                 print(f"\n[Engine] *** COMANDO INIT RECIBIDO ***")
-                #Paso 2.3.1: Consultar a CENTRAL directamente si hay sesión activa autorizada
+                # 1. Consultar a CENTRAL si hay sesión remota (App Driver)
+                driver_id = None
                 try:
                     helper_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                     helper_socket.connect(('127.0.0.1', ENGINE_PORT + 1000))
                     helper_socket.sendall(f"CHECK_SESSION#{CP_ID}".encode('utf-8'))
                     resp = helper_socket.recv(1024).decode('utf-8').strip()
                     helper_socket.close()
-                except Exception as e:
-                    print(f"[Engine] Error consultando sesión activa: {e}")
-                    resp = "NO_SESSION"
 
-                #Paso 2.3.2: Verificar respuesta de sesión
-                if resp == "NO_SESSION":
-                    print("[ENGINE] ERROR: No hay conductor autorizado para iniciar el suministro.")
-                    add_protocol_message("No hay sesión: conecta el coche desde la app del conductor (SOLICITAR)")
-                else:
-                    #Paso 2.3.3: Extraer ID del driver
-                    driver_id = resp
-                    print(f"[ENGINE] Sesión validada para driver {driver_id}")
-                    #Paso 2.3.4: Verificar que se puede iniciar
-                    with status_lock:
-                        can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
-                    if not can_start:
-                        print("[ENGINE] No se puede iniciar: ya está cargando o estado KO.")
+                    if resp != "NO_SESSION" and resp != "ERROR":
+                        driver_id = resp
+                        print(f"[Engine] Sesión remota detectada para Driver: {driver_id}")
+
+                except Exception as e:
+                    print(f"[Engine] Error comprobando sesión remota: {e}")
+
+                # 2. Lógica de Decisión (App vs Manual)
+                if not driver_id:
+                    print("[Engine] No hay reserva remota (App) activa.")
+                    global INPUT_MODE
+                    INPUT_MODE = True # Pausamos el refresco de pantalla
+                    try:
+                        # Ahora el usuario puede escribir tranquilo
+                        opcion = input("¿Desea iniciar una CARGA MANUAL (Usuario Invitado)? [S/N]: ").strip().upper()
+                    finally:
+                        INPUT_MODE = False # Reanudamos el refresco pase lo que pase
+                    if opcion == 'S':
+                        driver_id = "INVITADO"
+                        print("[Engine] Iniciando modo USUARIO INVITADO (Sin App).")
                     else:
-                        #Paso 2.3.5: Iniciar suministro
-                        print(f"[ENGINE] Iniciando suministro para driver {driver_id}...")
-                        enviar_log_central(f"[{CP_ID}] Inicio manual de carga (INIT). Driver: {driver_id}")
-                        with status_lock:
-                            ENGINE_STATUS['is_charging'] = True
-                            ENGINE_STATUS['driver_id'] = driver_id
-                        #Paso 2.3.6: Avisar a CENTRAL que la sesión comienza
-                        send_telemetry_message({
-                            "type": "SESSION_STARTED",
-                            "cp_id": CP_ID,
-                            "user_id": driver_id
-                        })
-                        #Paso 2.3.7: Iniciar hilo de simulación de carga
-                        threading.Thread(
-                            target=simulate_charging,
-                            args=(CP_ID, BROKER, driver_id),
-                            daemon=True
-                        ).start()
-                        print(f"[ENGINE] Carga iniciada tras validar sesión para driver {driver_id}.")
-                #Paso 2.3.8: Actualizar display
+                        print("[Engine] Operación cancelada.")
+                        add_protocol_message("Inicio de carga cancelado por el usuario.")
+                        display_status()
+                        continue
+
+                # 3. Iniciar Suministro 
+                with status_lock:
+                    can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
+                
+                if not can_start:
+                    print("[ENGINE] No se puede iniciar: El CP ya está cargando o está AVERIADO.")
+                else:
+                    print(f"[ENGINE] Iniciando suministro para: {driver_id}...")
+                    enviar_log_central(f"[{CP_ID}] Inicio de carga ({'MANUAL' if driver_id=='INVITADO' else 'APP'}). Usuario: {driver_id}")
+                    
+                    with status_lock:
+                        ENGINE_STATUS['is_charging'] = True
+                        ENGINE_STATUS['driver_id'] = driver_id
+                    
+                    # Avisar a CENTRAL (Start Session)
+                    send_telemetry_message({
+                        "type": "SESSION_STARTED",
+                        "cp_id": CP_ID,
+                        "user_id": driver_id
+                    })
+                    
+                    # Arrancar hilo de simulación
+                    threading.Thread(
+                        target=simulate_charging,
+                        args=(CP_ID, BROKER, driver_id),
+                        daemon=True
+                    ).start()
+                
                 display_status()
                 
             #Paso 2.4: Comando END - Finalizar Suministro

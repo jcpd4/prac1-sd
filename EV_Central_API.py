@@ -117,25 +117,26 @@ def receive_external_log():
 
 @app.route('/api/logs', methods=['GET'])
 def get_logs():
-    """Devuelve TODOS los logs mezclados y ordenados para la web."""
     combined_logs = []
     
-    # 1. Añadir logs internos de Central
+    # 1. Logs internos de Central (Ahora tienen timestamp real)
     if CONTEXT["central_messages"]:
-        # Los logs de central son strings, les inventamos un timestamp aproximado (el actual)
-        # o simplemente los ponemos al final. Para hacerlo simple:
-        for m in list(CONTEXT["central_messages"]):
-            combined_logs.append({
-                'source': 'CENTRAL',
-                'msg': m,
-                'timestamp': time.time() # Aproximado
-            })
-            
-    # 2. Añadir logs externos (Registry, Weather...)
+        for entry in list(CONTEXT["central_messages"]):
+            # Si usamos TimestampedList, entry es un dict {'msg':..., 'timestamp':...}
+            if isinstance(entry, dict):
+                combined_logs.append({
+                    'source': 'CENTRAL',
+                    'msg': entry['msg'],
+                    'timestamp': entry['timestamp'] # ¡Hora Real!
+                })
+            else:
+                # Fallback por si acaso
+                combined_logs.append({'source': 'CENTRAL','msg': str(entry),'timestamp': time.time()})
+                
+    # 2. Logs Externos (Igual que antes)
     combined_logs.extend(EXTERNAL_LOGS)
     
-    # 3. Devolver (la web se encargará de filtrar)
-    # Devolvemos los últimos 100 para no saturar
+    combined_logs.sort(key=lambda x: x['timestamp'])
     return jsonify({"logs": combined_logs[-100:]}), 200
 
 @app.route('/api/alertas', methods=['POST'])
@@ -152,6 +153,12 @@ def receive_weather_alert():
     if CONTEXT["central_messages"] is not None:
         CONTEXT["central_messages"].append(msg)
     
+    EXTERNAL_LOGS.append({
+        'timestamp': time.time(),
+        'source': 'EV_W',
+        'msg': msg
+    })
+
     # Lógica de parada/arranque
     all_cps = database.get_all_cps()
     send_cmd = CONTEXT["send_command_func"]
@@ -190,12 +197,12 @@ def revoke_cp_key():
 
     # 1. Llamar a la base de datos para borrar las claves
     if database.revoke_cp_keys(cp_id):
-        msg = f"SEGURIDAD: Claves del CP {cp_id} REVOCADAS manualmente."
+        msg = f"Claves del CP {cp_id} REVOCADAS manualmente."
         print(f"[API] {msg}")
         
         # 2. Guardar log interno para mostrar en consola de Central
         if CONTEXT["central_messages"] is not None:
-            CONTEXT["central_messages"].append(f"[SEGURIDAD] {msg}")
+            CONTEXT["central_messages"].append(f"{msg}")
         
         # 3. Generar evento de AUDITORÍA
         # Usamos request.remote_addr para registrar quién ordenó la revocación
@@ -223,6 +230,67 @@ def revoke_cp_key():
     
     return jsonify({"error": "CP no encontrado o error en BD"}), 404
 
+#Seva: --- ENDPOINTS DE COMANDOS A CPs (PARAR/REANUDAR) ---
+@app.route('/api/comandos/cp', methods=['POST'])
+def send_cp_action():
+    """Envía PARAR o REANUDAR a un CP específico."""
+    data = request.json
+    cp_id = data.get('cp_id')
+    action = data.get('action') # Espera 'PARAR' o 'REANUDAR'
+
+    if not cp_id or not action:
+        return jsonify({"error": "Faltan parámetros"}), 400
+
+    send_cmd = CONTEXT["send_command_func"]
+    
+    # Verificamos si el CP está conectado (tiene socket activo)
+    if cp_id not in CONTEXT["active_cp_sockets"]:
+        return jsonify({"error": "El CP no está conectado. No se puede enviar comando."}), 404
+
+    if send_cmd:
+        # Auditoría: Registramos que la orden vino desde la Web
+        log_audit_event(
+            source_ip=request.remote_addr,
+            action=f"WEB_ORDEN_{action}",
+            description=f"Orden manual desde Web: {action} para {cp_id}",
+            cp_id=cp_id
+        )
+        
+        # Ejecutar el comando usando la lógica de la Central
+        send_cmd(cp_id, action, CONTEXT["central_messages"])
+        return jsonify({"message": f"Comando {action} enviado a {cp_id}"}), 200
+
+    return jsonify({"error": "Función de comandos no disponible"}), 500
+
+# Seva: --- ENDPOINTS DE COMANDOS MASIVOS
+@app.route('/api/comandos/todos', methods=['POST'])
+def send_global_action():
+    """Envía PARAR o REANUDAR a TODOS los CPs conectados."""
+    data = request.json
+    action = data.get('action') # 'PARAR' o 'REANUDAR'
+
+    if not action:
+        return jsonify({"error": "Falta acción"}), 400
+
+    send_cmd = CONTEXT["send_command_func"]
+    active_sockets = CONTEXT["active_cp_sockets"]
+
+    if send_cmd and active_sockets:
+        count = 0
+        # Iteramos sobre una copia de las claves para evitar errores de concurrencia
+        for cp_id in list(active_sockets.keys()):
+            # Auditoría individual para trazabilidad completa
+            log_audit_event(
+                source_ip=request.remote_addr,
+                action=f"WEB_ORDEN_MASIVA_{action}",
+                description=f"Orden masiva desde Web: {action}",
+                cp_id=cp_id
+            )
+            send_cmd(cp_id, action, CONTEXT["central_messages"])
+            count += 1
+        return jsonify({"message": f"Comando {action} enviado a {count} CPs conectados"}), 200
+
+    return jsonify({"message": "No hay CPs conectados para recibir la orden"}), 200
 
 def start_api_server(host, port):
     print(f"[API Central] Escuchando peticiones HTTP en {host}:{port}")

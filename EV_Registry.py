@@ -62,6 +62,13 @@ def register_cp():
         
         print(f"[Registry] CP {cp_id} registrado con éxito. Token y Clave Simétrica generados.")
         enviar_log_central(f"CP {cp_id} REGISTRADO.\n   >> Token: {token}\n   >> Clave: {symmetric_key}")
+        log_audit_event(
+            source_ip=request.remote_addr,  
+            action="CP_ALTA_REGISTRO",
+            description=f"CP registrado exitosamente. Credenciales (Token+Clave) generadas y entregadas.",
+            cp_id=cp_id
+        )
+        
         # 4. Devolver el token y la clave simétrica al CP
         return jsonify({
             "message": "CP registrado correctamente",
@@ -91,7 +98,8 @@ def unregister_cp():
     
     if database.delete_cp(cp_id):
         # Seva: AUDITORÍA: BAJA DE CP EXITOSA ***
-        # La IP de origen es la que llama a este endpoint (presumiblemente el CP Monitor)
+        # La IP de origen es la que llama a este endpoint 
+        # Seva: AUDITORÍA: BAJA DE CP EXITOSA ***
         log_audit_event(
             source_ip=request.remote_addr, 
             action="CP_BAJA_EXITOSA",

@@ -5,6 +5,7 @@ import json
 from kafka import KafkaConsumer, KafkaProducer
 import threading
 import os
+import socket
 from collections import deque
 
 # --- Configuración ---
@@ -40,6 +41,16 @@ def colorize_status(status):
     end = '\033[0m'
     return f"{colors.get(status,'')}{status}{end}"
 
+#Seva: Función para obtener la IP local del equipo
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)) # Truco para obtener IP real de salida
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return "127.0.0.1"
 
 # HILO 1: Funcion Kafka que porcesa las notificaciones de la central 
 def process_central_notifications(kafka_broker, client_id, messages):
@@ -263,7 +274,7 @@ def start_driver_interactive_logic(producer, messages):
                     messages.append("Uso: SOLICITAR <CP_ID>")
                     continue
                 cp_id = parts[1]
-                request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time() }
+                request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time(), "source_ip": get_local_ip() }
                 try:
                     producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
@@ -288,7 +299,7 @@ def start_driver_interactive_logic(producer, messages):
                     messages.append(f"BATCH ({i+1}/{len(cps_to_request)}): Solicitando recarga en {cp_id}")
                     
                     #Paso 2.2.4.3.1: Enviar la petición de recarga
-                    request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time() }
+                    request_message = { "user_id": CLIENT_ID, "cp_id": cp_id, "timestamp": time.time(), "source_ip": get_local_ip() }
                     producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     
                     #Paso 2.2.4.3.2: Esperar a que la recarga sea autorizada y comience
@@ -382,7 +393,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         # Avisar a CENTRAL para liberar reservas del driver
         try:
-            quit_msg = {"type": "DRIVER_QUIT", "user_id": CLIENT_ID, "timestamp": time.time()}
+            quit_msg = {"type": "DRIVER_QUIT", "user_id": CLIENT_ID, "timestamp": time.time(), "source_ip": get_local_ip()}
             kafka_producer.send(KAFKA_TOPIC_REQUESTS, value=quit_msg)
             kafka_producer.flush()
         except Exception:
