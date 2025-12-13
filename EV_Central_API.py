@@ -6,6 +6,11 @@ import time
 import logging
 import database
 from database import log_audit_event # Seva: Importar función de auditoría
+from kafka import KafkaProducer  
+import json
+
+SIMULATION_PRODUCER = None
+
 app = Flask(__name__)
 CORS(app)
 
@@ -291,6 +296,47 @@ def send_global_action():
         return jsonify({"message": f"Comando {action} enviado a {count} CPs conectados"}), 200
 
     return jsonify({"message": "No hay CPs conectados para recibir la orden"}), 200
+
+def configure_api(messages_list, drivers_set, sockets_dict, command_func, kafka_broker_url=None): # <--- Nuevo argumento
+    global SIMULATION_PRODUCER
+    CONTEXT["central_messages"] = messages_list
+    CONTEXT["connected_drivers"] = drivers_set
+    CONTEXT["active_cp_sockets"] = sockets_dict
+    CONTEXT["send_command_func"] = command_func
+    
+    # Inicializar productor de simulación
+    if kafka_broker_url:
+        try:
+            SIMULATION_PRODUCER = KafkaProducer(
+                bootstrap_servers=[kafka_broker_url],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+            print(f"[API] Canal de Simulación conectado a {kafka_broker_url}")
+        except Exception as e:
+            print(f"[API] Error conectando Kafka: {e}")
+
+# En EV_Central_API.py (añádelo antes de start_api_server)
+
+@app.route('/api/simulacion', methods=['POST'])
+def enviar_simulacion():
+    """Envía comandos F, R, I, E al Engine vía Kafka."""
+    data = request.json
+    cp_id = data.get('cp_id')
+    command = data.get('command') # F, R, I, E
+
+    if not SIMULATION_PRODUCER:
+        return jsonify({"error": "Kafka no disponible"}), 500
+
+    # Enviamos la orden al topic 'cp_simulation'
+    msg = {"target_cp": cp_id, "command": command}
+    SIMULATION_PRODUCER.send('cp_simulation', value=msg)
+    SIMULATION_PRODUCER.flush()
+    
+    # Log visual
+    if CONTEXT["central_messages"] is not None:
+        CONTEXT["central_messages"].append(f"[SIMULACION] Enviado comando {command} a {cp_id}")
+
+    return jsonify({"message": f"Comando {command} enviado"}), 200
 
 def start_api_server(host, port):
     print(f"[API Central] Escuchando peticiones HTTP en {host}:{port}")

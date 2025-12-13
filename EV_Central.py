@@ -2353,7 +2353,8 @@ if __name__ == "__main__":
             messages_list=central_messages,    # Para escribir logs
             drivers_set=connected_drivers,     # Para leer drivers conectados
             sockets_dict=active_cp_sockets,    # Para saber qué CPs tienen socket
-            command_func=send_cp_command       # Para poder enviar órdenes (PARAR/REANUDAR)
+            command_func=send_cp_command,      # Para poder enviar órdenes (PARAR/REANUDAR)
+            kafka_broker_url=KAFKA_BROKER
         )
         
         # 2. Arrancar el servidor Flask en un hilo separado

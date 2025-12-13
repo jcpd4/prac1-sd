@@ -9,6 +9,7 @@ import requests
 from kafka import KafkaProducer # Usado para enviar telemetría a Central (asíncrono)
 from kafka.errors import NoBrokersAvailable
 from cryptography.fernet import Fernet # Seva: Importar Fernet para manejo de claves simétricas
+from kafka import KafkaConsumer # Asegúrate de importar esto arriba
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
 # Constantes del protocolo
@@ -936,6 +937,57 @@ def process_user_input():
         except Exception as e:
             print(f"Error en la entrada de usuario: {e}")
 
+# para los botones del engine en el frontend
+# Función nueva para escuchar órdenes remotas
+def listen_simulation_commands(broker, my_cp_id):
+    """Escucha el topic 'cp_simulation' para recibir órdenes de la web."""
+    try:
+        consumer = KafkaConsumer(
+            'cp_simulation',
+            bootstrap_servers=[broker],
+            value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+            auto_offset_reset='latest'
+        )
+        print(f"[Engine] Escuchando comandos de simulación remota...")
+        
+        for msg in consumer:
+            payload = msg.value
+            target = payload.get('target_cp')
+            cmd = payload.get('command')
+            
+            # Solo obedecemos si es para NOSOTROS o para TODOS
+            if target == my_cp_id or target == "ALL":
+                print(f"\n[REMOTE] Comando recibido: {cmd}")
+                
+                # Ejecutamos la lógica que ya tenías en process_user_input
+                if cmd == 'F': # FAIL
+                    with status_lock: ENGINE_STATUS['health'] = 'KO'
+                    add_protocol_message("Remoto: Simulación AVERÍA (F)")
+                
+                elif cmd == 'R': # RECOVER
+                    with status_lock: ENGINE_STATUS['health'] = 'OK'
+                    add_protocol_message("Remoto: Simulación RECUPERACIÓN (R)")
+
+                elif cmd == 'I': # INIT (Enchufar)
+                    # Truco: Inyectamos 'I' en la entrada estándar no es fácil,
+                    # mejor llamamos a la lógica directamente.
+                    # (Copia aquí la lógica de INIT que tienes en process_user_input)
+                    # OJO: Simular carga remota requiere saber driver_id, usaremos "WEB_TESTER"
+                    with status_lock:
+                        can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
+                    if can_start:
+                        with status_lock:
+                            ENGINE_STATUS['is_charging'] = True
+                            ENGINE_STATUS['driver_id'] = "WEB_TESTER"
+                        send_telemetry_message({"type": "SESSION_STARTED", "cp_id": CP_ID, "user_id": "WEB_TESTER"})
+                        threading.Thread(target=simulate_charging, args=(CP_ID, BROKER, "WEB_TESTER"), daemon=True).start()
+
+                elif cmd == 'E': # END (Desenchufar)
+                    with status_lock: ENGINE_STATUS['is_charging'] = False
+
+    except Exception as e:
+        print(f"[Engine] Error en listener remoto: {e}")
+
 # --- Punto de Entrada Principal ---
 if __name__ == "__main__":
     #Paso 1: Obtener los argumentos de la línea de comandos
@@ -975,6 +1027,10 @@ if __name__ == "__main__":
         
         display_thread = threading.Thread(target=update_display_periodically, daemon=True)
         display_thread.start()
+
+        # <--- AÑÁDELO AQUÍ (NUEVO HILO DE SIMULACIÓN) --->
+        # Hilo para escuchar comandos de simulación remota (Web)
+        threading.Thread(target=listen_simulation_commands, args=(KAFKA_BROKER, CP_ID), daemon=True).start()
 
         # Paso 5.3: Iniciar el hilo principal para la entrada de comandos del usuario
         start_msg = f"Engine {CP_ID} INICIADO. Esperando Monitor en puerto {ENGINE_PORT}..."

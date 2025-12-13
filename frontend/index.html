@@ -176,16 +176,15 @@
             } catch(e) { console.error(e); }
         }
 
-        // --- ACTUALIZACIÓN DE RENDER TABLE ---
-        
         function renderTable(cps) {
             const tbody = document.querySelector('#tabla-cps tbody');
             if(!cps || cps.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay CPs registrados.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay CPs registrados en la Base de Datos.</td></tr>';
                 return;
             }
 
             tbody.innerHTML = cps.map(cp => {
+                // Clima
                 let tempHtml = "";
                 for (const city in cityTemps) {
                     if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
@@ -194,38 +193,54 @@
                     }
                 }
 
-                // Botones de acción individuales
-                // Solo mostramos Parar/Reanudar si NO está revocado (Fuera de servicio por seguridad)
-                let actionButtons = "";
+                // 1. Botones de CONTROL (Central)
+                let centralBtns = "";
                 if(cp.status !== 'FUERA_DE_SERVICIO') {
-                    actionButtons = `
-                        <button class="btn-control btn-stop" onclick="comandoCP('${cp.id}', 'PARAR')" title="Parar CP">⏸</button>
-                        <button class="btn-control btn-resume" onclick="comandoCP('${cp.id}', 'REANUDAR')" title="Reanudar CP">▶</button>
+                    centralBtns = `
+                        <div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #eee;">
+                            <span style="font-size:0.7em; color:#666; font-weight:bold;">CENTRAL:</span>
+                            <button class="btn-control btn-stop" onclick="comandoCP('${cp.id}', 'PARAR')" title="Parar (P)">⏸</button>
+                            <button class="btn-control btn-resume" onclick="comandoCP('${cp.id}', 'REANUDAR')" title="Reanudar (R)">▶</button>
+                        </div>
                     `;
                 }
 
-                // Botón Revocar (existente)
-                let btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')" title="Simular ataque">☠️</button>`;
-                if(cp.status === 'FUERA_DE_SERVICIO') {
-                    btnRevoke = `<span style="color:orange; font-size:0.8em;">⚠ REVOCADO</span>`;
-                    // Si está revocado, quizás quieras permitir reanudar manualmente si recuperó claves pero se quedó pillado
-                    // Ocultamos los controles normales para forzar la recuperación automática, o los dejamos visibles.
-                    // En este diseño, si está revocado, oculto Parar/Reanudar para priorizar la seguridad.
+                // 2. Botones de SIMULACIÓN (Engine)
+                let simBtns = `
+                    <div>
+                        <span style="font-size:0.7em; color:#666; font-weight:bold;">ENGINE:</span>
+                        <button class="btn-control" style="background:#dc3545;" onclick="simularEngine('${cp.id}', 'F')" title="Simular Avería (F)">🔥</button>
+                        <button class="btn-control" style="background:#28a745;" onclick="simularEngine('${cp.id}', 'R')" title="Simular Recuperación (R)">🔧</button>
+                        <button class="btn-control" style="background:#007bff;" onclick="simularEngine('${cp.id}', 'I')" title="Enchufar Coche (I)">🚗</button>
+                        <button class="btn-control" style="background:#6c757d;" onclick="simularEngine('${cp.id}', 'E')" title="Desenchufar (E)">🔌</button>
+                    </div>
+                `;
+
+                // 3. Botón de Seguridad (Revocar)
+                let btnRevoke;
+                let isRevoked = (cp.status === 'FUERA_DE_SERVICIO' || cp.status === 'DESCONECTADO');
+                if (isRevoked) {
+                    btnRevoke = `<button class="btn-revoke btn-disabled" disabled>REVOCADO</button>`;
+                } else {
+                    btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')" title="Simular ataque">☢️ REVOCAR</button>`;
                 }
+
+                // Información de suministro
+                let infoSum = (cp.status === 'SUMINISTRANDO' && cp.kwh) 
+                              ? `⚡ ${cp.kwh.toFixed(2)} kWh` 
+                              : '<span style="color:#ccc;">-</span>';
 
                 return `
                 <tr>
                     <td><b>${cp.id}</b></td>
                     <td>${cp.location} ${tempHtml}</td>
                     <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
-                    <td>${cp.status==='SUMINISTRANDO' ? `⚡ ${cp.kwh?.toFixed(2)} kWh` : '<span style="color:#ccc;">-</span>'}</td>
+                    <td>${infoSum}</td>
                     <td>
-                        <div style="display:flex; align-items:center;">
-                            ${actionButtons}
-                            <span style="border-left:1px solid #ccc; margin:0 8px; height:20px;"></span>
-                            ${btnRevoke}
-                        </div>
+                        ${centralBtns}
+                        ${simBtns}
                     </td>
+                    <td style="text-align:center;">${btnRevoke}</td>
                 </tr>`;
             }).join('');
         }
@@ -300,55 +315,24 @@
             // div.scrollTop = div.scrollHeight; 
         }
 
-        function renderTable(cps) {
-            const tbody = document.querySelector('#tabla-cps tbody');
-            if(!cps || cps.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;">No hay CPs registrados en la Base de Datos.</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = cps.map(cp => {
-                // Clima (Tu lógica actual)
-                let tempHtml = "";
-                for (const city in cityTemps) {
-                    if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
-                        tempHtml = `<span class="temp-badge">🌡️ ${cityTemps[city]}ºC</span>`;
-                        break; 
-                    }
-                }
-
-                // NUEVO: Lógica del botón de Revocación
-                // Si el CP está "FUERA_DE_SERVICIO", asumimos que ya ha sido revocado o parado,
-                // así que desactivamos el botón visualmente para que no se pulse dos veces.
-                let isRevoked = (cp.status === 'FUERA_DE_SERVICIO' || cp.status === 'DESCONECTADO');
-                
-                let btnRevoke;
-                if (isRevoked) {
-                    // Botón gris desactivado
-                    btnRevoke = `<button class="btn-revoke btn-disabled" disabled>REVOCADO</button>`;
-                } else {
-                    // Botón rojo activo
-                    btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')">☢️ REVOCAR CLAVES</button>`;
-                }
-
-                // Información de suministro
-                let infoSum = (cp.status === 'SUMINISTRANDO' && cp.kwh) 
-                              ? `⚡ ${cp.kwh.toFixed(2)} kWh` 
-                              : '<span style="color:#ccc;">-</span>';
-
-                return `
-                <tr>
-                    <td><b>${cp.id}</b></td>
-                    <td>${cp.location} ${tempHtml}</td>
-                    <td><span class="badge bg-${cp.status}">${cp.status}</span></td>
-                    <td>${infoSum}</td>
-                    <td style="text-align:center;">${btnRevoke}</td>
-                </tr>`;
-            }).join('');
-        }
-
         setInterval(update, 2000); // Refresco cada 2s
         update();
+
+        // --- NUEVA FUNCIÓN PARA SIMULACIÓN (ENGINE) ---
+        async function simularEngine(cpId, cmd) {
+            try {
+                // Llamamos al nuevo endpoint de la API que reenvía a Kafka
+                await fetch(`${API}/simulacion`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({cp_id: cpId, command: cmd})
+                });
+                console.log(`Simulación ${cmd} enviada a ${cpId}`);
+            } catch(e) { 
+                console.error("Error enviando simulación:", e); 
+                alert("Error: Asegúrate de que la Central (EV_Central) está corriendo.");
+            }
+        }
     </script>
 </body>
 </html>
