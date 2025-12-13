@@ -37,24 +37,41 @@ def cargar_configuracion():
         return None, {}
 
 def obtener_clima(ciudad, api_key):
-    """Consulta la API de OpenWeather."""
+    """Consulta la API de OpenWeather y reporta errores a la Web."""
     if not api_key: return None
     try:
-        # Usamos la API Key leída del JSON
         url = f"http://api.openweathermap.org/data/2.5/weather?q={ciudad}&appid={api_key}&units=metric"
         response = requests.get(url, timeout=2)
         
         if response.status_code == 200:
             data = response.json()
             return data['main']['temp']
+            
         elif response.status_code == 401:
-            print(f"[CLIMA] Error 401: API Key inválida.")
+            err = f"Error 401: API Key inválida."
+            print(f"[CLIMA] {err}")
+            # ENVIAR ERROR A LA WEB
+            try:
+                requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
+            except: pass
+            
         else:
-            print(f"[CLIMA] Error al obtener clima de {ciudad}: {response.status_code}")
+            err = f"Error al obtener clima de {ciudad}: {response.status_code}"
+            print(f"[CLIMA] {err}")
+            # ENVIAR ERROR A LA WEB
+            try:
+                requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
+            except: pass
+            
     except Exception as e:
-        print(f"[CLIMA] Excepción conectando con OpenWeather: {e}")
+        err = f"Error conectando con OpenWeather: {e}"
+        print(f"[CLIMA] {err}")
+        # ENVIAR ERROR A LA WEB (Requisito de fallo de componente externo)
+        try:
+            requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
+        except: pass
+        
     return None
-
 
 def obtener_umbral_central():
     """Consulta el umbral de temperatura configurado en la Central."""
