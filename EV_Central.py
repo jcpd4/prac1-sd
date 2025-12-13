@@ -2288,7 +2288,7 @@ if __name__ == "__main__":
         
         # Paso 3: Usaremos listas compartidas para que los hilos se comuniquen con el panel
         central_messages = TimestampedList()
-        central_messages = ["CENTRAL system status OK"] #Lo que muestra el panel de estado (display_panel)
+        central_messages.append("CENTRAL system status OK")
         driver_requests = []                            #Pedidos de drivers en cola (process_kafka_requests)    
 
         # Paso 4: Crear un productor Kafka compartido para que lo usen varios hilos
