@@ -1159,6 +1159,29 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 #Seva: he modificado esta parte para poder procesar la carga sin un usuario asignado
                 #Paso 2.4.1: Procesar el consumo periódico (ENGINE envía cada segundo)
                 if msg_type == 'CONSUMO':
+                    # --- 🛑 EL POLICÍA: BLOQUEO DE SEGURIDAD 🛑 ---
+                    # Verificamos el estado real en la Base de Datos
+                    current_db_status = database.get_cp_status(cp_id)
+                    
+                    # Si el CP está roto (AVERIADO) o parado (FUERA_DE_SERVICIO), ¡NO PUEDE CARGAR!
+                    if current_db_status in ['AVERIADO', 'FUERA_DE_SERVICIO', 'DESCONECTADO']:
+                        print(f"[CENTRAL] 🚨 ALERTA DE SEGURIDAD: CP {cp_id} intentando cargar en estado {current_db_status}.")
+                        
+                        # 1. Enviamos orden de CORTE INMEDIATO al CP
+                        # Usamos la función send_cp_command que ya tienes definida
+                        # Nota: Necesitas asegurarte de tener acceso a send_cp_command o usar la lógica directa
+                        if cp_id in active_cp_sockets:
+                            try:
+                                # Enviamos PARAR directamente por el socket
+                                socket_ref = active_cp_sockets[cp_id]
+                                send_frame(socket_ref, "PARAR#CENTRAL", central_messages)
+                                print(f"[CENTRAL] 🛑 Orden de PARADA FORZOSA enviada a {cp_id}")
+                            except:
+                                pass
+                        
+                        # 2. Ignoramos este paquete de consumo (no cobramos ni registramos)
+                        continue 
+                    # -----------------------------------------------------
                     kwh = float(payload.get('kwh', 0)) # Consumo en kWh
                     importe = float(payload.get('importe', 0)) # Importe en euros
                     driver_id = payload.get('user_id') or payload.get('driver_id') # ID del driver
