@@ -92,6 +92,8 @@
         }
         .weather-row:last-child { border-bottom: none; }
     </style>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
     <h1> EVCharging - Panel de Control</h1>
@@ -119,6 +121,13 @@
                     <tbody><tr><td colspan="5">Esperando datos...</td></tr></tbody>
                 </table>
             </div>
+
+            <div style="margin-top: 20px; border-top: 1px solid #eee; padding-top: 15px;">
+                    <h3 style="margin-top:0;">🌍 Mapa de Cobertura</h3>
+                    <div id="map" style="height: 300px; width: 100%; border-radius: 8px; border: 1px solid #ccc;"></div>
+            </div>
+            
+
             
             <div class="card">
                 <h2> Configuración Climática (EV_W)</h2>
@@ -195,6 +204,8 @@
                 }
 
                 renderTable(data.cps);
+
+                updateMapMarkers(data.cps);
 
                 // 2. Obtener Logs
                 const resLog = await fetch(`${API}/logs`);
@@ -372,6 +383,73 @@
 
         // --- RENDERIZADO ---
 
+        let map;
+        let markers = {}; // Para guardar las chinchetas y no duplicarlas
+
+        // Coordenadas fijas para tus ciudades de prueba
+        const cityCoords = {
+            "madrid": [40.4168, -3.7038],
+            "barcelona": [41.3851, 2.1734],
+            "valencia": [39.4699, -0.3763],
+            "sevilla": [37.3891, -5.9845],
+            "oslo": [59.9139, 10.7522],
+            "paris": [48.8566, 2.3522],
+            "default": [40.4637, -3.7492] // Centro de España aprox.
+        };
+
+        function initMap() {
+            // 1. Inicializar mapa centrado en España
+            map = L.map('map').setView([40.4168, -3.7038], 5); // Zoom nivel 5
+
+            // 2. Cargar las baldosas (tiles) de OpenStreetMap
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors'
+            }).addTo(map);
+        }
+
+        function updateMapMarkers(cps) {
+            if (!map) return;
+
+            // Limpiamos marcadores antiguos para simplificar (o podrías actualizarlos)
+            for (let id in markers) {
+                map.removeLayer(markers[id]);
+            }
+            markers = {};
+
+            cps.forEach(cp => {
+                let loc = cp.location.toLowerCase();
+                let coords = null;
+
+                // Buscamos si la ubicación contiene alguna de nuestras ciudades conocidas
+                for (let city in cityCoords) {
+                    if (loc.includes(city)) {
+                        coords = cityCoords[city];
+                        break;
+                    }
+                }
+
+                // Si encontramos coordenadas, ponemos chincheta
+                if (coords) {
+                    // Elegimos color del icono según estado (Truco: usamos filtros CSS en el icono por defecto de Leaflet)
+                    // O simplemente ponemos un popup con la info
+                    let marker = L.marker(coords).addTo(map);
+                    
+                    let statusIcon = "";
+                    if(cp.status === 'ACTIVADO') statusIcon = "🟢";
+                    else if(cp.status === 'AVERIADO') statusIcon = "🔴";
+                    else if(cp.status === 'SUMINISTRANDO') statusIcon = "⚡";
+                    else statusIcon = "⚪";
+
+                    marker.bindPopup(`
+                        <b>${cp.id}</b><br>
+                        ${statusIcon} ${cp.status}<br>
+                        ${cp.location}
+                    `);
+                    markers[cp.id] = marker;
+                }
+            });
+        }
+
         function setFilter(filter) {
             currentFilter = filter;
             document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
@@ -462,6 +540,7 @@
             } catch(e) { alert("Error API"); }
         }
 
+        initMap();
         setInterval(update, 2000); // Refresco cada 2s
         update();
 

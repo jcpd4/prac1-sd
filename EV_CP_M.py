@@ -1135,7 +1135,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     #Paso 3: Configurar ubicación del CP
-    locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1, Valencia", "BCN-02": "Las Ramblas 55, Barcelona"}
+    locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1, Valencia", "BCN-02": "Las Ramblas 55, Barcelona", "PAR-01": "Torre Eiffel, Paris"}
     LOCATION = locations.get(CP_ID, "Ubicacion Desconocida")
 
     # --- NUEVO BLOQUE RELEASE 2: REGISTRO ---
