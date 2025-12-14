@@ -7,6 +7,7 @@ import threading
 import os
 import socket
 from collections import deque
+import requests
 
 # --- Configuración ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Driver → Central
@@ -40,6 +41,15 @@ def colorize_status(status):
     }
     end = '\033[0m'
     return f"{colors.get(status,'')}{status}{end}"
+
+# Función para enviar logs a la Web (Central API)
+def log_to_web(msg):
+    """Envía el log a la API para que salga en el frontend."""
+    try:
+        url = "http://127.0.0.1:5000/api/log"
+        requests.post(url, json={"source": "DRIVER", "msg": msg}, timeout=0.1)
+    except:
+        pass 
 
 #Seva: Función para obtener la IP local del equipo
 def get_local_ip():
@@ -105,9 +115,11 @@ def process_central_notifications(kafka_broker, client_id, messages):
                 if msg_type == 'AUTH_OK':
                     messages.append(f" [AUTORIZADO] Recarga autorizada en CP {payload['cp_id']}.")
                     active_charge_info[payload['cp_id']] = {'kwh': 0.0, 'importe': 0.0}
+                    log_to_web(f"[{CLIENT_ID}] ✅ Autorizado en {payload['cp_id']}") # <--- AÑADIR
                     #Paso 2.4.1: Procesar los mensajes de autorización
                 elif msg_type == 'AUTH_DENIED':
                     messages.append(f" [DENEGADO] Recarga RECHAZADA en CP {payload['cp_id']}. Razón: {payload.get('reason', 'CP no disponible')}")
+                    log_to_web(f"[{CLIENT_ID}] ⛔ Denegado en {payload['cp_id']}: {payload.get('reason')}") # <--- AÑADIR
                 #Paso 2.4.2: Procesar los mensajes de consumo
                 elif msg_type == 'CONSUMO_UPDATE':
                     cp_id = payload['cp_id']
@@ -120,6 +132,7 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     messages.append(f" [TICKET] Recarga finalizada en CP {payload['cp_id']}. Consumo: {payload['kwh']} kWh. Coste final: {payload['importe']} €")
                     if payload['cp_id'] in active_charge_info:
                         del active_charge_info[payload['cp_id']]
+                    log_to_web(f"[{CLIENT_ID}] 🎫 TICKET: {payload['kwh']} kWh / {payload['importe']}€") # <--- AÑADIR
                 
                 #Paso 2.4.4: Procesar los mensajes de supply error
                 elif msg_type == 'SUPPLY_ERROR':
@@ -146,6 +159,8 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     #Paso 2.4.4.1: Limpiar la recarga activa, ya que se ha interrumpido
                     if cp_id in active_charge_info:
                         del active_charge_info[cp_id]
+                    
+                    log_to_web(f"[{CLIENT_ID}] ❌ {txt}") # <--- AÑADIR
 
                 elif msg_type == 'SESSION_CANCELLED':
                     # Ignoramos las cancelaciones (supone que ya llegó SUPPLY_ERROR con datos definitivos)
@@ -278,6 +293,8 @@ def start_driver_interactive_logic(producer, messages):
                 try:
                     producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
+                    log_to_web(f"[{CLIENT_ID}] 📤 Solicitando carga en {cp_id}") # <--- AÑADIR
+
                 except Exception as e:
                     messages.append(f"[ERROR KAFKA] No se pudo enviar la petición: {e}")
 
@@ -343,6 +360,7 @@ if __name__ == "__main__":
     #Paso 3: Inicializar la lista compartida para los logs y notificaciones
     driver_messages = deque(maxlen=200)
     driver_messages.append(f"Driver {CLIENT_ID} iniciado.")
+    log_to_web(f"[{CLIENT_ID}] 🚗 Driver iniciado y conectado a Kafka.") # <--- AÑADIR
     driver_messages.append(f"Broker: {KAFKA_BROKER}")
 
     try:

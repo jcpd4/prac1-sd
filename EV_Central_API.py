@@ -267,6 +267,44 @@ def send_cp_action():
 
     return jsonify({"error": "Función de comandos no disponible"}), 500
 
+# --- NUEVO ENDPOINT PARA DRIVER WEB ---
+@app.route('/api/driver/request', methods=['POST'])
+def web_driver_request():
+    """Recibe una petición de carga desde la Web y la envía a Kafka."""
+    data = request.json
+    user_id = data.get('user_id')
+    cp_id = data.get('cp_id')
+
+    if not user_id or not cp_id:
+        return jsonify({"error": "Faltan datos"}), 400
+
+    if not SIMULATION_PRODUCER:
+        return jsonify({"error": "Kafka no conectado en API"}), 500
+
+    # Construimos el mensaje EXACTAMENTE como lo espera la Central
+    # Topic: driver_requests
+    msg = {
+        "user_id": user_id,
+        "cp_id": cp_id,
+        "type": "REQUEST_CHARGE",
+        "timestamp": time.time(),
+        "source_ip": "WEB_DASHBOARD"
+    }
+
+    try:
+        # Reutilizamos el productor que ya teníamos para la simulación
+        # pero enviamos al topic de los drivers
+        SIMULATION_PRODUCER.send('driver_requests', value=msg)
+        SIMULATION_PRODUCER.flush()
+        
+        # Log visual para confirmar salida
+        if CONTEXT["central_messages"] is not None:
+            CONTEXT["central_messages"].append(f"[WEB-DRIVER] Petición enviada: {user_id} -> {cp_id}")
+            
+        return jsonify({"message": "Solicitud enviada a Kafka"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 # Seva: --- ENDPOINTS DE COMANDOS MASIVOS
 @app.route('/api/comandos/todos', methods=['POST'])
 def send_global_action():

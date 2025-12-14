@@ -51,11 +51,46 @@
         .src-EV_W { color: #00d0ff; }
         .src-MONITOR { color: #ffff00; }
         .src-ENGINE { color: #1455eb; }
+        .src-DRIVER { color: #ff9900; font-weight: bold; }
 
         /* Filtros */
         .filter-bar { margin-bottom: 10px; display: flex; gap: 5px; flex-wrap: wrap;}
         .filter-btn { padding: 5px; cursor: pointer; border: 1px solid #ddd; border-radius: 3px; }
         .filter-btn.active { background-color: #007bff; color: white; }
+
+        /* WIDGET FLOTANTE DE CLIMA */
+        #weather-widget {
+            position: fixed;      /* Fijo en la pantalla */
+            bottom: 20px;         /* Separación del fondo */
+            left: 20px;           /* Separación de la izquierda */
+            width: 200px;         /* Ancho fijo */
+            background-color: rgba(255, 255, 255, 0.95); /* Blanco semi-transparente */
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.2); /* Sombra elegante */
+            z-index: 1000;        /* Para que flote sobre todo lo demás */
+            overflow: hidden;
+            font-size: 0.85em;
+        }
+        .weather-header {
+            background-color: #17a2b8; /* Color cian (a juego con EV_W) */
+            color: white;
+            padding: 8px 10px;
+            font-weight: bold;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .weather-content {
+            padding: 10px;
+        }
+        .weather-row {
+            display: flex;
+            justify-content: space-between;
+            border-bottom: 1px dotted #eee;
+            padding: 3px 0;
+        }
+        .weather-row:last-child { border-bottom: none; }
     </style>
 </head>
 <body>
@@ -94,6 +129,27 @@
                 </div>
             </div>
         </div>
+        <div style="display:flex; flex-direction:column; gap:20px;">
+            
+        <div class="card" style="border-top: 4px solid #ff9900;">
+            <h2>📱 Simulador de App Conductor</h2>
+            <div style="display:flex; gap:10px; align-items:center; background:#fff8e1; padding:15px; border-radius:5px;">
+                <div>
+                    <label style="display:block; font-size:0.8em; font-weight:bold; margin-bottom:3px;">ID CLIENTE</label>
+                    <input type="text" id="driverId" value="CLIENTE_WEB" style="padding:8px; width:120px; border:1px solid #ccc; border-radius:4px;">
+                </div>
+                <div>
+                    <label style="display:block; font-size:0.8em; font-weight:bold; margin-bottom:3px;">CP OBJETIVO</label>
+                    <input type="text" id="targetCp" placeholder="Ej: MAD-01" style="padding:8px; width:100px; border:1px solid #ccc; border-radius:4px;">
+                </div>
+                <div style="flex-grow:1; display:flex; justify-content:flex-end; align-items:flex-end;">
+                    <button onclick="solicitarCargaWeb()" style="background:#ff9900; color:white; border:none; padding:10px 20px; border-radius:4px; font-weight:bold; cursor:pointer; height:36px;">
+                        ⚡ SOLICITAR CARGA
+                    </button>
+                </div>
+            </div>
+            <small style="color:#666; margin-top:5px; display:block;">* Esto enviará una petición real a la Central vía Kafka.</small>
+        </div>
 
         <div class="card">
             <h2> Eventos en Tiempo Real</h2>
@@ -104,8 +160,18 @@
                 <button class="filter-btn" onclick="setFilter('EV_W')">CLIMA</button>
                 <button class="filter-btn" onclick="setFilter('MONITOR')">MONITOR</button>
                 <button class="filter-btn" onclick="setFilter('ENGINE')">ENGINE</button>
+                <button class="filter-btn" onclick="setFilter('DRIVER')">DRIVER</button>
             </div>
             <div id="log-console">Conectando con API Central...</div>
+        </div>
+    </div>
+    <div id="weather-widget">
+        <div class="weather-header">
+            <span>🌤️ Clima Actual</span>
+            <small id="weather-count">0 ciudades</small>
+        </div>
+        <div class="weather-content" id="weather-list">
+            Cargando...
         </div>
     </div>
 
@@ -122,7 +188,7 @@
                 const data = await res.json();
                 
                 cityTemps = data.city_temps || {}; 
-                
+                renderWeatherWidget();
                 // Actualizar placeholder del input si no tiene foco
                 if(document.activeElement.id !== 'tempInput') {
                     document.getElementById('tempInput').value = data.config.temp_umbral;
@@ -139,6 +205,35 @@
             } catch (e) { 
                 console.error("Error conectando con API:", e); 
             }
+        }
+        function renderWeatherWidget() {
+            const container = document.getElementById('weather-list');
+            const countLabel = document.getElementById('weather-count');
+            
+            const cities = Object.keys(cityTemps);
+            countLabel.innerText = `${cities.length}`;
+
+            if (cities.length === 0) {
+                container.innerHTML = '<div style="text-align:center; color:#888;">Esperando datos...</div>';
+                return;
+            }
+
+            let html = "";
+            for (const [city, temp] of Object.entries(cityTemps)) {
+                // Color si hace mucho frío (alerta)
+                let tempColor = '#333';
+                let icon = '☀️';
+                if(parseFloat(temp) <= 5) { tempColor = 'blue'; icon = '❄️'; }
+                else if(parseFloat(temp) > 30) { tempColor = 'red'; icon = '🔥'; }
+
+                html += `
+                    <div class="weather-row">
+                        <span style="font-weight:600;">${city}</span>
+                        <span style="color:${tempColor};">${icon} ${temp}ºC</span>
+                    </div>
+                `;
+            }
+            container.innerHTML = html;
         }
 
         // --- ACCIONES ---
@@ -283,6 +378,43 @@
             event.target.classList.add('active');
             renderLogs();
         }
+        // --- FUNCIÓN DRIVER WEB ---
+        async function solicitarCargaWeb() {
+            const driver = document.getElementById('driverId').value;
+            const cp = document.getElementById('targetCp').value;
+
+            if(!driver || !cp) {
+                alert("Por favor, introduce ID de Cliente y CP.");
+                return;
+            }
+
+            try {
+                const res = await fetch(`${API}/driver/request`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({user_id: driver, cp_id: cp})
+                });
+                
+                if(res.ok) {
+                    // Animación simple de éxito
+                    const btn = document.querySelector('button[onclick="solicitarCargaWeb()"]');
+                    const origText = btn.innerHTML;
+                    btn.innerHTML = "✅ ENVIADO";
+                    btn.style.background = "#28a745";
+                    setTimeout(() => {
+                        btn.innerHTML = origText;
+                        btn.style.background = "#ff9900";
+                    }, 2000);
+                    update(); // Forzar actualización de logs para ver la respuesta
+                } else {
+                    const data = await res.json();
+                    alert("Error: " + data.error);
+                }
+            } catch(e) {
+                console.error(e);
+                alert("Error de conexión con API");
+            }
+        }
 
         function renderLogs() {
             const div = document.getElementById('log-console');
@@ -312,6 +444,22 @@
             
             // Auto-scroll solo si estamos abajo
             // div.scrollTop = div.scrollHeight; 
+        }
+
+        async function pedirCargaWeb() {
+            const driver = document.getElementById('webDriverId').value;
+            const cp = document.getElementById('webTargetCp').value;
+            if(!driver || !cp) return alert("Faltan datos");
+
+            try {
+                await fetch(`${API}/driver/request`, {
+                    method: 'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify({user_id: driver, cp_id: cp})
+                });
+                alert("✅ Petición enviada a Kafka");
+                update(); // Refrescar logs
+            } catch(e) { alert("Error API"); }
         }
 
         setInterval(update, 2000); // Refresco cada 2s
