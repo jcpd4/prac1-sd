@@ -23,6 +23,7 @@ def push_health_message(msg):
         if len(monitor_state['health_messages']) > 5:
             monitor_state['health_messages'].pop(0)
 
+
 def push_protocol_message(msg):
     """Añade un mensaje del protocolo (máximo 5)."""
     with monitor_ui_lock:
@@ -600,6 +601,14 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                     if MONITOR_VERBOSE:
                         print(f"[Monitor] Engine KO detectado → Enviando FAULT#{cp_id}")
                     push_protocol_message(f"Enviando FAULT#{cp_id} a Central")
+                    # --- NUEVO: AVISAR A LA WEB DEL FALLO ---
+                    # Necesitamos la IP de la central. Como esta función no la recibe, 
+                    # usaremos una variable global o pasaremos el argumento.
+                    # TRUCO RÁPIDO: Usa la variable global CENTRAL_IP que se define en el main.
+                    try:
+                        enviar_log_monitor(CENTRAL_IP, f"[{cp_id}] 🚨 DETECTADO FALLO EN ENGINE (KO). Enviando alerta.")
+                    except: pass
+                    # ----------------------------------------
                     #Paso 2.6.1.1: Enviar FAULT a Central si está conectada usando protocolo
                     if central_socket_ref[0]:
                         try:
@@ -629,6 +638,11 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                     if MONITOR_VERBOSE:
                         print(f"[Monitor] Engine recuperado (cambió de KO a OK) → Enviando RECOVER#{cp_id}")
                     push_protocol_message(f"Enviando RECOVER#{cp_id} a Central")
+                    # --- NUEVO: AVISAR A LA WEB DE LA RECUPERACIÓN ---
+                    try:
+                        enviar_log_monitor(CENTRAL_IP, f"[{cp_id}] ✅ ENGINE RECUPERADO AUTOMÁTICAMENTE.")
+                    except: pass
+                    # -------------------------------------------------
                     #Paso 2.6.2.1: Enviar RECOVER a Central si está conectada usando protocolo
                     if central_socket_ref[0]:
                         try:
@@ -1002,6 +1016,7 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                         
                         central_socket_ref[0] = central_socket
                         print(f"[Monitor] 🟢 CONEXIÓN ESTABLECIDA con Central.")
+                        enviar_log_monitor(central_host, f"[{cp_id}] 🟢 Conexión establecida con Central.")
                         
                         # Si venimos de un cambio de claves (Revocación), forzamos ACTIVAR.
                         # Si es un reinicio normal (Mantenimiento), respetamos el estado de la Central.
@@ -1056,7 +1071,7 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                             enviar_log_monitor(central_host, msg_loss)
                             
                             print(f"[Monitor] ⏳ Esperando 4s antes de iniciar recuperación de seguridad...")
-                            enviar_log_monitor(central_host, f"[{cp_id}] Esperando 4s para re-autenticación...")
+                            enviar_log_monitor(central_host, f"[{cp_id}] ⏳ Iniciando protocolo de auto-recuperación (4s)...")
                             time.sleep(4) 
                            
                             break 
@@ -1153,8 +1168,9 @@ if __name__ == "__main__":
                     resp, _ = receive_frame(sock, timeout=2, silent=True)
                     if resp and "ACK" in resp:
                         print("[Monitor] Clave configurada en el Engine correctamente.")
-                        enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] Clave inyectada en Engine con éxito.")
+                        enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] 🔐 Clave inyectada en Engine. Cifrado E2E LISTO.")
                     else:
+                        # El 'else' tiene que estar alineado con el 'if', NO pegado a la línea de arriba
                         print(f"[Monitor] Engine no confirmó recepción de clave: {resp}")
             
             sock.close()

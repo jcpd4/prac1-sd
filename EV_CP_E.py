@@ -454,12 +454,22 @@ def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-
+# En EV_CP_E.py (arriba, junto a otras funciones)
+def enviar_log_central(mensaje):
+    """Envía logs a la API de Central para que salgan en la web."""
+    try:
+        # Usamos el puerto 5000 que es donde escucha la API
+        url = "http://127.0.0.1:5000/api/log"
+        requests.post(url, json={"source": "ENGINE", "msg": mensaje}, timeout=0.1)
+    except:
+        pass # Si falla, no bloqueamos el Engine
 
 
 # Variable global para almacenar mensajes del protocolo
 protocol_messages = []  # Lista circular de últimos mensajes
 protocol_lock = threading.Lock()
+
+
 
 def display_status():
     """Muestra el estado actual del Engine en pantalla con mensajes del protocolo sobre el menú."""
@@ -728,6 +738,7 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
 
     #Paso 2.1: Imprimir mensaje de inicio
     print(f"[ENGINE] Inicio suministro CP={cp_id} driver={driver_id}")
+    enviar_log_central(f"[{cp_id}] ⚡ INICIO DE CARGA. Driver: {driver_id}")
     try:
         #Paso 3: Bucle principal de simulación de carga
         while True:
@@ -832,6 +843,7 @@ def process_user_input():
                     ENGINE_STATUS['health'] = 'KO'
                 # Los mensajes se mostrarán en el panel del protocolo (no imprimir aquí para no interferir)
                 add_protocol_message("Usuario: Estado cambiado a KO (AVERÍA)")
+                enviar_log_central(f"[{CP_ID}] 🔥 AVERÍA SIMULADA POR USUARIO (Salud: KO)") # <--- AÑADIR
                 # No llamar display_status aquí, se actualizará automáticamente
                 
             #Paso 2.2: Comando RECOVER - Simular Recuperación
@@ -842,8 +854,10 @@ def process_user_input():
                     ENGINE_STATUS['health'] = 'OK'
                 if old_health == 'KO':
                     add_protocol_message("Usuario: Estado recuperado de KO a OK")
+                    enviar_log_central(f"[{CP_ID}] 🔧 RECUPERACIÓN SIMULADA POR USUARIO (Salud: OK)")
                 else:
                     add_protocol_message("Usuario: Estado ya estaba en OK")
+                    enviar_log_central(f"[{CP_ID}] ℹ️ Intento de recuperación (El estado ya era OK)")
                 # No llamar display_status aquí, se actualizará automáticamente
 
             #Seva: he modificado el boton INIT para poder inciar la carga sin un driver asignado    
@@ -963,10 +977,12 @@ def listen_simulation_commands(broker, my_cp_id):
                 if cmd == 'F': # FAIL
                     with status_lock: ENGINE_STATUS['health'] = 'KO'
                     add_protocol_message("Remoto: Simulación AVERÍA (F)")
+                    enviar_log_central(f"[{my_cp_id}] 🔥 Avería remota recibida desde Web") # <--- AÑADIR
                 
                 elif cmd == 'R': # RECOVER
                     with status_lock: ENGINE_STATUS['health'] = 'OK'
                     add_protocol_message("Remoto: Simulación RECUPERACIÓN (R)")
+                    enviar_log_central(f"[{my_cp_id}] 🔧 Recuperación remota recibida desde Web") # <--- AÑADIR
 
                 elif cmd == 'I': # INIT (Enchufar)
                     # Truco: Inyectamos 'I' en la entrada estándar no es fácil,
