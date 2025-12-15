@@ -98,6 +98,13 @@ Señal de vida: No debe cerrarse. Debe decir algo como "Kafka Server started".
 
 #### **recuerda que si no funciona tienes que borrar los logs, y volver a generar un nueva uuid en kafka**
 
+### Diectorio en el ordenador en jc
+
+```Bash
+cd C:\Users\USUARIO\Desktop\curso 25-26\sd\prac1-sd-4\prac1-sd
+```
+
+
 ### 2️⃣ Terminal 2: EV_Registry (El Portero - Seguridad)
 Arranca el servidor de registro seguro (HTTPS).
 
