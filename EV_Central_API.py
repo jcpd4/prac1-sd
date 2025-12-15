@@ -20,10 +20,12 @@ CONTEXT = {
     "connected_drivers": set(),
     "active_cp_sockets": {},
     "send_command_func": None,
-    "city_temps": {}, # Seva: Almacén de temperaturas actuales
+    "city_temps": {},           # Seva: Almacén de temperaturas actuales
     "config": {
         "temp_umbral": 0.0      # Configuración modificable
-    }
+    },
+    "sessions": {},             # Referencia a current_sessions del Central
+    "producer": None            # Referencia al Kafka Producer del Central
 }
 
 # Lista para guardar logs que vienen de otros módulos (Registry, Weather, etc.)
@@ -32,12 +34,41 @@ EXTERNAL_LOGS = []
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
-def configure_api(messages_list, drivers_set, sockets_dict, command_func):
+def configure_api(messages_list, drivers_set, sockets_dict, command_func, sessions, producer, kafka_broker_url=None):
+    """
+    Configura las referencias compartidas con el hilo principal.
+    Versión Unificada: Acepta contexto, sesiones, producer y configuración de simulación.
+    """
+    global SIMULATION_PRODUCER
+    
+    # 1. Contexto Básico
     CONTEXT["central_messages"] = messages_list
     CONTEXT["connected_drivers"] = drivers_set
     CONTEXT["active_cp_sockets"] = sockets_dict
     CONTEXT["send_command_func"] = command_func
-    print("[API] Contexto configurado correctamente.")
+    
+    # 2. Contexto de Seguridad (Release 2)
+    CONTEXT["sessions"] = sessions
+    CONTEXT["producer"] = producer
+    
+    # 3. Configuración del Productor para Simulación Web
+    # Si Central ya nos pasa un producer conectado, lo reutilizamos (es más eficiente)
+    if producer:
+        SIMULATION_PRODUCER = producer
+        print("[API] Usando Producer compartido de Central para Simulación.")
+    
+    # Si no hay producer pero hay URL (fallback antiguo), creamos uno nuevo
+    elif kafka_broker_url:
+        try:
+            SIMULATION_PRODUCER = KafkaProducer(
+                bootstrap_servers=[kafka_broker_url],
+                value_serializer=lambda v: json.dumps(v).encode('utf-8')
+            )
+            print(f"[API] Canal de Simulación conectado independientemente a {kafka_broker_url}")
+        except Exception as e:
+            print(f"[API] Error conectando Kafka secundario: {e}")
+
+    print("[API] Contexto configurado correctamente (Sesiones, Kafka y Simulación listos).")
 
 # --- ENDPOINTS DE ESTADO Y CONFIGURACIÓN ---
 
@@ -192,7 +223,7 @@ def receive_weather_alert():
 def revoke_cp_key():
     """
     Simula una brecha de seguridad revocando las claves de un CP.
-    Requisito de Seguridad: Capacidad de revocación y auditoría.
+    Ahora recupera el consumo parcial antes de cortar para generar un ticket de error válido.
     """
     data = request.json
     cp_id = data.get('cp_id')
@@ -200,40 +231,88 @@ def revoke_cp_key():
     if not cp_id:
         return jsonify({"error": "Falta el parámetro cp_id"}), 400
 
-    # 1. Llamar a la base de datos para borrar las claves
-    if database.revoke_cp_keys(cp_id):
-        msg = f"Claves del CP {cp_id} REVOCADAS manualmente."
-        print(f"[API] {msg}")
+    # 1. RECUPERAR DATOS DE CONSUMO ACTUAL (ANTES DE BORRAR NADA)
+    # Buscamos en la BD cuánto lleva cargado ese CP
+    kwh_actual = 0.0
+    importe_actual = 0.0
+    
+    try:
+        # Obtenemos info completa del CP
+        all_cps = database.get_all_cps()
+        cp_info = next((cp for cp in all_cps if cp['id'] == cp_id), None)
         
-        # 2. Guardar log interno para mostrar en consola de Central
-        if CONTEXT["central_messages"] is not None:
-            CONTEXT["central_messages"].append(f"{msg}")
-        
-        # 3. Generar evento de AUDITORÍA
-        # Usamos request.remote_addr para registrar quién ordenó la revocación
-        log_audit_event(
-            source_ip=request.remote_addr,
-            action="REVOCACION_MANUAL",
-            description=f"Claves eliminadas por administrador. CP marcado como FUERA_DE_SERVICIO.",
-            cp_id=cp_id
-        )
-        
-        # 4. Intentar forzar cierre de socket si está conectado
-        # Esto hace que el CP se de cuenta inmediatamente de que algo pasa
-        try:
-            if cp_id in CONTEXT["active_cp_sockets"]:
-                sock = CONTEXT["active_cp_sockets"][cp_id]
-                try:
-                    sock.close() # Forzar desconexión
-                except: pass
-                del CONTEXT["active_cp_sockets"][cp_id]
-                print(f"[API] Socket del CP {cp_id} cerrado forzosamente tras revocación.")
-        except Exception as e:
-            print(f"[API] Error cerrando socket: {e}")
+        if cp_info:
+            # Aseguramos que sea float
+            kwh_actual = float(cp_info.get('kwh') or 0.0)
+            importe_actual = float(cp_info.get('importe') or 0.0)
+    except Exception as e:
+        print(f"[API] Error recuperando métricas parciales: {e}")
 
-        return jsonify({"status": "OK", "message": msg}), 200
+    # 2. REVOCAR CLAVES (BD)
+    if database.revoke_cp_keys(cp_id):
+        
+        # Mensaje detallado para el Frontend y Logs
+        msg_publico = (f"[SEGURIDAD] Claves de {cp_id} REVOCADAS durante suministro. "
+                       f"Cierre forzoso. Parcial: {kwh_actual:.3f} kWh / {importe_actual:.2f} €")
+        
+        print(f"[API CENTRAL] {msg_publico}")
+        
+        # 3. GUARDAR LOG PARA EL FRONTEND (Aquí estaba lo que faltaba)
+        if CONTEXT["central_messages"] is not None:
+            CONTEXT["central_messages"].append(msg_publico)
+        
+        # 4. AUDITORÍA
+        try:
+            log_audit_event(
+                source_ip=request.remote_addr,
+                action="REVOCACION_MANUAL",
+                description=f"Revocación forzosa. Suministro cortado con {kwh_actual:.3f} kWh.",
+                cp_id=cp_id
+            )
+        except Exception: pass
+
+        # 5. NOTIFICAR AL DRIVER (Con los datos reales)
+        sessions = CONTEXT.get("sessions")
+        producer = CONTEXT.get("producer")
+        
+        if sessions is not None and cp_id in sessions and producer:
+            driver_id = sessions[cp_id].get('driver_id')
+            if driver_id:
+                print(f"[API] Notificando expulsión a driver {driver_id}...")
+                error_msg = {
+                    "type": "SUPPLY_ERROR",
+                    "cp_id": cp_id,
+                    "user_id": driver_id,
+                    "reason": "⚠️ CARGA DETENIDA: Intervención de Seguridad (Revocación).",
+                    # AQUÍ PONEMOS LOS DATOS REALES:
+                    "kwh_partial": kwh_actual, 
+                    "importe_partial": importe_actual
+                }
+                try:
+                    producer.send('driver_notifications', value=error_msg)
+                    producer.flush()
+                except Exception as e:
+                    print(f"[API] Error notificando a driver: {e}")
+                
+                try: del sessions[cp_id]
+                except: pass
+
+        # 6. PATEAR AL CP (Cerrar Socket y Actualizar Estado)
+        database.update_cp_status(cp_id, 'FUERA_DE_SERVICIO')
+        
+        try:
+            active_sockets = CONTEXT.get("active_cp_sockets")
+            if active_sockets and cp_id in active_sockets:
+                sock = active_sockets[cp_id]
+                try: sock.close()
+                except: pass
+                del active_sockets[cp_id]
+        except: pass
+
+        return jsonify({"status": "OK", "message": msg_publico}), 200
     
     return jsonify({"error": "CP no encontrado o error en BD"}), 404
+
 
 #Seva: --- ENDPOINTS DE COMANDOS A CPs (PARAR/REANUDAR) ---
 @app.route('/api/comandos/cp', methods=['POST'])
@@ -335,25 +414,6 @@ def send_global_action():
 
     return jsonify({"message": "No hay CPs conectados para recibir la orden"}), 200
 
-def configure_api(messages_list, drivers_set, sockets_dict, command_func, kafka_broker_url=None): # <--- Nuevo argumento
-    global SIMULATION_PRODUCER
-    CONTEXT["central_messages"] = messages_list
-    CONTEXT["connected_drivers"] = drivers_set
-    CONTEXT["active_cp_sockets"] = sockets_dict
-    CONTEXT["send_command_func"] = command_func
-    
-    # Inicializar productor de simulación
-    if kafka_broker_url:
-        try:
-            SIMULATION_PRODUCER = KafkaProducer(
-                bootstrap_servers=[kafka_broker_url],
-                value_serializer=lambda v: json.dumps(v).encode('utf-8')
-            )
-            print(f"[API] Canal de Simulación conectado a {kafka_broker_url}")
-        except Exception as e:
-            print(f"[API] Error conectando Kafka: {e}")
-
-# En EV_Central_API.py (añádelo antes de start_api_server)
 
 @app.route('/api/simulacion', methods=['POST'])
 def enviar_simulacion():

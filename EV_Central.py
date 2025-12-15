@@ -2377,7 +2377,9 @@ if __name__ == "__main__":
             drivers_set=connected_drivers,     # Para leer drivers conectados
             sockets_dict=active_cp_sockets,    # Para saber qué CPs tienen socket
             command_func=send_cp_command,      # Para poder enviar órdenes (PARAR/REANUDAR)
-            kafka_broker_url=KAFKA_BROKER
+            kafka_broker_url=KAFKA_BROKER,
+            sessions=current_sessions,      
+            producer=shared_producer_ref
         )
         
         # 2. Arrancar el servidor Flask en un hilo separado

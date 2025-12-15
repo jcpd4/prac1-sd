@@ -919,6 +919,27 @@ def handle_engine_communication(engine_host, engine_port, cp_id, central_ip, cen
         server_socket.close()
 
 
+#Seva: Funcion para forzar la parada del engine (revocación durante el suministro)
+def trigger_emergency_stop(engine_host, engine_port):
+    """Fuerza la parada del Engine local en caso de pérdida de conexión con Central."""
+    print(f"[Monitor] EMERGENCIA: Enviando orden de PARADA al Engine...")
+    try:
+        # Abrimos conexión efímera con Engine
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect((engine_host, engine_port))
+        
+        # Usamos el protocolo existente para enviar "PARAR"
+        if handshake_client(sock, silent=True):
+            send_frame(sock, "PARAR") # El Engine ya sabe procesar "PARAR"
+            # No esperamos respuesta elaborada, solo aseguramos el envío
+        
+        sock.close()
+        print(f"[Monitor] Orden de parada enviada.")
+    except Exception as e:
+        print(f"[Monitor] Fallo al intentar parar Engine: {e}")
+
+
 
 #HILO 4: Funciones de Conexion y Reporte a la Central
 # Seva: Cambaiado para incluir resiliencia y seguridad
@@ -1066,12 +1087,15 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                     if not data_str:
                         empty_reads += 1
                         if empty_reads > 2:
-                            msg_loss = f"[{cp_id}] 🔴 Conexión perdida con Central (Posible Revocación)."
+                            msg_loss = f"[{cp_id}] Conexión perdida con Central (Posible Revocación)."
                             print(f"[Monitor] {msg_loss}")
                             enviar_log_monitor(central_host, msg_loss)
+
+                            # Antes de dormir o desconectar, paramos el Engine físicamente
+                            trigger_emergency_stop(engine_host, engine_port)
                             
-                            print(f"[Monitor] ⏳ Esperando 4s antes de iniciar recuperación de seguridad...")
-                            enviar_log_monitor(central_host, f"[{cp_id}] ⏳ Iniciando protocolo de auto-recuperación (4s)...")
+                            print(f"[Monitor] Esperando 4s antes de iniciar recuperación de seguridad...")
+                            enviar_log_monitor(central_host, f"[{cp_id}] Iniciando protocolo de auto-recuperación (4s)...")
                             time.sleep(4) 
                            
                             break 
@@ -1094,6 +1118,7 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
 
                 except socket.error:
                     print("[Monitor] Error de socket. Reiniciando...")
+                    trigger_emergency_stop(engine_host, engine_port)
                     break 
 
         except Exception as e:

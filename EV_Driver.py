@@ -144,8 +144,11 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     # Si ya se mostró un error para este CP y los valores son idénticos, no repetirlo
                     if last_supply_errors.get(cp_id) == (kwh_p, imp_p):
                         continue
+                    
+                    # Preparamos el texto del mensaje UNA SOLA VEZ
+                    msg_error = f"[ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {cp_id}"
 
-                    # Eliminar mensaje anterior de error para este CP (si existe)
+                    # Eliminar mensaje anterior de error para este CP (si existe) para no saturar pantalla
                     try:
                         for idx in range(len(messages) - 1, -1, -1):
                             if " [ERROR SUMINISTRO]" in messages[idx] and f"CP {cp_id}" in messages[idx]:
@@ -154,13 +157,16 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     except Exception:
                         pass
 
-                    messages.append(f" [ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {cp_id}")
+                    # Añadir a la lista de la consola local
+                    messages.append(f" {msg_error}")
                     last_supply_errors[cp_id] = (kwh_p, imp_p)
-                    #Paso 2.4.4.1: Limpiar la recarga activa, ya que se ha interrumpido
+                    
+                    # Paso 2.4.4.1: Limpiar la recarga activa
                     if cp_id in active_charge_info:
                         del active_charge_info[cp_id]
-                    
-                    log_to_web(f"[{CLIENT_ID}] ❌ {txt}") # <--- AÑADIR
+                
+                    # Usamos la variable msg_error que creamos arriba en lugar de 'txt'
+                    log_to_web(f"[{CLIENT_ID}] ❌ {msg_error}")
 
                 elif msg_type == 'SESSION_CANCELLED':
                     # Ignoramos las cancelaciones (supone que ya llegó SUPPLY_ERROR con datos definitivos)
