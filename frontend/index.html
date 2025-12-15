@@ -300,7 +300,7 @@
 
                 // 1. Botones de CONTROL (Central)
                 let centralBtns = "";
-                if(cp.status !== 'FUERA_DE_SERVICIO') {
+                if(cp.status !== 'FUERA_DE_SERVICIO' || cp.status !== 'DESCONECTADO') {
                     centralBtns = `
                         <div style="margin-bottom:4px; padding-bottom:4px; border-bottom:1px solid #eee;">
                             <span style="font-size:0.7em; color:#666; font-weight:bold;">CENTRAL:</span>
@@ -309,6 +309,7 @@
                         </div>
                     `;
                 }
+
 
                 // 2. Botones de SIMULACIÓN (Engine)
                 let simBtns = `

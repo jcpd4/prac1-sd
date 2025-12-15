@@ -1246,6 +1246,20 @@ def process_kafka_requests(kafka_broker, central_messages, driver_requests,produ
                 elif msg_type == 'SUPPLY_END':
                     kwh = float(payload.get('kwh', 0)) # Consumo en kWh
                     importe = float(payload.get('importe', 0)) # Importe en euros
+                    
+                    session_data = current_sessions.get(cp_id)
+
+                    if session_data:
+                        # Si session_data es un diccionario (como muestra tu log), sacamos solo el ID
+                        if isinstance(session_data, dict):
+                            driver_id = session_data.get('driver_id', 'DESCONOCIDO')
+                        else:
+                            # Si fuera solo texto, lo usamos tal cual
+                            driver_id = str(session_data)
+                    else:
+                        # Si no hay sesión en memoria, nos fiamos del Engine
+                        driver_id = payload.get('driver_id', 'INVITADO')
+
                     current_status = database.get_cp_status(cp_id) # Estado del CP
 
                     # Paso 2.4.3.1: Si el CP está FUERA_DE_SERVICIO (Interrupción)
