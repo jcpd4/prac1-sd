@@ -154,8 +154,11 @@ El control automático de temperatura.
 py EV_W.py
 ```
 Señal de vida: Empezará a imprimir la temperatura de Madrid, Barcelona, etc. cada 4 segundos.
-
-### 7️⃣ Terminal 7: Frontend (La Web)
+### 7️⃣ Terminal 7: Driver
+```Bash
+py EV_Driver.py 127.0.0.1:9092 101
+```
+### 7️⃣ Terminal 8: Frontend (La Web)
 No es una terminal negra, es tu navegador.
 
 Ve a la carpeta frontend.
