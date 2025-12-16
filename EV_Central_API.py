@@ -188,12 +188,7 @@ def receive_weather_alert():
     print(f"[API] {msg}")
     if CONTEXT["central_messages"] is not None:
         CONTEXT["central_messages"].append(msg)
-    
-    EXTERNAL_LOGS.append({
-        'timestamp': time.time(),
-        'source': 'EV_W',
-        'msg': msg
-    })
+
 
     # Lógica de parada/arranque
     all_cps = database.get_all_cps()
