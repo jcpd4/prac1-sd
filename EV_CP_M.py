@@ -1039,9 +1039,13 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                 time.sleep(5)
                 continue
             
-            # Registro
+           # Registro INCLUYENDO EL TOKEN (Requisito Seguridad)
             default_price = 0.25
-            register_msg = f"REGISTER#{cp_id}#{location}#{default_price}"
+            # Añadimos initial_token (o new_token si acabas de registrarte) al mensaje
+            token_to_send = initial_token if initial_token else new_token
+            
+            # FORMATO: REGISTER#ID#UBICACION#PRECIO#TOKEN
+            register_msg = f"REGISTER#{cp_id}#{location}#{default_price}#{token_to_send}"
             
             if send_frame(central_socket, register_msg):
                 try:
