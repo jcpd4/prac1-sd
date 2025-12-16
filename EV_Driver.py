@@ -119,9 +119,12 @@ def process_central_notifications(kafka_broker, client_id, messages):
                 # FIN DE LA INDENTACIÓN
             
             elif msg_type in ['TICKET', 'SUPPLY_ERROR']:
-                # INICIO DE LA INDENTACIÓN (4 espacios)
-                # NO FILTRAR: Los tickets y errores siempre deben procesarse
-                # para que el driver se entere de lo que pasó mientras estaba desconectado.
+                target_user = payload.get('user_id') or payload.get('driver_id')
+                
+                # Si el mensaje tiene destinatario y NO soy yo, lo ignoro.
+                if target_user and target_user != client_id:
+                    continue 
+                
                 pass 
                 # FIN DE LA INDENTACIÓN
             
