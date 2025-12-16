@@ -251,13 +251,17 @@ def revoke_cp_key():
 
     # 2. REVOCAR CLAVES (BD)
     if database.revoke_cp_keys(cp_id):
-        
-        # Mensaje detallado para el Frontend y Logs
-        msg_publico = (f"[SEGURIDAD] Claves de {cp_id} REVOCADAS durante suministro. "
-                       f"Cierre forzoso. Parcial: {kwh_actual:.3f} kWh / {importe_actual:.2f} €")
-        
-        print(f"[API CENTRAL] {msg_publico}")
-        
+
+        # Verificar si  estaba suministrando 
+        cp_status = cp_info.get('status') if cp_info else 'DESCONECTADO'
+        was_supplying = (kwh_actual > 0) or (cp_status == 'SUMINISTRANDO')
+
+        if was_supplying:
+            msg_publico = (f"[SEGURIDAD] Claves de {cp_id} REVOCADAS durante suministro. "
+                           f"Cierre forzoso. Parcial: {kwh_actual:.3f} kWh / {importe_actual:.2f} €")
+        else:
+            msg_publico = f"[SEGURIDAD] Claves de {cp_id} REVOCADAS (CP en reposo)."
+        # -------------------------------------------------------------
         # 3. GUARDAR LOG PARA EL FRONTEND (Aquí estaba lo que faltaba)
         if CONTEXT["central_messages"] is not None:
             CONTEXT["central_messages"].append(msg_publico)
