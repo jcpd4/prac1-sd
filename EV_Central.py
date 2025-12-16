@@ -1851,6 +1851,7 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
         if len(parts) >= 3 and parts[0] == 'REGISTER':
             cp_id = parts[1]
             location = parts[2]
+            # --- ACTUALIZACIÓN DE TIMESTAMP (HEALTH) ---
             try:
                 now_ts = time.time()
                 monitor_last_seen[cp_id] = now_ts
@@ -1858,13 +1859,43 @@ def handle_client(client_socket, address, central_messages, kafka_broker):
                 engine_health_status[cp_id] = 'OK'
             except Exception:
                 pass
-            # Si se envía precio opcional: REGISTER#CP_ID#LOCATION#PRICE
+
+            # --- NUEVA LÓGICA DE PARSEO (PRECIO Y TOKEN) ---
             price = None
+            token_recibido = None
+            
             if len(parts) >= 4:
+                # Intentamos ver si el cuarto elemento es el precio (float)
                 try:
                     price = float(parts[3])
-                except Exception:
-                    price = None
+                    # Si parts[3] es precio, el token estaría en parts[4]
+                    if len(parts) >= 5:
+                        token_recibido = parts[4]
+                except ValueError:
+                    # Si falla al convertir a float, asumimos que parts[3] NO es precio, sino el TOKEN
+                    token_recibido = parts[3]
+                    price = None # Usar valor por defecto
+
+            # --- VALIDACIÓN DE SEGURIDAD (EL PORTERO) ---
+            # Verificamos si el token coincide con lo que guardó el Registry en la BD.
+            # (Asegúrate de haber añadido validate_cp_token en database.py)
+            if not database.validate_cp_token(cp_id, token_recibido):
+                msg = f"❌ ALERTA SEGURIDAD: Conexión rechazada para {cp_id}. Token inválido o ausente."
+                print(f"[CENTRAL] {msg}")
+                push_message(central_messages, msg)
+                
+                # Auditoría de Seguridad (Requisito Tarea 6)
+                log_audit_event(
+                    source_ip=address[0],
+                    action="CONEXION_RECHAZADA",
+                    description=f"Fallo de autenticación: Token incorrecto.",
+                    cp_id=cp_id
+                )
+                
+                # Protocolo: Enviamos NACK y cortamos la conexión
+                send_nack(client_socket)
+                client_socket.close()
+                return # 
 
             #Fase2.2.1: Registrar en la BD (si no existía) o actualizar ubicación/precio
             # Detectar si ya existía para ajustar los mensajes de sistema
