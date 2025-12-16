@@ -1,0 +1,7 @@
+{
+    "central_ip": "127.0.0.1",
+    "central_socket_port": 8000,
+    "central_api_port": 5000,
+    "kafka_ip": "127.0.0.1",
+    "kafka_port": 9092
+}

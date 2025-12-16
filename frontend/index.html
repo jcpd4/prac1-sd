@@ -94,6 +94,7 @@
     </style>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="config.js"></script>
 </head>
 <body>
     <h1> EVCharging - Panel de Control</h1>
@@ -185,7 +186,9 @@
     </div>
 
     <script>
-        const API = 'http://127.0.0.1:5000/api';
+        // Usamos la IP definida en config.js
+        const API = `http://${CONFIG.API_IP}:${CONFIG.API_PORT}/api`;
+        console.log("Conectando frontend a:", API);
         let currentFilter = 'ALL';
         let allLogs = [];
         let cityTemps = {}; 

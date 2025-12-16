@@ -5,6 +5,7 @@ import requests
 import database
 import uuid # Para generar tokens únicos
 import sys
+import json  # <--- 1. AÑADE ESTE IMPORT
 from database import log_audit_event # Seva: Importar función de auditoría
 from cryptography.fernet import Fernet # Seva: Importar Fernet para manejo de claves simétricas
 # Configuración
@@ -17,12 +18,25 @@ app = Flask(__name__)
 # Inicializamos la DB al arrancar para asegurar que existen las tablas
 database.setup_database()
 
-# Seva: URL para enviar logs a la Central (Asumimos localhost:5000)
-CENTRAL_LOG_URL = "http://127.0.0.1:5000/api/log"
+# --- 2. AÑADE ESTA FUNCIÓN AQUÍ ---
+def get_network_config():
+    try:
+        with open('network_config.json', 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+# ----------------------------------
 
 def enviar_log_central(msg):
     """Envía un log a la Central para visualización en el Front."""
     try:
+        # --- CAMBIO: LEER IP DEL JSON ---
+        config = get_network_config()
+        ip = config.get('central_ip', '127.0.0.1')
+        port = config.get('central_api_port', 5000)
+        url = f"http://{ip}:{port}/api/log"
+        # --------------------------------
+
         requests.post(CENTRAL_LOG_URL, json={"source": "REGISTRY", "msg": msg}, timeout=1)
     except:
         pass # Si falla (ej. Central apagada), no bloquear el Registry

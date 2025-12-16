@@ -8,7 +8,17 @@ import os
 import requests # Para hacer peticiones HTTPS
 import urllib3 # Para silenciar las alertas de certificado autofirmado
 # Desactivar advertencias de certificado inseguro (porque usamos adhoc)
+import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# --- NUEVO: FUNCIÓN PARA LEER CONFIGURACIÓN DE RED ---
+def get_network_config():
+    try:
+        with open('network_config.json', 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+# -----------------------------------------------------
 
 # Control de verbosidad del Monitor (reduce prints en consola)
 MONITOR_VERBOSE = False
@@ -30,10 +40,13 @@ def push_protocol_message(msg):
         monitor_state['protocol_messages'].append(f"{datetime.now().strftime('%H:%M:%S')} - {msg}")
         if len(monitor_state['protocol_messages']) > 5:
             monitor_state['protocol_messages'].pop(0)
-# Seva: funcion para enviar logs a la Central para el Fronted
 def enviar_log_monitor(central_ip, msg):
     try:
-        url = f"http://{central_ip}:5000/api/log"
+        # Leemos la config para saber el puerto de la API
+        config = get_network_config()
+        api_port = config.get('central_api_port', 5000) # Por defecto 5000
+        
+        url = f"http://{central_ip}:{api_port}/api/log"
         requests.post(url, json={"source": "MONITOR", "msg": msg}, timeout=1)
     except:
         pass
@@ -45,9 +58,14 @@ def register_in_registry_https(cp_id, location):
     Se conecta al EV_Registry vía HTTPS para obtener el token de seguridad y la clave simétrica.
     Retorna (token, symmetric_key) o (None, None) si falla.
     """
-    # URL del Registry (Asumimos que está en el puerto 6000 de la IP local o configurada)
-    # En un despliegue real, esta IP debería ser un argumento o config.
-    registry_url = "https://127.0.0.1:6000/register"
+    # --- CAMBIO: LEER IP DEL JSON ---
+    config = get_network_config()
+    # Si hay IP en el JSON la usamos, si no, usamos 127.0.0.1 por defecto
+    central_ip = config.get('central_ip', '127.0.0.1') 
+    
+    # Usamos central_ip porque el Registry suele estar en el mismo PC que la Central
+    registry_url = f"https://{central_ip}:6000/register" 
+    # --------------------------------
     
     payload = {
         "id": cp_id,
@@ -82,13 +100,13 @@ def register_in_registry_https(cp_id, location):
 # Seva: --- Función de Baja HTTPS (Release 2) ---
 def unregister_from_registry_https(cp_id, token):
     """Solicita la baja del CP al Registry."""
+    # --- CAMBIO: LEER IP DEL JSON ---
+    config = get_network_config()
+    central_ip = config.get('central_ip', '127.0.0.1')
+    registry_url = f"https://{central_ip}:6000/unregister"
+    # --------------------------------
 
-    registry_url = "https://127.0.0.1:6000/unregister"
-    
-    payload = {
-        "id": cp_id,
-        "token": token
-    }
+    payload = { "id": cp_id, "token": token }
     
     print(f"\n[Monitor] Solicitando BAJA en {registry_url}...")
     
@@ -1158,6 +1176,21 @@ if __name__ == "__main__":
     except ValueError:
         print("Error: Los puertos deben ser numeros enteros.")
         sys.exit(1)
+
+    # --- NUEVO: SOBRESCRIBIR CON JSON (Para el Examen) ---
+    # Esto busca la función get_network_config() que debiste poner arriba
+    config = get_network_config() 
+    if 'central_ip' in config:
+        CENTRAL_IP = config['central_ip']
+        print(f"[INIT] 🟢 Usando IP Central del JSON: {CENTRAL_IP}")
+    
+    # IMPORTANTE: Buscamos 'central_socket_port' porque el Monitor habla por SOCKETS con la Central
+    if 'central_socket_port' in config:
+        CENTRAL_PORT = int(config['central_socket_port'])
+        print(f"[INIT] 🟢 Monitor usará puerto SOCKET del JSON: {CENTRAL_PORT}")
+    elif 'central_port' in config:
+        # Fallback por si se te olvidó cambiar el JSON
+        CENTRAL_PORT = int(config['central_port'])
 
     #Paso 3: Configurar ubicación del CP
     locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1, Valencia", "BCN-02": "Las Ramblas 55, Barcelona", "PAR-01": "Torre Eiffel, Paris"}

@@ -437,5 +437,8 @@ def enviar_simulacion():
     return jsonify({"message": f"Comando {command} enviado"}), 200
 
 def start_api_server(host, port):
-    print(f"[API Central] Escuchando peticiones HTTP en {host}:{port}")
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    # CAMBIO IMPORTANTE: Forzamos 0.0.0.0 para que escuche conexiones externas
+    print(f"[API Central] 🟢 Escuchando en TODAS las interfaces (0.0.0.0) puerto {port}")
+    
+    # Ignoramos el 'host' que nos llega y usamos '0.0.0.0'
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)

@@ -12,6 +12,16 @@ import database
 import EV_Central_API # codigo mio(juanky) donde hago la parte de api_central
 from database import log_audit_event # Seva: funcion para loguear eventos de auditoria
 from cryptography.fernet import Fernet, InvalidToken # Seva: Cifrado
+
+# --- NUEVO: FUNCIÓN PARA LEER CONFIGURACIÓN DE RED ---
+def get_network_config():
+    try:
+        with open('network_config.json', 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+# -----------------------------------------------------
+
 # --- Configuración global ---
 KAFKA_TOPIC_REQUESTS = 'driver_requests' # Conductores -> Central
 KAFKA_TOPIC_STATUS = 'cp_telemetry'      # CP -> Central (Telemetría/Averías/Consumo)
@@ -2322,6 +2332,33 @@ if __name__ == "__main__":
         SOCKET_PORT = int(sys.argv[1])       # 8000
         KAFKA_BROKER = sys.argv[2]           # 127.0.0.1:9092
         HOST = '0.0.0.0'                     # Escucha en todas las IPs    
+
+        # --- NUEVO: SOBRESCRIBIR CON JSON (Plan A - Examen) ---
+        config = get_network_config()
+        
+        # 1. Configurar KAFKA
+        k_ip = config.get('kafka_ip')
+        k_port = config.get('kafka_port')
+        if k_ip and k_port:
+            KAFKA_BROKER = f"{k_ip}:{k_port}"
+            print(f"[INIT] 🟢 Central usando Kafka del JSON: {KAFKA_BROKER}")
+        else:
+            print(f"[INIT] ⚠️ Usando Kafka de consola: {KAFKA_BROKER}")
+
+        # 2. Configurar PUERTO SOCKET (Sobrescribe el sys.argv[1])
+        # Buscamos 'central_socket_port' en el JSON. Si existe, lo usamos.
+        json_socket_port = config.get('central_socket_port')
+        if json_socket_port:
+            SOCKET_PORT = int(json_socket_port)
+            print(f"[INIT] 🟢 Socket Server usará puerto del JSON: {SOCKET_PORT}")
+
+        # 3. Configurar PUERTO API (Para Flask)
+        json_api_port = config.get('central_api_port')
+        API_PORT = 5000 # Valor por defecto
+        if json_api_port:
+            API_PORT = int(json_api_port)
+            print(f"[INIT] 🟢 API Server usará puerto del JSON: {API_PORT}")
+        # ------------------------------------------------------
         
         # Paso 3: Usaremos listas compartidas para que los hilos se comuniquen con el panel
         central_messages = TimestampedList()

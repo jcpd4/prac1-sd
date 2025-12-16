@@ -26,6 +26,16 @@ last_supply_errors = {}  # Recordar último parcial mostrado por CP para evitar 
 
 
 # --- Funciones ---
+
+# --- AÑADE ESTA FUNCIÓN AQUÍ (Debajo de los imports) ---
+def get_network_config():
+    try:
+        with open('network_config.json', 'r') as f:
+            return json.load(f)
+    except:
+        return {}
+# -------------------------------------------------------
+
 def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -46,7 +56,12 @@ def colorize_status(status):
 def log_to_web(msg):
     """Envía el log a la API para que salga en el frontend."""
     try:
-        url = "http://127.0.0.1:5000/api/log"
+        # --- CAMBIO: LEER IP DE CENTRAL DESDE JSON ---
+        config = get_network_config()
+        ip = config.get('central_ip', '127.0.0.1')
+        port = config.get('central_port', 5000)
+        url = f"http://{ip}:{port}/api/log"
+        # ---------------------------------------------
         requests.post(url, json={"source": "DRIVER", "msg": msg}, timeout=0.1)
     except:
         pass 
@@ -362,7 +377,16 @@ if __name__ == "__main__":
     #Paso 2: Extraer los argumentos
     KAFKA_BROKER = sys.argv[1]
     CLIENT_ID = sys.argv[2]
+    # --- NUEVO: SOBRESCRIBIR CON JSON (Plan A - Examen) ---
+    config = get_network_config()
+    k_ip = config.get('kafka_ip')
+    k_port = config.get('kafka_port')
     
+    if k_ip and k_port:
+        KAFKA_BROKER = f"{k_ip}:{k_port}"
+        print(f"[INIT] 🟢 Driver usando Kafka del JSON: {KAFKA_BROKER}")
+    # ------------------------------------------------------
+
     #Paso 3: Inicializar la lista compartida para los logs y notificaciones
     driver_messages = deque(maxlen=200)
     driver_messages.append(f"Driver {CLIENT_ID} iniciado.")

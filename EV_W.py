@@ -4,14 +4,28 @@ import requests
 import sys
 import json
 import os
-# --- CONFIGURACIÓN ---
-API_KEY = "3b4ca6faaaed312c8ae9244e7a652a69" 
 
-# URLs de tu Central
-CENTRAL_URL_ALERTAS = "http://127.0.0.1:5000/api/alertas"
-CENTRAL_URL_ESTADO = "http://127.0.0.1:5000/api/estado"
-CENTRAL_URL_LOG = "http://127.0.0.1:5000/api/log" # NUEVO: Para enviar la temperatura
+# Función para cargar la IP de la Central desde el fichero externo
+def cargar_config_red():
+    try:
+        with open('network_config.json', 'r') as f:
+            config = json.load(f)
+            # Ahora buscamos 'central_api_port' porque queremos hablar con la WEB/API, no con el socket
+            return config.get('central_ip', '127.0.0.1'), config.get('central_api_port', 5000)  
+    except Exception as e:
+        print(f"[EV_W] ⚠️ No se encontró network_config.json, usando localhost. Error: {e}")
+        return "127.0.0.1", 5000
 
+# Cargamos la configuración AL INICIO
+CENTRAL_IP, CENTRAL_PORT = cargar_config_red()
+BASE_URL = f"http://{CENTRAL_IP}:{CENTRAL_PORT}"
+
+# URLs construidas dinámicamente
+CENTRAL_URL_ALERTAS = f"{BASE_URL}/api/alertas"
+CENTRAL_URL_ESTADO = f"{BASE_URL}/api/estado"
+CENTRAL_URL_LOG = f"{BASE_URL}/api/log"
+
+print(f"[EV_W] Configurado para conectar a Central en: {BASE_URL}")
 CONFIG_FILE = "config_weather.json"
 
 def cargar_configuracion():

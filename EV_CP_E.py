@@ -309,14 +309,27 @@ KAFKA_TOPIC_TELEMETRY = "cp_telemetry"
 
 INPUT_MODE = False # Bandera para pausar el refresco de pantalla
 
-# Seva: Función para reportar mensajes del Engine a la Central
-def enviar_log_central(mensaje):
-    """Envía cualquier log (info o error) a la API de la Central."""
+def cargar_url_central():
     try:
-        url = "http://127.0.0.1:5000/api/log"
-        # El source es ENGINE para que el front sepa colorearlo
-        requests.post(url, json={"source": "ENGINE", "msg": mensaje}, timeout=0.5)
-    except Exception:
+        with open('network_config.json', 'r') as f:
+            config = json.load(f)
+            ip = config.get('central_ip', '127.0.0.1')
+            port = config.get('central_port', 5000)
+            return f"http://{ip}:{port}/api/log"
+    except:
+        return "http://127.0.0.1:5000/api/log"
+
+# Variable global para no leer el fichero en cada log (eficiencia)
+URL_LOG_CENTRAL = cargar_url_central()
+print(f"[ENGINE] Logs se enviarán a: {URL_LOG_CENTRAL}")
+
+# --- BUSCA TU FUNCIÓN enviar_log_central Y CÁMBIALA ASÍ ---
+def enviar_log_central(mensaje):
+    """Envía logs a la API de Central usando la URL configurada."""
+    try:
+        # Usamos la variable global URL_LOG_CENTRAL
+        requests.post(URL_LOG_CENTRAL, json={"source": "ENGINE", "msg": mensaje}, timeout=0.1)
+    except:
         pass
 
 # Seva: función auxiliar para obtener la IP local
@@ -454,15 +467,6 @@ def clear_screen():
     """Limpia la pantalla de la terminal."""
     os.system('cls' if os.name == 'nt' else 'clear')
 
-# En EV_CP_E.py (arriba, junto a otras funciones)
-def enviar_log_central(mensaje):
-    """Envía logs a la API de Central para que salgan en la web."""
-    try:
-        # Usamos el puerto 5000 que es donde escucha la API
-        url = "http://127.0.0.1:5000/api/log"
-        requests.post(url, json={"source": "ENGINE", "msg": mensaje}, timeout=0.1)
-    except:
-        pass # Si falla, no bloqueamos el Engine
 
 
 # Variable global para almacenar mensajes del protocolo
@@ -1000,6 +1004,22 @@ if __name__ == "__main__":
         KAFKA_BROKER = sys.argv[2]
         CP_ID = sys.argv[3]
         ENGINE_HOST = '0.0.0.0' #significa que el servidor acepta conexiones desde cualquier IP local
+
+        # --- NUEVO: PRIORIDAD AL ARCHIVO JSON (Para el Examen) ---
+        # Esto te salva si te equivocas al escribir la IP en la consola
+        try:
+            with open('network_config.json', 'r') as f:
+                config = json.load(f)
+                k_ip = config.get('kafka_ip')
+                k_port = config.get('kafka_port')
+                if k_ip and k_port:
+                    KAFKA_BROKER = f"{k_ip}:{k_port}"
+                    print(f"[INIT] 🟢 Configuración de Kafka cargada desde JSON: {KAFKA_BROKER}")
+                else:
+                    print(f"[INIT] ⚠️ Usando Kafka de consola: {KAFKA_BROKER}")
+        except Exception as e:
+            print(f"[INIT] No se leyó network_config.json, usando consola: {KAFKA_BROKER}")
+        # ---------------------------------------------------------
         
 
         # Paso 3: Guardamos broker global para que otros hilos lo usen al arrancar simulate_charging
