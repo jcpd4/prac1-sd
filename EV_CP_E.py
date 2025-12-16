@@ -981,9 +981,9 @@ def listen_simulation_commands(broker, my_cp_id):
                     if can_start:
                         with status_lock:
                             ENGINE_STATUS['is_charging'] = True
-                            ENGINE_STATUS['driver_id'] = "WEB_TESTER"
-                        send_telemetry_message({"type": "SESSION_STARTED", "cp_id": CP_ID, "user_id": "WEB_TESTER"})
-                        threading.Thread(target=simulate_charging, args=(CP_ID, BROKER, "WEB_TESTER"), daemon=True).start()
+                            ENGINE_STATUS['driver_id'] = "CARGANDO"
+                        send_telemetry_message({"type": "SESSION_STARTED", "cp_id": CP_ID, "user_id": "CARGANDO"})
+                        threading.Thread(target=simulate_charging, args=(CP_ID, BROKER, "CARGANDO"), daemon=True).start()
 
                 elif cmd == 'E': # END (Desenchufar)
                     with status_lock: ENGINE_STATUS['is_charging'] = False
