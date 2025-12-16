@@ -611,3 +611,23 @@ def get_audit_logs(limit=200):
     except Exception as e:
         print(f"[DB] ERROR al obtener logs de auditoría: {e}")
     return logs
+
+
+def validate_cp_token(cp_id, token_candidate):
+    """Verifica si el token recibido coincide con el de la BD."""
+    if not USE_SQLITE: return True # Si estamos en modo memoria, aceptamos todo (o implementa lógica dict)
+    try:
+        with db_lock:
+            conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+            cursor = conn.cursor()
+            cursor.execute("SELECT token FROM charging_points WHERE id = ?", (cp_id,))
+            result = cursor.fetchone()
+            conn.close()
+            
+            if result and result[0] == token_candidate:
+                return True
+            else:
+                return False
+    except Exception as e:
+        print(f"[DB] ERROR validando token: {e}")
+        return False
