@@ -166,8 +166,14 @@ def get_logs():
                     'timestamp': entry['timestamp'] # ¡Hora Real!
                 })
             else:
-                # Fallback por si acaso
-                combined_logs.append({'source': 'CENTRAL','msg': str(entry),'timestamp': time.time()})
+                # Detectamos si es de Clima para ponerle la etiqueta correcta (y que funcione el filtro)
+                msg_txt = str(entry)
+                src = 'CENTRAL'
+                
+                if '[CLIMA]' in msg_txt:
+                    src = 'EV_W'
+                
+                combined_logs.append({'source': src, 'msg': msg_txt, 'timestamp': time.time()})
                 
     # 2. Logs Externos (Igual que antes)
     combined_logs.extend(EXTERNAL_LOGS)
