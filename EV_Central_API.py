@@ -1,11 +1,10 @@
-# Fichero: EV_Central_API.py
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import threading
 import time
 import logging
 import database
-from database import log_audit_event # Seva: Importar función de auditoría
+from database import log_audit_event 
 from kafka import KafkaProducer  
 import json
 
@@ -14,21 +13,19 @@ SIMULATION_PRODUCER = None
 app = Flask(__name__)
 CORS(app)
 
-# --- VARIABLES COMPARTIDAS ---
 CONTEXT = {
-    "central_messages": [],     # Logs internos de Central (strings)
+    "central_messages": [],     
     "connected_drivers": set(),
     "active_cp_sockets": {},
     "send_command_func": None,
-    "city_temps": {},           # Seva: Almacén de temperaturas actuales
+    "city_temps": {},           
     "config": {
-        "temp_umbral": 0.0      # Configuración modificable
+        "temp_umbral": 0.0      
     },
-    "sessions": {},             # Referencia a current_sessions del Central
-    "producer": None            # Referencia al Kafka Producer del Central
+    "sessions": {},             
+    "producer": None            
 }
 
-# Lista para guardar logs que vienen de otros módulos (Registry, Weather, etc.)
 # Formato: {'timestamp': float, 'source': 'REGISTRY', 'msg': 'Texto...'}
 EXTERNAL_LOGS = []
 log = logging.getLogger('werkzeug')
@@ -52,12 +49,10 @@ def configure_api(messages_list, drivers_set, sockets_dict, command_func, sessio
     CONTEXT["producer"] = producer
     
     # 3. Configuración del Productor para Simulación Web
-    # Si Central ya nos pasa un producer conectado, lo reutilizamos (es más eficiente)
     if producer:
         SIMULATION_PRODUCER = producer
         print("[API] Usando Producer compartido de Central para Simulación.")
     
-    # Si no hay producer pero hay URL (fallback antiguo), creamos uno nuevo
     elif kafka_broker_url:
         try:
             SIMULATION_PRODUCER = KafkaProducer(
@@ -69,8 +64,6 @@ def configure_api(messages_list, drivers_set, sockets_dict, command_func, sessio
             print(f"[API] Error conectando Kafka secundario: {e}")
 
     print("[API] Contexto configurado correctamente (Sesiones, Kafka y Simulación listos).")
-
-# --- ENDPOINTS DE ESTADO Y CONFIGURACIÓN ---
 
 @app.route('/api/estado', methods=['GET'])
 def get_system_status():
@@ -97,7 +90,6 @@ def set_temp_umbral():
             nuevo_umbral_float = float(nuevo_umbral)
             CONTEXT["config"]["temp_umbral"] = nuevo_umbral_float
             
-            # Auditoría solo para cambios de configuración 
             msg = f"Umbral de temperatura cambiado a {nuevo_umbral}ºC desde Web"
             if CONTEXT["central_messages"] is not None:
                 CONTEXT["central_messages"].append(f"[CONFIG] {msg}")
@@ -112,8 +104,6 @@ def set_temp_umbral():
         except ValueError:
             pass
     return jsonify({"error": "Error en datos"}), 400
-
-# --- ENDPOINTS DE LOGGING Y ALERTAS ---
 
 @app.route('/api/log', methods=['POST'])
 def receive_external_log():
@@ -133,7 +123,6 @@ def receive_external_log():
                 CONTEXT["city_temps"][city_part] = temp_part
         except:
             pass
-        # IMPORTANTE: Return aquí para NO añadir a EXTERNAL_LOGS
         return jsonify({"status": "Updated State"}), 200
     
     # Si NO es temperatura (es una alerta, error, conexión, etc.), lo guardamos
@@ -144,7 +133,6 @@ def receive_external_log():
     }
     EXTERNAL_LOGS.append(log_entry)
     
-    # Limpieza de buffer
     if len(EXTERNAL_LOGS) > 200:
         EXTERNAL_LOGS.pop(0)
         
@@ -166,7 +154,6 @@ def get_logs():
                     'timestamp': entry['timestamp'] # ¡Hora Real!
                 })
             else:
-                # Detectamos si es de Clima para ponerle la etiqueta correcta (y que funcione el filtro)
                 msg_txt = str(entry)
                 src = 'CENTRAL'
                 
@@ -196,7 +183,6 @@ def receive_weather_alert():
         CONTEXT["central_messages"].append(msg)
 
 
-    # Lógica de parada/arranque
     all_cps = database.get_all_cps()
     send_cmd = CONTEXT["send_command_func"]
     count = 0
@@ -205,21 +191,18 @@ def receive_weather_alert():
             if city.lower() in cp['location'].lower():
                 cp_id = cp['id']
                 if cp_id in CONTEXT["active_cp_sockets"]:
-                    # Seva: AUDITORÍA: ORDEN CLIMÁTICA ***
                     log_audit_event(
                         source_ip="EV_W_SERVICE", # El origen de la orden es el servicio climático (EV_W)
                         action=f"CLIMA_ORDEN_{action.upper()}",
                         description=f"Orden forzada de {action.upper()} por alerta climática en {city}.",
                         cp_id=cp_id
                     )
-                    # *****************************************
                     send_cmd(cp_id, action, CONTEXT["central_messages"])
                     count += 1
     
     return jsonify({"message": f"Accion {action} aplicada"}), 200
 
 
-# Seva: --- ENDPOINTS DE SEGURIDAD (Revocar la llave)---
 @app.route('/api/admin/revoke-key', methods=['POST'])
 def revoke_cp_key():
     """
@@ -233,17 +216,14 @@ def revoke_cp_key():
         return jsonify({"error": "Falta el parámetro cp_id"}), 400
 
     # 1. RECUPERAR DATOS DE CONSUMO ACTUAL (ANTES DE BORRAR NADA)
-    # Buscamos en la BD cuánto lleva cargado ese CP
     kwh_actual = 0.0
     importe_actual = 0.0
     
     try:
-        # Obtenemos info completa del CP
         all_cps = database.get_all_cps()
         cp_info = next((cp for cp in all_cps if cp['id'] == cp_id), None)
         
         if cp_info:
-            # Aseguramos que sea float
             kwh_actual = float(cp_info.get('kwh') or 0.0)
             importe_actual = float(cp_info.get('importe') or 0.0)
     except Exception as e:
@@ -252,7 +232,6 @@ def revoke_cp_key():
     # 2. REVOCAR CLAVES (BD)
     if database.revoke_cp_keys(cp_id):
 
-        # Verificar si  estaba suministrando 
         cp_status = cp_info.get('status') if cp_info else 'DESCONECTADO'
         was_supplying = (kwh_actual > 0) or (cp_status == 'SUMINISTRANDO')
 
@@ -261,7 +240,6 @@ def revoke_cp_key():
                            f"Cierre forzoso. Parcial: {kwh_actual:.3f} kWh / {importe_actual:.2f} €")
         else:
             msg_publico = f"[SEGURIDAD] Claves de {cp_id} REVOCADAS (CP en reposo)."
-        # -------------------------------------------------------------
         # 3. GUARDAR LOG PARA EL FRONTEND (Aquí estaba lo que faltaba)
         if CONTEXT["central_messages"] is not None:
             CONTEXT["central_messages"].append(msg_publico)
@@ -289,7 +267,6 @@ def revoke_cp_key():
                     "cp_id": cp_id,
                     "user_id": driver_id,
                     "reason": "⚠️ CARGA DETENIDA: Intervención de Seguridad (Revocación).",
-                    # AQUÍ PONEMOS LOS DATOS REALES:
                     "kwh_partial": kwh_actual, 
                     "importe_partial": importe_actual
                 }
@@ -319,7 +296,6 @@ def revoke_cp_key():
     return jsonify({"error": "CP no encontrado o error en BD"}), 404
 
 
-#Seva: --- ENDPOINTS DE COMANDOS A CPs (PARAR/REANUDAR) ---
 @app.route('/api/comandos/cp', methods=['POST'])
 def send_cp_action():
     """Envía PARAR o REANUDAR a un CP específico."""
@@ -351,7 +327,6 @@ def send_cp_action():
 
     return jsonify({"error": "Función de comandos no disponible"}), 500
 
-# --- NUEVO ENDPOINT PARA DRIVER WEB ---
 @app.route('/api/driver/request', methods=['POST'])
 def web_driver_request():
     """Recibe una petición de carga desde la Web y la envía a Kafka."""
@@ -365,8 +340,6 @@ def web_driver_request():
     if not SIMULATION_PRODUCER:
         return jsonify({"error": "Kafka no conectado en API"}), 500
 
-    # Construimos el mensaje EXACTAMENTE como lo espera la Central
-    # Topic: driver_requests
     msg = {
         "user_id": user_id,
         "cp_id": cp_id,
@@ -376,12 +349,9 @@ def web_driver_request():
     }
 
     try:
-        # Reutilizamos el productor que ya teníamos para la simulación
-        # pero enviamos al topic de los drivers
         SIMULATION_PRODUCER.send('driver_requests', value=msg)
         SIMULATION_PRODUCER.flush()
         
-        # Log visual para confirmar salida
         if CONTEXT["central_messages"] is not None:
             CONTEXT["central_messages"].append(f"[WEB-DRIVER] Petición enviada: {user_id} -> {cp_id}")
             
@@ -389,7 +359,6 @@ def web_driver_request():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# Seva: --- ENDPOINTS DE COMANDOS MASIVOS
 @app.route('/api/comandos/todos', methods=['POST'])
 def send_global_action():
     """Envía PARAR o REANUDAR a TODOS los CPs conectados."""
