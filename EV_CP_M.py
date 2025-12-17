@@ -1,24 +1,21 @@
-import socket # para tener una comunicacion por red
-import sys # para usar parametros desde consola
-import time # para manejar el tiempo
-import threading # para poder ejecutar en paralelo
+import socket 
+import sys 
+import time 
+import threading 
 import database
 from datetime import datetime
 import os
-import requests # Para hacer peticiones HTTPS
-import urllib3 # Para silenciar las alertas de certificado autofirmado
-# Desactivar advertencias de certificado inseguro (porque usamos adhoc)
+import requests 
+import urllib3 
 import json
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- NUEVO: FUNCIÓN PARA LEER CONFIGURACIÓN DE RED ---
 def get_network_config():
     try:
         with open('network_config.json', 'r') as f:
             return json.load(f)
     except:
         return {}
-# -----------------------------------------------------
 
 # Control de verbosidad del Monitor (reduce prints en consola)
 MONITOR_VERBOSE = False
@@ -42,7 +39,6 @@ def push_protocol_message(msg):
             monitor_state['protocol_messages'].pop(0)
 def enviar_log_monitor(central_ip, msg):
     try:
-        # Leemos la config para saber el puerto de la API
         config = get_network_config()
         api_port = config.get('central_api_port', 5000) # Por defecto 5000
         
@@ -51,21 +47,15 @@ def enviar_log_monitor(central_ip, msg):
     except:
         pass
 
-
-# --- Función de Registro HTTPS (Release 2) ---
 def register_in_registry_https(cp_id, location):
     """
     Se conecta al EV_Registry vía HTTPS para obtener el token de seguridad y la clave simétrica.
     Retorna (token, symmetric_key) o (None, None) si falla.
     """
-    # --- CAMBIO: LEER IP DEL JSON ---
     config = get_network_config()
-    # Si hay IP en el JSON la usamos, si no, usamos 127.0.0.1 por defecto
     central_ip = config.get('central_ip', '127.0.0.1') 
     
-    # Usamos central_ip porque el Registry suele estar en el mismo PC que la Central
     registry_url = f"https://{central_ip}:6000/register" 
-    # --------------------------------
     
     payload = {
         "id": cp_id,
@@ -75,7 +65,6 @@ def register_in_registry_https(cp_id, location):
     print(f"\n[Monitor] Iniciando registro seguro en {registry_url}...")
     
     try:
-        # Enviamos POST seguro. verify=False es necesario para certificados autofirmados
         response = requests.post(registry_url, json=payload, verify=False, timeout=5)
         
         if response.status_code == 200:
@@ -97,14 +86,11 @@ def register_in_registry_https(cp_id, location):
         return None, None
 
 
-# Seva: --- Función de Baja HTTPS (Release 2) ---
 def unregister_from_registry_https(cp_id, token):
     """Solicita la baja del CP al Registry."""
-    # --- CAMBIO: LEER IP DEL JSON ---
     config = get_network_config()
     central_ip = config.get('central_ip', '127.0.0.1')
     registry_url = f"https://{central_ip}:6000/unregister"
-    # --------------------------------
 
     payload = { "id": cp_id, "token": token }
     
@@ -115,8 +101,6 @@ def unregister_from_registry_https(cp_id, token):
         
         if response.status_code == 200:
             print(f"[Monitor] BAJA EXITOSA: {response.json().get('message')}")
-            # Opcional: Borrar claves locales de la BD
-            # database.revoke_cp_keys(cp_id) # Si quisieras borrarlo localmente también
             return True
         else:
             print(f"[Monitor] Error en baja: {response.status_code} - {response.text}")
@@ -136,26 +120,22 @@ def display_monitor_panel(cp_id):
         protocol_messages = monitor_state['protocol_messages'].copy()
     
     clear_screen()
-    
-    # --- Encabezado ---
+
     print("=" * 80)
     print(f"  EV CHARGING POINT MONITOR: {cp_id}")
     print("=" * 80)
     print(f"Última actualización: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     
-    # --- Sección 1: Estado de Conexiones ---
     print("-" * 80)
     print("*** ESTADO DE CONEXIONES ***")
     print("-" * 80)
     
-    # Estado Engine
     print(f"  Engine (Local):")
     print(f"    Estado: {engine_status}")
     if connection_info.get('engine'):
         print(f"    Conectado en: {connection_info['engine']}")
     
-    # Estado Central
     print(f"  Central:")
     print(f"    Estado:{central_status}")
     if connection_info.get('central'):
@@ -163,7 +143,6 @@ def display_monitor_panel(cp_id):
     
     print()
     
-    # --- Sección 2: Health Checks Recientes ---
     print("-" * 80)
     print("*** HEALTH CHECKS RECIENTES ***")
     print("-" * 80)
@@ -190,26 +169,23 @@ def display_monitor_panel(cp_id):
     # --- Pie ---
     print("=" * 80)
 
-# Constantes de configuracion (ajustalas segun tu necesidad de prueba)
 HEARTBEAT_INTERVAL_TO_CENTRAL = 15 # Cada 15s, informamos a la Central (No usado aun)
 HEARTBEAT_INTERVAL_TO_ENGINE = 1  # Cada 1s, comprobamos el Engine
 ENGINE_COMMAND_GRACE_WINDOW = 3   # Segundos de gracia tras enviar comando al Engine
 PANEL_UPDATE_INTERVAL = 2  # Cada 2s, actualizamos el panel visual
 
-# --- Variables globales para UI del Monitor ---
 monitor_ui_lock = threading.Lock()
 monitor_state = {
-    'engine_status': "Desconectado",  # "OK", "KO", "Desconectado"
-    'central_status': "Desconectado",  # "Conectado", "Desconectado"
+    'engine_status': "Desconectado",  
+    'central_status': "Desconectado",  
     'connection_info': {},
-    'health_messages': [],  # Últimos mensajes de health check
-    'protocol_messages': [],  # Últimos mensajes del protocolo
+    'health_messages': [],  
+    'protocol_messages': [],  
 }
 
 # Seva: Bandera para detener la actualización de la interfaz
 STOP_UI = False
 
-# Lock para proteger envíos/lecturas por el socket compartido con la Central
 central_socket_lock = threading.Lock()
 last_engine_command_ts = [0.0]
 
@@ -222,12 +198,12 @@ def recently_sent_engine_command():
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
 # Constantes del protocolo
-STX = bytes([0x02])  # Start of Text
-ETX = bytes([0x03])  # End of Text
-ENQ = bytes([0x05])  # Enquiry (handshake inicial)
-ACK = bytes([0x06])  # Acknowledgement (respuesta positiva)
-NACK = bytes([0x15]) # Negative Acknowledgement (respuesta negativa)
-EOT = bytes([0x04])  # End of Transmission (cierre de conexión)
+STX = bytes([0x02])  
+ETX = bytes([0x03]) 
+ENQ = bytes([0x05]) 
+ACK = bytes([0x06])  
+NACK = bytes([0x15]) 
+EOT = bytes([0x04]) 
 
 def calculate_lrc(message_bytes):
     """
@@ -519,11 +495,7 @@ def send_eot(socket_ref):
 
 #HILO 1: Funciones de Conexion y Control Local (Monitorizacion del Engine)
 def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
-    """
-    Supervisa continuamente el estado del Engine
-    Si el Engine no responde o devuelve un error, se notifica a la Central.
-    Si la Central no está disponible, se limpia la conexión para forzar una reconexión.
-    """
+
     #Paso 1: Inicializar variables de control
     if MONITOR_VERBOSE:
         print(f"Iniciando monitorizacion del Engine en {engine_host}:{engine_port}")
@@ -533,14 +505,11 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
     while True:
         try:
             #Paso 2.1: Crear un socket temporal para comprobar la salud del Engine
-            # Usaremos una conexion temporal simple creando un nuevo socket TCP/IP
-            #protocolo IP v4  #protocolo TCP (conexion orientada)
             engine_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
             #Paso 2.2: Intentar conectarse al servidor (el Engine)
             #Intenta conectarse al servidor (el Engine), usando la IP y el puerto.
             engine_socket.connect((engine_host, engine_port)) # si no hay nadie lanza excepcion ConnectionRefusedError
             #Paso 2.3: Configurar timeout para la respuesta
-            #Esperar respuesta del Engine (maximo 1 segundo)
             engine_socket.settimeout(1.5) # indica que la operacion recv de engine_socket deber esperar como max 1.5s y si no hay respuesta en ese tiempo, lanza socket.timeout
             
           
@@ -607,11 +576,9 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                 monitor_state['engine_status'] = response
                 monitor_state['connection_info']['engine'] = f"{engine_host}:{engine_port}"
             
-            # Añadir mensaje de health check
             push_health_message(f"Health Check: Engine respondió '{response}'")
             
             #Paso 2.6: Procesar la respuesta del Engine
-            # IMPORTANTE: Solo cambiar el estado si la respuesta cambia realmente
             if response != "OK":
                 #Paso 2.6.1: Engine devolvió KO → reportar fallo si no se había hecho ANTES
                 # Solo enviar FAULT si antes estaba en OK (primera vez que detectamos KO)
@@ -619,21 +586,14 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                     if MONITOR_VERBOSE:
                         print(f"[Monitor] Engine KO detectado → Enviando FAULT#{cp_id}")
                     push_protocol_message(f"Enviando FAULT#{cp_id} a Central")
-                    # --- NUEVO: AVISAR A LA WEB DEL FALLO ---
-                    # Necesitamos la IP de la central. Como esta función no la recibe, 
-                    # usaremos una variable global o pasaremos el argumento.
-                    # TRUCO RÁPIDO: Usa la variable global CENTRAL_IP que se define en el main.
                     try:
                         enviar_log_monitor(CENTRAL_IP, f"[{cp_id}] 🚨 DETECTADO FALLO EN ENGINE (KO). Enviando alerta.")
                     except: pass
-                    # ----------------------------------------
                     #Paso 2.6.1.1: Enviar FAULT a Central si está conectada usando protocolo
                     if central_socket_ref[0]:
                         try:
-                            # Enviar FAULT protegido por lock para evitar carreras con otros hilos
                             with central_socket_lock:
                                 send_frame(central_socket_ref[0], f"FAULT#{cp_id}")
-                                # Consumir el ACK (1 byte) que envía la Central por recibir una trama válida
                                 try:
                                     central_socket_ref[0].settimeout(0.5)
                                     _ack = central_socket_ref[0].recv(1)
@@ -643,31 +603,22 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                                     central_socket_ref[0].settimeout(5.0)
                         except Exception as e:
                             print(f"[Monitor] Error enviando FAULT: {e}")
-                    engine_failed = True  # Marcar que ahora está en fallo
-                # Si engine_failed ya era True, significa que ya habíamos reportado el fallo anteriormente
-                # No hacer nada más, solo mantener el estado
+                    engine_failed = True  
 
             else:
                 #Paso 2.6.2: Engine responde OK
-                # IMPORTANTE: Solo enviar RECOVER si ANTES estaba en fallo (engine_failed == True)
-                # Esto asegura que solo se recupera cuando realmente cambia de KO a OK
                 if engine_failed:
-                    # El Engine cambió de KO a OK → es una recuperación legítima
                     if MONITOR_VERBOSE:
                         print(f"[Monitor] Engine recuperado (cambió de KO a OK) → Enviando RECOVER#{cp_id}")
                     push_protocol_message(f"Enviando RECOVER#{cp_id} a Central")
-                    # --- NUEVO: AVISAR A LA WEB DE LA RECUPERACIÓN ---
                     try:
                         enviar_log_monitor(CENTRAL_IP, f"[{cp_id}] ✅ ENGINE RECUPERADO AUTOMÁTICAMENTE.")
                     except: pass
-                    # -------------------------------------------------
                     #Paso 2.6.2.1: Enviar RECOVER a Central si está conectada usando protocolo
                     if central_socket_ref[0]:
                         try:
-                            # Enviar RECOVER protegido por lock para evitar carreras con otros hilos
                             with central_socket_lock:
                                 send_frame(central_socket_ref[0], f"RECOVER#{cp_id}")
-                                # Consumir el ACK (1 byte) que envía la Central por recibir una trama válida
                                 try:
                                     central_socket_ref[0].settimeout(0.5)
                                     _ack = central_socket_ref[0].recv(1)
@@ -677,8 +628,7 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
                                     central_socket_ref[0].settimeout(5.0)
                         except Exception as e:
                             print(f"[Monitor] Error enviando RECOVER: {e}")
-                    engine_failed = False  # Marcar que ahora está recuperado
-                # Si engine_failed ya era False, significa que ya estaba OK, no hacer nada
+                    engine_failed = False  
                 
                 #Paso 2.7: Manejar errores de red inesperados
         except (socket.error, ConnectionRefusedError, socket.timeout):
@@ -719,13 +669,11 @@ def monitor_engine_health(engine_host, engine_port, cp_id, central_socket_ref):
             
         finally:
             #Paso 2.9: Limpiar recursos
-            #Pase lo que pase (exito o error), nos aseguramos de cerrar el socket del Engine en cada ciclo 
             try:
                 engine_socket.close()
             except Exception:
                 pass
             #Paso 2.10: Esperar antes del siguiente chequeo
-            #Esperar un poco antes del siguiente chequeo
             time.sleep(HEARTBEAT_INTERVAL_TO_ENGINE) # Comprobamos cada 1 segundo
 
 
@@ -786,17 +734,12 @@ def send_command_to_engine(engine_host, engine_port, command, central_socket):
         push_protocol_message(f"← Respuesta del Engine: {response_string}")
         if response_string.startswith("ACK"):
             #Paso 2.1: Engine confirmó comando → enviar ACK a Central usando protocolo
-            # Extraer solo el comando base (sin parámetros) para el ACK a Central
             command_base = command.split('#')[0]
             push_protocol_message(f"→ Enviando ACK#{command_base} a Central")
             # IMPORTANTE: Enviar ACK#PARAR/ACK#REANUDAR a la Central
-            # La Central procesará este mensaje en su bucle de receive_frame y actualizará el estado
-            # NO esperamos ACK de confirmación aquí porque el ACK#PARAR YA ES la respuesta al comando PARAR
-            # La Central enviará su ACK después de procesar el mensaje en su bucle principal
             try:
                 with central_socket_lock:
                     send_frame(central_socket, f"ACK#{command_base}")
-                    # Consumir el ACK de la Central (1 byte) para no dejarlo suelto en el socket
                     try:
                         central_socket.settimeout(0.5)
                         _ack = central_socket.recv(1)
@@ -812,9 +755,6 @@ def send_command_to_engine(engine_host, engine_port, command, central_socket):
             #Paso 2.2: Engine rechazó comando → enviar NACK a Central usando protocolo
             command_base = command.split('#')[0]
             push_protocol_message(f"→ Enviando NACK#{command_base} a Central")
-            # IMPORTANTE: Enviar NACK#PARAR/NACK#REANUDAR a la Central
-            # La Central procesará este mensaje en su bucle de receive_frame
-            # NO esperamos ACK de confirmación aquí porque el NACK#PARAR YA ES la respuesta al comando PARAR
             try:
                 with central_socket_lock:
                     send_frame(central_socket, f"NACK#{command_base}")
@@ -899,7 +839,6 @@ def handle_engine_communication(engine_host, engine_port, cp_id, central_ip, cen
                         #Paso 2.3.2.1.1: Crear conexión con Central
                         central_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                         central_socket.connect((central_ip, central_port))
-                        # Handshake protocolo y consulta con frames
                         if not handshake_client(central_socket, silent=True):
                             raise Exception("handshake fallido")
                         send_frame(central_socket, f"CHECK_SESSION#{cp_id}", silent=True)
@@ -942,12 +881,10 @@ def trigger_emergency_stop(engine_host, engine_port):
     """Fuerza la parada del Engine local en caso de pérdida de conexión con Central."""
     print(f"[Monitor] EMERGENCIA: Enviando orden de PARADA al Engine...")
     try:
-        # Abrimos conexión efímera con Engine
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
         sock.connect((engine_host, engine_port))
         
-        # Usamos el protocolo existente para enviar "PARAR"
         if handshake_client(sock, silent=True):
             send_frame(sock, "PARAR") # El Engine ya sabe procesar "PARAR"
             # No esperamos respuesta elaborada, solo aseguramos el envío
@@ -983,11 +920,9 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
             
             if initial_token and initial_key:
                 new_token, new_key = initial_token, initial_key
-                # Las consumimos para que si hay una reconexión futura, sí pida nuevas
                 initial_token = None 
                 initial_key = None
             else:
-                # Si no (o es una reconexión posterior), llamamos al Registry
                 new_token, new_key = register_in_registry_https(cp_id, location)
             
             if new_token and new_key:
@@ -995,7 +930,6 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                 with monitor_ui_lock:
                     old_key = monitor_state.get('symmetric_key')
                     
-                    # DETECCIÓN DE CAMBIO DE CLAVES (AUDITORÍA VISUAL)
                     if old_key != new_key:
                         security_recovery_mode = True
                         print(f"[Monitor] ⚠️ Nuevas credenciales. Sincronizando Engine...")
@@ -1039,9 +973,7 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                 time.sleep(5)
                 continue
             
-           # Registro INCLUYENDO EL TOKEN (Requisito Seguridad)
             default_price = 0.25
-            # Añadimos initial_token (o new_token si acabas de registrarte) al mensaje
             token_to_send = initial_token if initial_token else new_token
             
             # FORMATO: REGISTER#ID#UBICACION#PRECIO#TOKEN
@@ -1061,15 +993,11 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                         print(f"[Monitor] 🟢 CONEXIÓN ESTABLECIDA con Central.")
                         enviar_log_monitor(central_host, f"[{cp_id}] 🟢 Conexión establecida con Central.")
                         
-                        # Si venimos de un cambio de claves (Revocación), forzamos ACTIVAR.
-                        # Si es un reinicio normal (Mantenimiento), respetamos el estado de la Central.
                         if security_recovery_mode:
                             print("[Monitor] Enviando señal de RECUPERACIÓN DE SEGURIDAD...")
-                            # Enviamos RECOVER para sacar al CP del estado FUERA_DE_SERVICIO
                             send_frame(central_socket, f"RECOVER#{cp_id}")
                             security_recovery_mode = False
 
-                        # Iniciar hilos auxiliares si no existen
                         if not any(t.name == "EngineMonitor" for t in threading.enumerate()):
                              monitor_thread = threading.Thread(
                                 target=monitor_engine_health, 
@@ -1098,14 +1026,11 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                 if central_socket_ref[0] is None: break 
                 
                 try:
-                    # Usamos timeout de 2s para ser ágiles
                     data_str, is_valid = receive_frame(central_socket, timeout=2.0)
                     
-                    # CORRECCIÓN PRINCIPAL: Si es timeout, no es error, solo silencio.
                     if data_str == "__TIMEOUT__": 
                         continue 
                     
-                    # Si es None o vacío, la Central cerró la conexión (REVOCACIÓN o CAÍDA)
                     if not data_str:
                         empty_reads += 1
                         if empty_reads > 2:
@@ -1113,7 +1038,6 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                             print(f"[Monitor] {msg_loss}")
                             enviar_log_monitor(central_host, msg_loss)
 
-                            # Antes de dormir o desconectar, paramos el Engine físicamente
                             trigger_emergency_stop(engine_host, engine_port)
                             
                             print(f"[Monitor] Esperando 4s antes de iniciar recuperación de seguridad...")
@@ -1127,7 +1051,6 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                         send_ack(central_socket)
                         empty_reads = 0 # Reseteamos contador de errores
                         
-                        # Procesar comandos
                         cmd = data_str.strip().split('#')[0]
                         if cmd == 'PARAR':
                             send_command_to_engine(engine_host, engine_port, "PARAR", central_socket)
@@ -1156,7 +1079,6 @@ def start_central_connection(central_host, central_port, cp_id, location, engine
                     monitor_state['central_status'] = "Desconectado"
             time.sleep(5)
 
-# --- Punto de Entrada Principal ---
 if __name__ == "__main__":
     #Paso 1: Verificar argumentos de línea de comandos
     if len(sys.argv) != 6:
@@ -1200,8 +1122,6 @@ if __name__ == "__main__":
     locations = {"MAD-01": "C/ Serrano 10, Madrid", "VAL-03": "Plaza del Ayuntamiento 1, Valencia", "BCN-02": "Las Ramblas 55, Barcelona", "PAR-01": "Torre Eiffel, Paris"}
     LOCATION = locations.get(CP_ID, "Ubicacion Desconocida")
 
-    # --- NUEVO BLOQUE RELEASE 2: REGISTRO ---
-    #Intentamos obtener el token y la clave antes de lanzar los hilos
     TOKEN_SEGURIDAD, CLAVE_SIMETRICA = register_in_registry_https(CP_ID, LOCATION)
     
     if TOKEN_SEGURIDAD and CLAVE_SIMETRICA:
@@ -1242,12 +1162,10 @@ if __name__ == "__main__":
             print(f"[Monitor] {err_msg}")
             print("Asegúrate de que el Engine (EV_CP_E.py) esté corriendo antes que el Monitor.")
             enviar_log_monitor(CENTRAL_IP, f"[{CP_ID}] FALLO al inyectar clave en Engine.")
-        # --------------------------------------------------
     else:
         print("[Monitor] ADVERTENCIA: No se obtuvo token/clave. El sistema funcionará en modo Release 1 (inseguro).")
         TOKEN_SEGURIDAD = None
         CLAVE_SIMETRICA = None
-    # ----------------------------------------
 
     #Paso 4: Iniciar conexión con la Central en hilo separado
     central_thread = threading.Thread(target=start_central_connection, args=(CENTRAL_IP, CENTRAL_PORT, CP_ID, LOCATION, ENGINE_IP, ENGINE_PORT, TOKEN_SEGURIDAD, CLAVE_SIMETRICA), daemon=True)
@@ -1289,7 +1207,6 @@ if __name__ == "__main__":
 
         print("\n[Monitor] Deteniendo hilos...")
         
-        # Seva: OPCIÓN DE DAR DE BAJA AL SALIR ---
         if 'TOKEN_SEGURIDAD' in locals() and TOKEN_SEGURIDAD:
             print("-" * 50)
             print("      OPCIONES DE CIERRE      ")
@@ -1300,7 +1217,6 @@ if __name__ == "__main__":
                     unregister_from_registry_https(CP_ID, TOKEN_SEGURIDAD)
             except EOFError:
                 pass
-        # ---------------------------------------------
         if MONITOR_VERBOSE:
             print("\n[Monitor] Deteniendo Monitor...")
         sys.exit(0)
