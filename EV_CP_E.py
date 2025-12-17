@@ -9,17 +9,16 @@ import requests
 from kafka import KafkaProducer # Usado para enviar telemetría a Central (asíncrono)
 from kafka.errors import NoBrokersAvailable
 from cryptography.fernet import Fernet # Seva: Importar Fernet para manejo de claves simétricas
-from kafka import KafkaConsumer # Asegúrate de importar esto arriba
+from kafka import KafkaConsumer 
 # --- Funciones del Protocolo de Sockets <STX><DATA><ETX><LRC> ---
 
 # Constantes del protocolo
-STX = bytes([0x02])  # Start of Text
-ETX = bytes([0x03])  # End of Text
-ENQ = bytes([0x05])  # Enquiry (handshake inicial)
-ACK = bytes([0x06])  # Acknowledgement (respuesta positiva)
-NACK = bytes([0x15]) # Negative Acknowledgement (respuesta negativa)
-EOT = bytes([0x04])  # End of Transmission (cierre de conexión)
-
+STX = bytes([0x02]) 
+ETX = bytes([0x03]) 
+ENQ = bytes([0x05])  
+ACK = bytes([0x06]) 
+NACK = bytes([0x15]) 
+EOT = bytes([0x04]) 
 def calculate_lrc(message_bytes):
     """
     Calcula el LRC (Longitudinal Redundancy Check) mediante XOR byte a byte.
@@ -295,13 +294,10 @@ def send_nack(socket_ref):
 ENGINE_STATUS = {"health": "OK", "is_charging": False, "driver_id": None}
 SYMMETRIC_KEY = None # Seva: Variable para guardar la clave en memoria
 KAFKA_PRODUCER = None 
-TELEMETRY_BUFFER = []  # Buffer de resiliencia cuando el broker no está disponible
-LAST_MONITOR_TS = 0.0   # Marca de tiempo del último latido/orden del Monitor
+TELEMETRY_BUFFER = [] 
+LAST_MONITOR_TS = 0.0   
 CP_ID = ""
 BROKER = None 
-# Creamos un Lock global para proteger el acceso concurrente a ENGINE_STATUS.
-# Un Lock (cerrojo) garantiza que solo un hilo a la vez puede modificar el estado compartido.
-# Así evitamos condiciones de carrera si llegan comandos simultáneos (p. e.j, PARAR y REANUDAR al mismo tiempo).
 status_lock = threading.Lock()
 
 # Topic que espera la CENTRAL
@@ -327,7 +323,6 @@ print(f"[ENGINE] Logs se enviarán a: {URL_LOG_CENTRAL}")
 def enviar_log_central(mensaje):
     """Envía logs a la API de Central usando la URL configurada."""
     try:
-        # Usamos la variable global URL_LOG_CENTRAL
         requests.post(URL_LOG_CENTRAL, json={"source": "ENGINE", "msg": mensaje}, timeout=0.1)
     except:
         pass
@@ -483,7 +478,6 @@ def display_status():
         return
     clear_screen()
     
-    # Sección superior: Mensajes del protocolo (últimos 5, similar al Monitor)
     with protocol_lock:
         protocol_msgs = protocol_messages.copy()
     
@@ -513,8 +507,6 @@ def display_status():
 
 
 # --- Funciones de Comunicación con Monitor---
-
-#HILO 1: Espera mensajes del Monitor cada 1 segundo y le responde con OK/KO usando protocolo
 def handle_monitor_connection(monitor_socket, monitor_address):
     """Maneja la conexión síncrona con el Monitor local (EC_CP_M) usando protocolo <STX><DATA><ETX><LRC>."""
     global ENGINE_STATUS
@@ -549,13 +541,10 @@ def handle_monitor_connection(monitor_socket, monitor_address):
         
         #Paso 2.3: Si NO es health check, mostrar información del protocolo en el panel
         if not is_health_check:
-            # Solo añadir a mensajes del protocolo (no imprimir directamente para no interferir con el menú)
             add_protocol_message(f"← Recibido desde Monitor: '{data_string}'")
-            # No imprimir aquí, se mostrará en el display_status
         
         #Paso 2.4: Enviar ACK confirmando recepción válida (modo silencioso para health checks)
         send_ack(monitor_socket, silent=is_health_check)
-        # Actualizar último latido del Monitor
         try:
             global LAST_MONITOR_TS
             LAST_MONITOR_TS = time.time()
@@ -563,7 +552,6 @@ def handle_monitor_connection(monitor_socket, monitor_address):
             pass
         
         #Paso 3: Bloquear el acceso a ENGINE_STATUS mientras procesamos este comando
-        #   Esto impide que otro hilo lo modifique al mismo tiempo
         with status_lock:
             
             #Paso 4: Procesar los comandos recibidos desde el monitor (ya viene parseado como string)
@@ -572,9 +560,7 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                 #Paso 4.1.1: Responder con el estado de salud actual usando protocolo (modo silencioso)
                 response = ENGINE_STATUS['health'] 
                 send_frame(monitor_socket, response, silent=is_health_check)
-                # Esperar ACK del Monitor (sin mostrar mensaje para health checks)
                 ack_response = monitor_socket.recv(1)
-                # No imprimir confirmación para health checks repetitivos
 
             #Paso 4.2: Comando PARAR
             elif data_string.startswith("PARAR"):
@@ -585,18 +571,12 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                 # Añadir mensaje al panel del protocolo
                 if not is_health_check:
                     add_protocol_message("→ Enviado a Monitor: ACK#PARAR")
-                # Esperar ACK del Monitor
                 ack_response = monitor_socket.recv(1)
                 if ack_response == ACK and not is_health_check:
                     add_protocol_message("✓ Monitor confirmó recepción de ACK#PARAR")
             
             #Paso 4.3: Comando REANUDAR
             elif data_string.startswith("REANUDAR"):
-                #Paso 4.3.1: REANUDAR solo cambia el estado operativo, NO el estado de salud
-                # El estado de salud (OK/KO) solo cambia con comandos F/R del usuario
-                # REANUDAR solo permite que el CP vuelva a operar si está fuera de servicio
-                # No modifica ENGINE_STATUS['health'] porque eso es controlado manualmente por el usuario
-                #Paso 4.3.2: Confirmar acción al Monitor usando protocolo
                 send_frame(monitor_socket, "ACK#REANUDAR", silent=is_health_check)
                 # Añadir mensaje al panel del protocolo
                 if not is_health_check:
@@ -625,7 +605,6 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                 if len(parts) >= 2:
                     #Paso 4.4.1: Extraer ID del driver
                     driver_id = parts[1]
-                    # No imprimir aquí, se mostrará en el panel del protocolo
                     add_protocol_message(f"← AUTORIZAR_SUMINISTRO recibido: Driver {driver_id}")
                     #Paso 4.4.2: Registrar autorización sin iniciar carga aún
                     ENGINE_STATUS['driver_id'] = driver_id
@@ -640,7 +619,6 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                     #Paso 4.4.4: Manejar formato inválido
                     print(f"[ENGINE] ERROR: Formato de autorización inválido")
                     send_frame(monitor_socket, "NACK#AUTORIZAR_SUMINISTRO")
-                    # Esperar ACK del Monitor
                     ack_response = monitor_socket.recv(1)
             
             # Seva: Comando para recibir la clave simétrica desde el Monitor
@@ -660,7 +638,6 @@ def handle_monitor_connection(monitor_socket, monitor_address):
                 #Paso 4.5.1: Responder con error para comandos no reconocidos usando protocolo
                 add_protocol_message(f"⚠ Comando desconocido recibido: '{data_string}'")
                 send_frame(monitor_socket, "ERROR", silent=is_health_check)
-                # Esperar ACK del Monitor
                 ack_response = monitor_socket.recv(1)
 
         #Paso 5: El Lock se libera automáticamente al salir del bloque 'with'
@@ -672,7 +649,6 @@ def handle_monitor_connection(monitor_socket, monitor_address):
         #Paso 7: Cerrar siempre el socket tras atender la petición
         monitor_socket.close()
 
-#HILO 2: Levantamos el Servidor TCP local y su propósito es responder a los chequeos de salud del Monitor
 def start_health_server(host, port):
     """Inicia el servidor de sockets que escucha los HEALTH_CHECK del Monitor."""
     #Paso 1: Crear el socket del servidor
@@ -688,16 +664,11 @@ def start_health_server(host, port):
     except Exception as e:
         print(f"[Engine] ERROR: No se pudo iniciar el servidor de salud en {port}: {e}")
         sys.exit(1)
-    
-    
         #Paso 2: Bucle principal del servidor
     while True:
         try:
             #Paso 2.1: Esperar una conexión del Monitor
-            #monitor_socket: el socket activo para hablar con ese cliente
-            #address: la IP y puerto del cliente (Monitor)
             monitor_socket, address = server_socket.accept()
-            # Marca latido del monitor (conexión entrante)
             global LAST_MONITOR_TS
             LAST_MONITOR_TS = time.time()
             #Paso 2.2: Crear un nuevo hilo para manejar la conexión
@@ -718,7 +689,6 @@ def start_health_server(host, port):
             time.sleep(1)
             
 # --- Funciones de Simulación de Lógica de Negocio (Suministro) ---
-
 #HILO 3: Simulación de Suministro / Producción Kafka
 def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1):
     """
@@ -763,10 +733,7 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
                     #Paso 3.2.2: Enviar mensaje de avería
                     send_telemetry_message(payload_fault)
                     aborted_due_to_fault = True
-                    return
-
-            #Paso 3.2.5: Verificar latidos del Monitor (resiliencia R1)
-            
+                    return            
 
             #Paso 3.3: Incrementar consumo cada segundo
             total_kwh += step_kwh
@@ -785,7 +752,6 @@ def simulate_charging(cp_id, broker, driver_id, price_per_kwh=0.20, step_kwh=0.1
             #Paso 3.6: Esperar un segundo antes del siguiente incremento
             time.sleep(1)
     except KeyboardInterrupt:
-        #Paso 4: Manejar interrupción del teclado
         pass
     finally:
        #Paso 5: Finalizar la simulación de carga
@@ -815,27 +781,17 @@ def process_user_input():
     #Paso 1: Bucle principal de entrada de usuario
     while True:
         try:
-            #Paso 1.1: Leer comando del usuario
-            #input() espera a que el usuario escriba algo
-            #Mientras tanto, el hilo principal se detiene completamente
-            #Nada más se ejecuta en ese hilo hasta que se pulse Enter
-            # Nota: El display se actualiza en otro hilo, pero el input() aquí bloquea hasta Enter
             command = input().strip().upper()
-            
             #Paso 2: Procesar comandos del usuario
             #Paso 2.1: Comando FAIL - Simular Avería (KO)
             if command == 'F' or command == 'FAIL':
-                # Siempre cambiar a KO si se presiona F (independientemente del estado actual)
                 with status_lock:
                     ENGINE_STATUS['health'] = 'KO'
-                # Los mensajes se mostrarán en el panel del protocolo (no imprimir aquí para no interferir)
                 add_protocol_message("Usuario: Estado cambiado a KO (AVERÍA)")
                 enviar_log_central(f"[{CP_ID}] 🔥 AVERÍA SIMULADA POR USUARIO (Salud: KO)") # <--- AÑADIR
-                # No llamar display_status aquí, se actualizará automáticamente
                 
             #Paso 2.2: Comando RECOVER - Simular Recuperación
             elif command == 'R' or command == 'RECOVER':
-                # Siempre cambiar a OK si se presiona R (permitir recuperación incluso si ya está OK)
                 with status_lock:
                     old_health = ENGINE_STATUS['health']
                     ENGINE_STATUS['health'] = 'OK'
@@ -845,8 +801,6 @@ def process_user_input():
                 else:
                     add_protocol_message("Usuario: Estado ya estaba en OK")
                     enviar_log_central(f"[{CP_ID}] ℹ️ Intento de recuperación (El estado ya era OK)")
-                # No llamar display_status aquí, se actualizará automáticamente
-
             #Seva: he modificado el boton INIT para poder inciar la carga sin un driver asignado    
             #Paso 2.3: Comando INIT - Iniciar Suministro
             elif command == 'I' or command == 'INIT':
@@ -873,7 +827,6 @@ def process_user_input():
                     global INPUT_MODE
                     INPUT_MODE = True # Pausamos el refresco de pantalla
                     try:
-                        # Ahora el usuario puede escribir tranquilo
                         opcion = input("¿Desea iniciar una CARGA MANUAL (Usuario Invitado)? [S/N]: ").strip().upper()
                     finally:
                         INPUT_MODE = False # Reanudamos el refresco pase lo que pase
@@ -900,7 +853,6 @@ def process_user_input():
                         ENGINE_STATUS['is_charging'] = True
                         ENGINE_STATUS['driver_id'] = driver_id
                     
-                    # Avisar a CENTRAL (Start Session)
                     send_telemetry_message({
                         "type": "SESSION_STARTED",
                         "cp_id": CP_ID,
@@ -931,15 +883,11 @@ def process_user_input():
                 #Paso 2.4.3: Actualizar display
                 display_status()
               #Paso 3: Manejar errores de entrada
-              #End Of File (fin de entrada) 
-              #Este error ocurre cuando input() intenta leer del teclado, pero no hay más entrada disponible 
         except EOFError:
             pass 
         except Exception as e:
             print(f"Error en la entrada de usuario: {e}")
 
-# para los botones del engine en el frontend
-# Función nueva para escuchar órdenes remotas
 def listen_simulation_commands(broker, my_cp_id):
     """Escucha el topic 'cp_simulation' para recibir órdenes de la web."""
     try:
@@ -956,11 +904,9 @@ def listen_simulation_commands(broker, my_cp_id):
             target = payload.get('target_cp')
             cmd = payload.get('command')
             
-            # Solo obedecemos si es para NOSOTROS o para TODOS
             if target == my_cp_id or target == "ALL":
                 print(f"\n[REMOTE] Comando recibido: {cmd}")
                 
-                # Ejecutamos la lógica que ya tenías en process_user_input
                 if cmd == 'F': # FAIL
                     with status_lock: ENGINE_STATUS['health'] = 'KO'
                     add_protocol_message("Remoto: Simulación AVERÍA (F)")
@@ -972,10 +918,6 @@ def listen_simulation_commands(broker, my_cp_id):
                     enviar_log_central(f"[{my_cp_id}] 🔧 Recuperación remota recibida desde Web") # <--- AÑADIR
 
                 elif cmd == 'I': # INIT (Enchufar)
-                    # Truco: Inyectamos 'I' en la entrada estándar no es fácil,
-                    # mejor llamamos a la lógica directamente.
-                    # (Copia aquí la lógica de INIT que tienes en process_user_input)
-                    # OJO: Simular carga remota requiere saber driver_id, usaremos "WEB_TESTER"
                     with status_lock:
                         can_start = not ENGINE_STATUS['is_charging'] and ENGINE_STATUS['health'] == 'OK'
                     if can_start:
@@ -991,7 +933,6 @@ def listen_simulation_commands(broker, my_cp_id):
     except Exception as e:
         print(f"[Engine] Error en listener remoto: {e}")
 
-# --- Punto de Entrada Principal ---
 if __name__ == "__main__":
     #Paso 1: Obtener los argumentos de la línea de comandos
     if len(sys.argv) != 4:
@@ -1005,8 +946,6 @@ if __name__ == "__main__":
         CP_ID = sys.argv[3]
         ENGINE_HOST = '0.0.0.0' #significa que el servidor acepta conexiones desde cualquier IP local
 
-        # --- NUEVO: PRIORIDAD AL ARCHIVO JSON (Para el Examen) ---
-        # Esto te salva si te equivocas al escribir la IP en la consola
         try:
             with open('network_config.json', 'r') as f:
                 config = json.load(f)
@@ -1019,7 +958,6 @@ if __name__ == "__main__":
                     print(f"[INIT] ⚠️ Usando Kafka de consola: {KAFKA_BROKER}")
         except Exception as e:
             print(f"[INIT] No se leyó network_config.json, usando consola: {KAFKA_BROKER}")
-        # ---------------------------------------------------------
         
 
         # Paso 3: Guardamos broker global para que otros hilos lo usen al arrancar simulate_charging
@@ -1047,7 +985,6 @@ if __name__ == "__main__":
         display_thread = threading.Thread(target=update_display_periodically, daemon=True)
         display_thread.start()
 
-        # <--- AÑÁDELO AQUÍ (NUEVO HILO DE SIMULACIÓN) --->
         # Hilo para escuchar comandos de simulación remota (Web)
         threading.Thread(target=listen_simulation_commands, args=(KAFKA_BROKER, CP_ID), daemon=True).start()
 
@@ -1057,7 +994,6 @@ if __name__ == "__main__":
         enviar_log_central(start_msg)
         process_user_input()
            
-           #Si alguien pone letras donde debería ir un número
     except ValueError:
         print("Error: El puerto debe ser un número entero.")
         sys.exit(1)
