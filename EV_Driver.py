@@ -1,4 +1,3 @@
-# Fichero: ev_driver.py (Aplicación del Conductor - Módulo Cliente Final)
 import sys
 import time
 import json
@@ -9,32 +8,23 @@ import socket
 from collections import deque
 import requests
 
-# --- Configuración ---
-KAFKA_TOPIC_REQUESTS = 'driver_requests' # Driver → Central
-KAFKA_TOPIC_NOTIFY = 'driver_notifications' # Central → Driver
-CLIENT_ID = "" # Se asigna desde los argumentos  # ID del conductor (ej: "101")
-KAFKA_TOPIC_NETWORK_STATUS = 'network_status' # Central → Driver
+KAFKA_TOPIC_REQUESTS = 'driver_requests' 
+KAFKA_TOPIC_NOTIFY = 'driver_notifications' 
+CLIENT_ID = "" 
+KAFKA_TOPIC_NETWORK_STATUS = 'network_status' 
 
-# --- Estado Compartido ---
-
-network_status = {} # Estado de la red (ej: {"MAD-01": {"status": "ACTIVADO", "location": "C/ Serrano 10"}})
-network_status_lock = threading.Lock() # Lock para acceder a la variable network_status
-#  Almacenamiento del estado de la recarga (1)
-active_charge_info = {} # Usaremos un diccionario para guardar la información de la recarga activa (ej: {"MAD-01": {"kwh": 10.0, "importe": 10.0}})
-charge_lock = threading.Lock() # Lock para acceder a la variable active_charge_info
-last_supply_errors = {}  # Recordar último parcial mostrado por CP para evitar duplicados
-
-
+network_status = {} 
+network_status_lock = threading.Lock() 
+active_charge_info = {} 
+charge_lock = threading.Lock() 
+last_supply_errors = {}  
 # --- Funciones ---
-
-# --- AÑADE ESTA FUNCIÓN AQUÍ (Debajo de los imports) ---
 def get_network_config():
     try:
         with open('network_config.json', 'r') as f:
             return json.load(f)
     except:
         return {}
-# -------------------------------------------------------
 
 def clear_screen():
     """Limpia la pantalla de la terminal."""
@@ -52,25 +42,21 @@ def colorize_status(status):
     end = '\033[0m'
     return f"{colors.get(status,'')}{status}{end}"
 
-# Función para enviar logs a la Web (Central API)
 def log_to_web(msg):
     """Envía el log a la API para que salga en el frontend."""
     try:
-        # --- CAMBIO: LEER IP DE CENTRAL DESDE JSON ---
         config = get_network_config()
         ip = config.get('central_ip', '127.0.0.1')
         port = config.get('central_port', 5000)
         url = f"http://{ip}:{port}/api/log"
-        # ---------------------------------------------
         requests.post(url, json={"source": "DRIVER", "msg": msg}, timeout=0.1)
     except:
         pass 
 
-#Seva: Función para obtener la IP local del equipo
 def get_local_ip():
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80)) # Truco para obtener IP real de salida
+        s.connect(("8.8.8.8", 80)) 
         ip = s.getsockname()[0]
         s.close()
         return ip
@@ -110,23 +96,18 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     continue
             #Paso 2.3: Filtrar SÓLO los mensajes de consumo
             if msg_type == 'CONSUMO_UPDATE':
-                # INICIO DE LA INDENTACIÓN (4 espacios)
                 cp_id_del_mensaje = payload.get('cp_id')
                 with charge_lock:
-                    # Si no hay carga activa, ignorar el consumo
                     if cp_id_del_mensaje not in active_charge_info:
                         continue
-                # FIN DE LA INDENTACIÓN
             
             elif msg_type in ['TICKET', 'SUPPLY_ERROR']:
                 target_user = payload.get('user_id') or payload.get('driver_id')
                 
-                # Si el mensaje tiene destinatario y NO soy yo, lo ignoro.
                 if target_user and target_user != client_id:
                     continue 
                 
                 pass 
-                # FIN DE LA INDENTACIÓN
             
             #Paso 2.4: Procesar los mensajes de autorización, consumo, ticket y supply error
             with charge_lock:
@@ -159,14 +140,10 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     imp_p = payload.get('importe_partial', 0)
                     cp_id = payload.get('cp_id', 'N/A')
 
-                    # Si ya se mostró un error para este CP y los valores son idénticos, no repetirlo
                     if last_supply_errors.get(cp_id) == (kwh_p, imp_p):
                         continue
                     
-                    # Preparamos el texto del mensaje UNA SOLA VEZ
                     msg_error = f"[ERROR SUMINISTRO] {reason}. Parcial: {kwh_p} kWh / {imp_p} € en CP {cp_id}"
-
-                    # Eliminar mensaje anterior de error para este CP (si existe) para no saturar pantalla
                     try:
                         for idx in range(len(messages) - 1, -1, -1):
                             if " [ERROR SUMINISTRO]" in messages[idx] and f"CP {cp_id}" in messages[idx]:
@@ -175,7 +152,6 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     except Exception:
                         pass
 
-                    # Añadir a la lista de la consola local
                     messages.append(f" {msg_error}")
                     last_supply_errors[cp_id] = (kwh_p, imp_p)
                     
@@ -183,11 +159,9 @@ def process_central_notifications(kafka_broker, client_id, messages):
                     if cp_id in active_charge_info:
                         del active_charge_info[cp_id]
                 
-                    # Usamos la variable msg_error que creamos arriba en lugar de 'txt'
                     log_to_web(f"[{CLIENT_ID}] ❌ {msg_error}")
 
                 elif msg_type == 'SESSION_CANCELLED':
-                    # Ignoramos las cancelaciones (supone que ya llegó SUPPLY_ERROR con datos definitivos)
                     continue
         except Exception as e:
             messages.append(f"[ERROR] Procesando notificación: {e}")
@@ -200,14 +174,13 @@ def process_network_updates(kafka_broker):
     try:
         #Paso 1: Conectar al consumidor Kafka
         consumer = KafkaConsumer(
-            KAFKA_TOPIC_NETWORK_STATUS, # 'network_status'
+            KAFKA_TOPIC_NETWORK_STATUS, 
             bootstrap_servers=[kafka_broker],
             auto_offset_reset='latest',
             value_deserializer=lambda x: json.loads(x.decode('utf-8'))
         )
     except Exception:
         #Paso 1.1: Manejar errores
-        # No mostramos error para no ensuciar la consola del driver
         return
 
     #Paso 2: Bucle principal de actualizaciones de la red
@@ -236,12 +209,10 @@ def display_driver_panel(messages):
     }
     while True:
         clear_screen()
-        # Cabecera
         print("--- EV DRIVER APP ---")
         print(f"Cliente: {CLIENT_ID}")
         print("="*80)
 
-        # 1) Estado personal
         print("*** ESTADO DEL CLIENTE ***")
         with charge_lock:
             if not active_charge_info:
@@ -251,14 +222,12 @@ def display_driver_panel(messages):
                     print(f"  Estado: Suministrando en {cp_id}")
                     print(f"    Consumo: {data['kwh']:.3f} kWh    Importe: {data['importe']:.2f} €")
 
-        # 2) Mapa rápido de CPs disponibles (y resumen)
         print("-"*80)
         print("*** ESTADO DE LA RED (vista rápida) ***")
         with network_status_lock:
             if not network_status:
                 print("  Obteniendo estado de la red…")
             else:
-                # Contadores por estado
                 counts = {'ACTIVADO':0,'DESCONECTADO':0,'SUMINISTRANDO':0,'AVERIADO':0,'FUERA_DE_SERVICIO':0}
                 for _, data in network_status.items():
                     st = data.get('status','DESCONECTADO')
@@ -269,14 +238,12 @@ def display_driver_panel(messages):
                     if st == 'ACTIVADO':
                         print(f"     {cp_id:<10} | {data['location']} | {colorize_status(st)}")
 
-        # 3) Comandos
         print("-"*80)
         print("*** COMANDOS ***")
         print("  SOLICITAR <CP_ID>    Realiza una petición de recarga en el CP indicado")
         print("  BATCH <ruta.txt>     Envía múltiples peticiones (una por línea)")
         print("  Q/QUIT               Salir")
 
-        # 4) Mensajes recientes
         print("-"*80)
         print("*** MENSAJES (últimos 7) ***")
         for msg in list(messages)[-7:]:
@@ -317,7 +284,7 @@ def start_driver_interactive_logic(producer, messages):
                 try:
                     producer.send(KAFKA_TOPIC_REQUESTS, value=request_message)
                     messages.append(f"-> Petición enviada a Central para CP {cp_id}. Esperando autorización...")
-                    log_to_web(f"[{CLIENT_ID}] 📤 Solicitando carga en {cp_id}") # <--- AÑADIR
+                    log_to_web(f"[{CLIENT_ID}] 📤 Solicitando carga en {cp_id}") 
 
                 except Exception as e:
                     messages.append(f"[ERROR KAFKA] No se pudo enviar la petición: {e}")
@@ -380,7 +347,6 @@ if __name__ == "__main__":
     #Paso 2: Extraer los argumentos
     KAFKA_BROKER = sys.argv[1]
     CLIENT_ID = sys.argv[2]
-    # --- NUEVO: SOBRESCRIBIR CON JSON (Plan A - Examen) ---
     config = get_network_config()
     k_ip = config.get('kafka_ip')
     k_port = config.get('kafka_port')
@@ -388,12 +354,11 @@ if __name__ == "__main__":
     if k_ip and k_port:
         KAFKA_BROKER = f"{k_ip}:{k_port}"
         print(f"[INIT] 🟢 Driver usando Kafka del JSON: {KAFKA_BROKER}")
-    # ------------------------------------------------------
 
     #Paso 3: Inicializar la lista compartida para los logs y notificaciones
     driver_messages = deque(maxlen=200)
     driver_messages.append(f"Driver {CLIENT_ID} iniciado.")
-    log_to_web(f"[{CLIENT_ID}] 🚗 Driver iniciado y conectado a Kafka.") # <--- AÑADIR
+    log_to_web(f"[{CLIENT_ID}] 🚗 Driver iniciado y conectado a Kafka.") 
     driver_messages.append(f"Broker: {KAFKA_BROKER}")
 
     try:
@@ -403,9 +368,9 @@ if __name__ == "__main__":
             kafka_producer = KafkaProducer(
                 bootstrap_servers=[KAFKA_BROKER],
                 value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                acks=1, #Paso 4.1.1: Configurar el acks para menor latencia
-                linger_ms=5, #Paso 4.1.2: Configurar el linger_ms para menor latencia
-                retries=2 #Paso 4.1.3: Configurar el retries para menor latencia
+                acks=1, 
+                linger_ms=5, 
+                retries=2 
             )
             driver_messages.append(f"[KAFKA] Producer inicializado en {KAFKA_BROKER}")
         except Exception as e:
@@ -414,7 +379,6 @@ if __name__ == "__main__":
         
 
         #Paso 5: Iniciar los hilos
-        #Paso 5.1: Iniciar el Consumidor de Notificaciones en un hilo
         notify_thread = threading.Thread(
             target=process_central_notifications, 
             args=(KAFKA_BROKER, CLIENT_ID, driver_messages), 
@@ -442,7 +406,6 @@ if __name__ == "__main__":
         start_driver_interactive_logic(kafka_producer, driver_messages)
 
     except KeyboardInterrupt:
-        # Avisar a CENTRAL para liberar reservas del driver
         try:
             quit_msg = {"type": "DRIVER_QUIT", "user_id": CLIENT_ID, "timestamp": time.time(), "source_ip": get_local_ip()}
             kafka_producer.send(KAFKA_TOPIC_REQUESTS, value=quit_msg)

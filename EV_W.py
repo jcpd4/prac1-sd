@@ -5,22 +5,18 @@ import sys
 import json
 import os
 
-# Función para cargar la IP de la Central desde el fichero externo
 def cargar_config_red():
     try:
         with open('network_config.json', 'r') as f:
             config = json.load(f)
-            # Ahora buscamos 'central_api_port' porque queremos hablar con la WEB/API, no con el socket
             return config.get('central_ip', '127.0.0.1'), config.get('central_api_port', 5000)  
     except Exception as e:
         print(f"[EV_W] ⚠️ No se encontró network_config.json, usando localhost. Error: {e}")
         return "127.0.0.1", 5000
 
-# Cargamos la configuración AL INICIO
 CENTRAL_IP, CENTRAL_PORT = cargar_config_red()
 BASE_URL = f"http://{CENTRAL_IP}:{CENTRAL_PORT}"
 
-# URLs construidas dinámicamente
 CENTRAL_URL_ALERTAS = f"{BASE_URL}/api/alertas"
 CENTRAL_URL_ESTADO = f"{BASE_URL}/api/estado"
 CENTRAL_URL_LOG = f"{BASE_URL}/api/log"
@@ -40,7 +36,6 @@ def cargar_configuracion():
             
         with open(CONFIG_FILE, 'r') as f:
             config = json.load(f)
-            # Extraemos la API KEY y el mapa de ciudades
             return config.get('api_key'), config.get('cities', {})
             
     except json.JSONDecodeError:
@@ -64,7 +59,6 @@ def obtener_clima(ciudad, api_key):
         elif response.status_code == 401:
             err = f"Error 401: API Key inválida."
             print(f"[CLIMA] {err}")
-            # ENVIAR ERROR A LA WEB
             try:
                 requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
             except: pass
@@ -72,7 +66,6 @@ def obtener_clima(ciudad, api_key):
         else:
             err = f"Error al obtener clima de {ciudad}: {response.status_code}"
             print(f"[CLIMA] {err}")
-            # ENVIAR ERROR A LA WEB
             try:
                 requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
             except: pass
@@ -80,7 +73,6 @@ def obtener_clima(ciudad, api_key):
     except Exception as e:
         err = f"Error conectando con OpenWeather: {e}"
         print(f"[CLIMA] {err}")
-        # ENVIAR ERROR A LA WEB (Requisito de fallo de componente externo)
         try:
             requests.post(CENTRAL_URL_LOG, json={"source": "EV_W", "msg": err}, timeout=1)
         except: pass
@@ -92,7 +84,6 @@ def obtener_umbral_central():
     try:
         resp = requests.get(CENTRAL_URL_ESTADO, timeout=1)
         if resp.status_code == 200:
-            # Navegamos el JSON: { config: { temp_umbral: X } }
             return float(resp.json().get('config', {}).get('temp_umbral', 0.0))
     except: pass
     return 0.0
@@ -116,11 +107,9 @@ def ciclo_control():
     print(f"--- EV_W (Weather Office) Iniciado ---")
     print(f"Leyendo configuración dinámica de: {CONFIG_FILE}")
     
-    # Diccionario para recordar si ya enviamos alerta y no spamear a la Central
     estado_alertas = {} 
 
     while True:
-        # 1. LEER CONFIGURACIÓN EN CADA CICLO (Parametrización en caliente)
         API_KEY, CIUDADES_CPS = cargar_configuracion()
         
         if not API_KEY or not CIUDADES_CPS:
@@ -128,39 +117,31 @@ def ciclo_control():
             time.sleep(2)
             continue
 
-        # 2. Obtener el Umbral actual de la Central
         TEMP_UMBRAL = obtener_umbral_central()
         
-        # 3. Iterar sobre las ciudades del JSON
         print(f"\n[Ciclo] Consultando {len(CIUDADES_CPS)} ciudades (Umbral: {TEMP_UMBRAL}ºC)...")
         
         for ciudad in CIUDADES_CPS:
-            # Si añadimos una ciudad nueva al JSON, la inicializamos en el estado
             if ciudad not in estado_alertas:
                 estado_alertas[ciudad] = False
 
-            # Consultar OpenWeather
             temp = obtener_clima(ciudad, API_KEY)
             
             if temp is not None:
                 print(f"  > {ciudad}: {temp}ºC")
                 enviar_log_temperatura(ciudad, temp)
 
-                # Lógica de Alerta (Histeresis simple)
                 if temp < TEMP_UMBRAL:
-                    # Hace frío -> Mandar PARAR
                     if not estado_alertas[ciudad]:
                         print(f"    !!! ALERTA DE FRÍO !!! ({temp} < {TEMP_UMBRAL})")
                         notificar_central(ciudad, "PARAR")
                         estado_alertas[ciudad] = True
                 else:
-                    # Hace buen tiempo -> Mandar REANUDAR
                     if estado_alertas[ciudad]:
                         print(f"    ... Temperatura normalizada ...")
                         notificar_central(ciudad, "REANUDAR")
                         estado_alertas[ciudad] = False
         
-        # Esperar 5 segundos antes del siguiente ciclo
         time.sleep(5)
 
 if __name__ == "__main__":

@@ -8,8 +8,6 @@
         h1 { text-align: center; color: #333; }
         .container { max-width: 1400px; margin: 0 auto; display: grid; gap: 20px; grid-template-columns: 2fr 1.5fr; }
         .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
-        
-        /* Tabla */
         table { width: 100%; border-collapse: collapse; font-size: 0.9em; }
         th { background-color: #007bff; color: white; padding: 10px; text-align: left;}
         td { padding: 8px; border-bottom: 1px solid #eee; vertical-align: middle; }
@@ -21,26 +19,20 @@
         .bg-FUERA_DE_SERVICIO { background-color: #fd7e14; }
         .bg-DESCONECTADO { background-color: #6c757d; }
         .bg-RESERVADO { background-color: #159894; }        
-        /* Info Clima */
         .temp-badge { font-size: 0.85em; color: #333; background: #e2e6ea; padding: 2px 6px; border-radius: 10px; margin-left: 5px;}
         
-        /* Botones Acción */
         .btn-revoke { background-color: #dc3545; color: white; border: none; padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 0.8em; }
         .btn-revoke:hover { background-color: #c82333; }
         .btn-disabled { background-color: #ccc; cursor: not-allowed; }
-        /* Botones de Control Operativo */
         .btn-control { border: none; padding: 5px 8px; border-radius: 4px; cursor: pointer; color: white; font-weight: bold; margin-right: 3px; }
-        .btn-stop { background-color: #ffc107; color: #333; } /* Amarillo/Naranja */
+        .btn-stop { background-color: #ffc107; color: #333; } 
         .btn-stop:hover { background-color: #e0a800; }
         
-        .btn-resume { background-color: #17a2b8; } /* Cyan */
+        .btn-resume { background-color: #17a2b8; } 
         .btn-resume:hover { background-color: #138496; }
-
-        /* Botones Globales (Más grandes) */
         .global-controls { display: flex; gap: 10px; margin-bottom: 15px; padding: 10px; background: #fff3cd; border-radius: 5px; border: 1px solid #ffeeba; align-items: center;}
         .btn-global { padding: 8px 15px; font-size: 0.9em; text-transform: uppercase; }
 
-        /* Logs */
         #log-console { 
             background: #1e1e1e; color: #eee; height: 500px; overflow-y: auto; 
             padding: 10px; font-family: 'Consolas', monospace; font-size: 0.85em; border-radius: 4px;
@@ -53,27 +45,25 @@
         .src-ENGINE { color: #1455eb; }
         .src-DRIVER { color: #ff9900; font-weight: bold; }
 
-        /* Filtros */
         .filter-bar { margin-bottom: 10px; display: flex; gap: 5px; flex-wrap: wrap;}
         .filter-btn { padding: 5px; cursor: pointer; border: 1px solid #ddd; border-radius: 3px; }
         .filter-btn.active { background-color: #007bff; color: white; }
 
-        /* WIDGET FLOTANTE DE CLIMA */
         #weather-widget {
-            position: fixed;      /* Fijo en la pantalla */
-            bottom: 20px;         /* Separación del fondo */
-            left: 20px;           /* Separación de la izquierda */
-            width: 200px;         /* Ancho fijo */
-            background-color: rgba(255, 255, 255, 0.95); /* Blanco semi-transparente */
+            position: fixed;      
+            bottom: 20px;         
+            left: 20px;           
+            width: 200px;         
+            background-color: rgba(255, 255, 255, 0.95); 
             border: 1px solid #ccc;
             border-radius: 8px;
-            box-shadow: 0 4px 10px rgba(0,0,0,0.2); /* Sombra elegante */
-            z-index: 1000;        /* Para que flote sobre todo lo demás */
+            box-shadow: 0 4px 10px rgba(0,0,0,0.2); 
+            z-index: 1000;        
             overflow: hidden;
             font-size: 0.85em;
         }
         .weather-header {
-            background-color: #17a2b8; /* Color cian (a juego con EV_W) */
+            background-color: #17a2b8; 
             color: white;
             padding: 8px 10px;
             font-weight: bold;
@@ -185,7 +175,6 @@
     </div>
 
     <script>
-        // Usamos la IP definida en config.js
         const API = `http://${CONFIG.API_IP}:${CONFIG.API_PORT}/api`;
         console.log("Conectando frontend a:", API);
         let currentFilter = 'ALL';
@@ -194,22 +183,16 @@
 
         async function update() {
             try {
-                // 1. Obtener Estado
                 const res = await fetch(`${API}/estado`);
                 const data = await res.json();
                 
                 cityTemps = data.city_temps || {}; 
                 renderWeatherWidget();
-                // Actualizar placeholder del input si no tiene foco
                 if(document.activeElement.id !== 'tempInput') {
                     document.getElementById('tempInput').value = data.config.temp_umbral;
                 }
-
                 renderTable(data.cps);
-
                 updateMapMarkers(data.cps);
-
-                // 2. Obtener Logs
                 const resLog = await fetch(`${API}/logs`);
                 const dataLog = await resLog.json();
                 allLogs = dataLog.logs;
@@ -233,7 +216,6 @@
 
             let html = "";
             for (const [city, temp] of Object.entries(cityTemps)) {
-                // Color si hace mucho frío (alerta)
                 let tempColor = '#333';
                 let icon = '☀️';
                 if(parseFloat(temp) <= 5) { tempColor = 'blue'; icon = '❄️'; }
@@ -249,7 +231,6 @@
             container.innerHTML = html;
         }
 
-        // --- ACCIONES ---
         async function comandoCP(cpId, accion) {
             try {
                 const res = await fetch(`${API}/comandos/cp`, {
@@ -291,7 +272,6 @@
             }
 
             tbody.innerHTML = cps.map(cp => {
-                // Clima
                 let tempHtml = "";
                 for (const city in cityTemps) {
                     if (cp.location && cp.location.toLowerCase().includes(city.toLowerCase())) {
@@ -300,7 +280,6 @@
                     }
                 }
 
-                // 1. Botones de CONTROL (Central)
                 let centralBtns = "";
                 if(cp.status !== 'FUERA_DE_SERVICIO' || cp.status !== 'DESCONECTADO') {
                     centralBtns = `
@@ -312,8 +291,6 @@
                     `;
                 }
 
-
-                // 2. Botones de SIMULACIÓN (Engine)
                 let simBtns = `
                     <div>
                         <span style="font-size:0.7em; color:#666; font-weight:bold;">ENGINE:</span>
@@ -324,7 +301,6 @@
                     </div>
                 `;
 
-                // 3. Botón de Seguridad (Revocar)
                 let btnRevoke;
                 let isRevoked = (cp.status === 'FUERA_DE_SERVICIO' || cp.status === 'DESCONECTADO');
                 if (isRevoked) {
@@ -333,7 +309,6 @@
                     btnRevoke = `<button class="btn-revoke" onclick="revocarClaves('${cp.id}')" title="Simular ataque">☢️ REVOCAR</button>`;
                 }
 
-                // Información de suministro
                 let infoSum = (cp.status === 'SUMINISTRANDO' && cp.kwh) 
                               ? `⚡ ${cp.kwh.toFixed(2)} kWh` 
                               : '<span style="color:#ccc;">-</span>';
@@ -375,7 +350,7 @@
                 const data = await res.json();
                 if(res.ok) {
                     alert(`✅ ${data.message}`);
-                    update(); // Refrescar tabla inmediato
+                    update(); 
                 } else {
                     alert(`❌ Error: ${data.error}`);
                 }
@@ -384,12 +359,8 @@
             }
         }
 
-        // --- RENDERIZADO ---
-
         let map;
-        let markers = {}; // Para guardar las chinchetas y no duplicarlas
-
-        // Coordenadas fijas para tus ciudades de prueba
+        let markers = {};
         const cityCoords = {
             "madrid": [40.4168, -3.7038],
             "barcelona": [41.3851, 2.1734],
@@ -397,14 +368,11 @@
             "sevilla": [37.3891, -5.9845],
             "oslo": [59.9139, 10.7522],
             "paris": [48.8566, 2.3522],
-            "default": [40.4637, -3.7492] // Centro de España aprox.
+            "default": [40.4637, -3.7492] 
         };
 
         function initMap() {
-            // 1. Inicializar mapa centrado en España
-            map = L.map('map').setView([40.4168, -3.7038], 5); // Zoom nivel 5
-
-            // 2. Cargar las baldosas (tiles) de OpenStreetMap
+            map = L.map('map').setView([40.4168, -3.7038], 5); 
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 attribution: '© OpenStreetMap contributors'
             }).addTo(map);
@@ -413,7 +381,6 @@
         function updateMapMarkers(cps) {
             if (!map) return;
 
-            // Limpiamos marcadores antiguos para simplificar (o podrías actualizarlos)
             for (let id in markers) {
                 map.removeLayer(markers[id]);
             }
@@ -422,19 +389,13 @@
             cps.forEach(cp => {
                 let loc = cp.location.toLowerCase();
                 let coords = null;
-
-                // Buscamos si la ubicación contiene alguna de nuestras ciudades conocidas
                 for (let city in cityCoords) {
                     if (loc.includes(city)) {
                         coords = cityCoords[city];
                         break;
                     }
                 }
-
-                // Si encontramos coordenadas, ponemos chincheta
                 if (coords) {
-                    // Elegimos color del icono según estado (Truco: usamos filtros CSS en el icono por defecto de Leaflet)
-                    // O simplemente ponemos un popup con la info
                     let marker = L.marker(coords).addTo(map);
                     
                     let statusIcon = "";
@@ -459,7 +420,6 @@
             event.target.classList.add('active');
             renderLogs();
         }
-        // --- FUNCIÓN DRIVER WEB ---
         async function solicitarCargaWeb() {
             const driver = document.getElementById('driverId').value;
             const cp = document.getElementById('targetCp').value;
@@ -477,7 +437,6 @@
                 });
                 
                 if(res.ok) {
-                    // Animación simple de éxito
                     const btn = document.querySelector('button[onclick="solicitarCargaWeb()"]');
                     const origText = btn.innerHTML;
                     btn.innerHTML = "✅ ENVIADO";
@@ -486,7 +445,7 @@
                         btn.innerHTML = origText;
                         btn.style.background = "#ff9900";
                     }, 2000);
-                    update(); // Forzar actualización de logs para ver la respuesta
+                    update(); 
                 } else {
                     const data = await res.json();
                     alert("Error: " + data.error);
@@ -500,7 +459,6 @@
         function renderLogs() {
             const div = document.getElementById('log-console');
             
-            // Filtrado
             const filtered = allLogs.filter(l => {
                 if(currentFilter === 'ALL') return true;
                 return l.source === currentFilter;
@@ -515,7 +473,6 @@
                     if(msg.includes('REGISTRO') || msg.includes('REGISTRY')) src = 'REGISTRY';
                 }
 
-                // Generamos la línea con el color del módulo original (src-MONITOR, src-ENGINE, etc.)
                 return `<div class="log-line">
                             <span style="color:#888; font-size:0.8em;">[${new Date(l.timestamp * 1000).toLocaleTimeString()}]</span>
                             <span class="log-src src-${src}">[${src}]</span> 
@@ -523,8 +480,6 @@
                         </div>`;
             }).join('');
             
-            // Auto-scroll solo si estamos abajo
-            // div.scrollTop = div.scrollHeight; 
         }
 
         async function pedirCargaWeb() {
@@ -539,18 +494,17 @@
                     body: JSON.stringify({user_id: driver, cp_id: cp})
                 });
                 alert("✅ Petición enviada a Kafka");
-                update(); // Refrescar logs
+                update(); 
             } catch(e) { alert("Error API"); }
         }
 
         initMap();
-        setInterval(update, 2000); // Refresco cada 2s
+        setInterval(update, 2000); 
         update();
 
         // --- NUEVA FUNCIÓN PARA SIMULACIÓN (ENGINE) ---
         async function simularEngine(cpId, cmd) {
             try {
-                // Llamamos al nuevo endpoint de la API que reenvía a Kafka
                 await fetch(`${API}/simulacion`, {
                     method: 'POST',
                     headers:{'Content-Type':'application/json'},
